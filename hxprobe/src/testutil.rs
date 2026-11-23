@@ -3,6 +3,7 @@
 
 use crate::block::{crc32, HEADER, MAGIC};
 use crate::item::{self, TICKS_PER_SECOND, UNIX_EPOCH_TICKS};
+use crate::mcp::proto::{Refresher, ServiceStatus};
 use crate::props::PropValue;
 use crate::props_gen::TYPES;
 use crate::value::{ObjRef, COLLECTION_REF_TYPE, ENTRY_VERSION, MIN_ENTRY_LEN};
@@ -620,6 +621,121 @@ pub fn mail_store() -> Vec<u8> {
 /// [`mail_store`] without attachments and appointments.
 pub fn mail_store_without_calendar() -> Vec<u8> {
     store_of(mail_items())
+}
+
+/// A request a [`FakeRefresher`] received.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FakeOp {
+    Touch,
+    Status,
+    Refresh,
+}
+
+/// Run by a [`FakeRefresher`] on every request, with the request and its
+/// number among requests of that kind (from 1); a reply it returns replaces
+/// the scripted one.
+pub type FakeAction = Box<dyn FnMut(FakeOp, usize) -> Option<Result<ServiceStatus, String>> + Send>;
+
+/// What a [`FakeRefresher`] answers and what it was asked.
+pub struct FakeScript {
+    /// Reply to `touch` and `status`.
+    pub reply: Result<ServiceStatus, String>,
+    /// Reply to `refresh`; `None`: the same as `reply`.
+    pub refresh_reply: Option<Result<ServiceStatus, String>>,
+    pub touches: usize,
+    pub statuses: usize,
+    pub refreshes: usize,
+    pub action: Option<FakeAction>,
+}
+
+/// A refresh service played in process: scripted replies, counted
+/// requests. Clones share the script, so a test keeps one to change the
+/// replies and read the counts while a `Cache` owns another.
+#[derive(Clone)]
+pub struct FakeRefresher(pub std::sync::Arc<std::sync::Mutex<FakeScript>>);
+
+impl std::fmt::Debug for FakeRefresher {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("FakeRefresher")
+    }
+}
+
+/// A status reply of a running service of this crate's version with a
+/// usable database built at `built_unix`, not building.
+pub fn fake_status(built_unix: Option<i64>) -> ServiceStatus {
+    ServiceStatus {
+        ok: true,
+        version: crate::mcp::proto::VERSION.into(),
+        pid: 4242,
+        db_usable: built_unix.is_some(),
+        built_unix,
+        ..ServiceStatus::default()
+    }
+}
+
+impl FakeRefresher {
+    /// A refresher answering every request with `reply`.
+    pub fn new(reply: Result<ServiceStatus, String>) -> FakeRefresher {
+        FakeRefresher(std::sync::Arc::new(std::sync::Mutex::new(FakeScript {
+            reply,
+            refresh_reply: None,
+            touches: 0,
+            statuses: 0,
+            refreshes: 0,
+            action: None,
+        })))
+    }
+
+    /// The script, locked.
+    pub fn script(&self) -> std::sync::MutexGuard<'_, FakeScript> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// `(touches, statuses, refreshes)` so far.
+    pub fn counts(&self) -> (usize, usize, usize) {
+        let s = self.script();
+        (s.touches, s.statuses, s.refreshes)
+    }
+
+    fn answer(&mut self, op: FakeOp) -> Result<ServiceStatus, String> {
+        let (n, mut action) = {
+            let mut s = self.script();
+            let n = match op {
+                FakeOp::Touch => &mut s.touches,
+                FakeOp::Status => &mut s.statuses,
+                FakeOp::Refresh => &mut s.refreshes,
+            };
+            *n += 1;
+            (*n, s.action.take())
+        };
+        // Run without the lock held, so the action may change the script.
+        let replaced = action.as_mut().and_then(|a| a(op, n));
+        let mut s = self.script();
+        if s.action.is_none() {
+            s.action = action;
+        }
+        if let Some(r) = replaced {
+            return r;
+        }
+        match (op, &s.refresh_reply) {
+            (FakeOp::Refresh, Some(r)) => r.clone(),
+            _ => s.reply.clone(),
+        }
+    }
+}
+
+impl Refresher for FakeRefresher {
+    fn touch(&mut self, _now: i64) -> Result<ServiceStatus, String> {
+        self.answer(FakeOp::Touch)
+    }
+
+    fn status(&mut self, _now: i64) -> Result<ServiceStatus, String> {
+        self.answer(FakeOp::Status)
+    }
+
+    fn refresh(&mut self, _now: i64) -> Result<ServiceStatus, String> {
+        self.answer(FakeOp::Refresh)
+    }
 }
 
 #[cfg(test)]

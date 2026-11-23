@@ -550,6 +550,14 @@ fn store_status(cache: &mut Cache, now: i64) -> Result<Value, ToolError> {
             "prepare": meta_int("prepare_ms"),
         },
         "last_error": st.last_error,
+        // `null` when this server builds the cache itself.
+        "service": st.service.map(|s| json!({
+            "running": s.running,
+            "building": s.building,
+            "version": s.version,
+            "pid": s.pid,
+            "last_error": s.last_error,
+        })),
     }))
 }
 
@@ -949,8 +957,8 @@ mod tests {
     use super::*;
     use crate::props::guid_hex;
     use crate::testutil::{
-        mail_store, mail_store_without_calendar, MAIL_EVENTS, MAIL_EVENT_TIMES, MAIL_MSGS,
-        MAIL_SENT, MAIL_VIEW_TOP, NOW,
+        fake_status, mail_store, mail_store_without_calendar, FakeOp, FakeRefresher, MAIL_EVENTS,
+        MAIL_EVENT_TIMES, MAIL_MSGS, MAIL_SENT, MAIL_VIEW_TOP, NOW,
     };
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1054,6 +1062,102 @@ mod tests {
         for k in ["copy", "export", "prepare"] {
             assert!(s["build_ms"][k].is_u64(), "{k}");
         }
+    }
+
+    #[test]
+    fn store_status_without_a_service_has_a_null_service() {
+        let mut f = fixture();
+        let s = f.ok("store_status", json!({}));
+        assert_eq!(s["service"], Value::Null);
+        assert_eq!(s["messages"], 4);
+    }
+
+    /// A fixture whose `mail.db` was built by another cache and whose cache
+    /// asks `fake` instead of building.
+    fn served(fake: &FakeRefresher) -> Fixture {
+        let mut f = fixture();
+        f.cache = Cache::new(&f.dir.join("cache"), &f.dir.join("HxStore.hxd"))
+            .unwrap()
+            .with_refresher(Box::new(fake.clone()));
+        f
+    }
+
+    #[test]
+    fn store_status_shows_the_service() {
+        let fake = FakeRefresher::new(Ok(fake_status(Some(NOW_I))));
+        let mut f = served(&fake);
+        let s = f.ok("store_status", json!({}));
+        assert_eq!(
+            s["service"],
+            json!({"running": true, "building": false,
+                   "version": crate::mcp::proto::VERSION, "pid": 4242, "last_error": null})
+        );
+        assert_eq!(s["messages"], 4);
+        assert_eq!(s["folders"], 2);
+        assert_eq!(s["built"], iso(NOW_I));
+        assert_eq!(s["store_changed_since_build"], false);
+        assert_eq!(s["last_error"], Value::Null);
+        assert_eq!(
+            s["store_path"],
+            f.cache.store_path().to_string_lossy().as_ref()
+        );
+        assert_eq!(fake.counts(), (1, 0, 0));
+        assert_eq!(f.cache.builds, 0);
+
+        // Building, with the error of an earlier build.
+        fake.script().reply = Ok(crate::mcp::proto::ServiceStatus {
+            building: true,
+            last_error: Some("export: boom".into()),
+            ..fake_status(Some(NOW_I))
+        });
+        let s = f.ok("store_status", json!({}));
+        assert_eq!(s["service"]["building"], true);
+        assert_eq!(s["service"]["last_error"], "export: boom");
+        assert_eq!(s["last_error"], "export: boom");
+    }
+
+    #[test]
+    fn store_status_shows_an_unavailable_service() {
+        let why = "the refresh service did not start; see service.log";
+        let fake = FakeRefresher::new(Err(why.into()));
+        let mut f = served(&fake);
+        let s = f.ok("store_status", json!({}));
+        assert_eq!(
+            s["service"],
+            json!({"running": false, "building": false, "version": null, "pid": null,
+                   "last_error": why})
+        );
+        assert_eq!(s["last_error"], why);
+        assert_eq!(s["messages"], 4);
+    }
+
+    #[test]
+    fn refresh_returns_the_status_after_the_service_build() {
+        let fake = FakeRefresher::new(Ok(fake_status(Some(NOW_I))));
+        let mut f = served(&fake);
+        let dir = f.dir.clone();
+        fake.script().action = Some(Box::new(move |op, _| {
+            if op == FakeOp::Refresh {
+                Cache::new(&dir.join("cache"), &dir.join("HxStore.hxd"))
+                    .unwrap()
+                    .build(NOW_I + 100)
+                    .unwrap();
+                return Some(Ok(fake_status(Some(NOW_I + 100))));
+            }
+            None
+        }));
+        let s = f.ok("refresh", Value::Null);
+        assert_eq!(s["built"], iso(NOW_I + 100));
+        assert_eq!(s["messages"], 4);
+        assert_eq!(s["service"]["running"], true);
+        assert_eq!(fake.counts(), (1, 0, 1));
+        assert_eq!(f.cache.builds, 0);
+
+        let mut script = fake.script();
+        script.action = None;
+        script.refresh_reply = Some(Err("export: boom".into()));
+        drop(script);
+        assert_eq!(f.err("refresh", Value::Null), "export: boom");
     }
 
     #[test]

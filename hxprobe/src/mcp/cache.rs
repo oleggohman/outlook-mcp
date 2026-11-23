@@ -29,7 +29,8 @@ use crate::header;
 use crate::item;
 use crate::kv::Store;
 use crate::mcp::log;
-use crate::mcp::text::{cap, html_to_text, lossy};
+use crate::mcp::proto::{self, Refresher, ServiceStatus};
+use crate::mcp::text::{cap, html_to_text, iso, lossy};
 use crate::props_gen::TYPES;
 
 /// Name of the prepared database in the cache directory.
@@ -62,6 +63,15 @@ const LEFTOVER_LOCK_POLL: Duration = Duration::from_millis(10);
 
 /// `last_error` while a build runs; it stays when the build panics.
 pub(crate) const BUILD_UNFINISHED: &str = "the last cache build did not finish (internal error)";
+
+/// Error of a call in service mode that found no database and waited
+/// [`proto::FIRST_BUILD_WAIT`] for the service's first build in vain.
+pub const FIRST_BUILD_PENDING: &str =
+    "the mail cache is being built for the first time; call again in a few seconds";
+
+/// Error of a call in service mode when `mail.db` has another format
+/// version and the service is newer than this server.
+pub const OLDER_SERVER: &str = "this server is older than the mail cache; restart the MCP client";
 
 /// Longest body text put in the search index, in chars.
 const MAX_FTS_BODY: usize = 200_000;
@@ -126,9 +136,46 @@ pub struct Status<'a> {
     /// Whether the live store differs from the one the database in use was
     /// built from; `None` when there is no database.
     pub store_changed: Option<bool>,
-    /// Error of the last build attempt, if it failed.
+    /// Error of the last build attempt, if it failed. In service mode: the
+    /// service's `last_error`, else why the service is not available.
     pub last_error: Option<&'a str>,
     pub last_attempt_unix: Option<i64>,
+    /// The refresh service as the last request found it; `None` when the
+    /// cache builds by itself (no refresher).
+    pub service: Option<&'a ServiceView>,
+}
+
+/// The refresh service as a [`Cache`] in service mode last saw it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ServiceView {
+    /// The service answered the last request.
+    pub running: bool,
+    pub building: bool,
+    pub version: Option<String>,
+    pub pid: Option<u32>,
+    /// The service's `last_error`, or why it is not available.
+    pub last_error: Option<String>,
+    pub last_attempt_unix: Option<i64>,
+}
+
+impl ServiceView {
+    /// The view after a request that got `reply`.
+    fn of(reply: &Result<ServiceStatus, String>) -> ServiceView {
+        match reply {
+            Ok(st) => ServiceView {
+                running: true,
+                building: st.building,
+                version: Some(st.version.clone()),
+                pid: Some(st.pid),
+                last_error: st.last_error.clone(),
+                last_attempt_unix: st.last_attempt_unix,
+            },
+            Err(e) => ServiceView {
+                last_error: Some(e.clone()),
+                ..ServiceView::default()
+            },
+        }
+    }
 }
 
 /// The cache directory of one store, and the database in use.
@@ -159,6 +206,14 @@ pub struct Cache {
     /// Pause after the store copy of every build (see
     /// [`Cache::with_build_delay`]).
     build_delay: Option<Duration>,
+    /// The refresh service that builds `mail.db` instead of this value
+    /// (service mode, see [`Cache::with_refresher`]).
+    refresher: Option<Box<dyn Refresher + Send>>,
+    /// What the last request to the refresher found.
+    service: Option<ServiceView>,
+    /// How long a call without a database waits for the service's first
+    /// build, and how often it looks.
+    first_build_wait: (Duration, Duration),
     /// Called at the start of every build, with the lock held.
     #[cfg(test)]
     pub(crate) build_hook: Option<fn()>,
@@ -242,6 +297,9 @@ impl Cache {
             db_id: None,
             rejected_id: None,
             build_delay: None,
+            refresher: None,
+            service: None,
+            first_build_wait: (proto::FIRST_BUILD_WAIT, proto::FIRST_BUILD_POLL),
             #[cfg(test)]
             build_hook: None,
             #[cfg(test)]
@@ -264,6 +322,23 @@ impl Cache {
         self
     }
 
+    /// Service mode: never build; `refresher` (the refresh service) builds
+    /// `mail.db`, and this value only reads it, reopening it when it was
+    /// replaced (see [`Cache::connection_at`], [`Cache::force_refresh_at`]
+    /// and [`Cache::status`]).
+    pub fn with_refresher(mut self, refresher: Box<dyn Refresher + Send>) -> Cache {
+        self.refresher = Some(refresher);
+        self
+    }
+
+    /// In service mode, how long a call without a database waits for the
+    /// first build (default [`proto::FIRST_BUILD_WAIT`]) and how often it
+    /// looks (default [`proto::FIRST_BUILD_POLL`]).
+    pub fn with_first_build_wait(mut self, wait: Duration, poll: Duration) -> Cache {
+        self.first_build_wait = (wait, poll);
+        self
+    }
+
     /// The database to query at `now` (unix seconds), built or rebuilt
     /// first when needed:
     /// - no usable `mail.db` (missing, not a private regular file, not a
@@ -282,7 +357,29 @@ impl Cache {
     /// it was opened here is opened instead (see
     /// [`Cache::reopen_if_replaced`]), so the decision is made on the file
     /// on disk.
+    ///
+    /// In service mode (see [`Cache::with_refresher`]) it never builds: it
+    /// sends `touch` (which may start a build in the service, and never
+    /// waits for one), opens `mail.db` again when it was replaced, and
+    /// answers from it. Without a usable database: the error when the
+    /// service is not available; otherwise it waits for the first build
+    /// (see [`Cache::wait_for_first_build`]).
     pub fn connection_at(&mut self, now: i64) -> Result<&Connection, String> {
+        if let Some(r) = self.refresher.as_mut() {
+            let reply = r.touch(now);
+            self.service = Some(ServiceView::of(&reply));
+            self.reopen_if_replaced();
+            if self.db.is_none() {
+                // The service is not available: nothing to wait for.
+                reply?;
+                self.wait_for_first_build(now)?;
+            }
+            return self
+                .db
+                .as_ref()
+                .map(|(c, _)| c)
+                .ok_or_else(|| "no database".to_string());
+        }
         if self.reopen_if_replaced() {
             if let Some((_, meta)) = &self.db {
                 // Up to date without a build of this value (another process
@@ -327,19 +424,76 @@ impl Cache {
     /// Rebuild now, whatever the interval and even when the store did not
     /// change (the `refresh` tool). On failure the old database stays in
     /// use.
+    ///
+    /// In service mode: send `refresh` (the service builds, or joins its
+    /// running build, and replies when it is over), then open the new
+    /// `mail.db`. A failed build is the error; the old database stays.
     pub fn force_refresh_at(&mut self, now: i64) -> Result<(), String> {
-        self.attempt(now, false)
+        let Some(r) = self.refresher.as_mut() else {
+            return self.attempt(now, false);
+        };
+        let reply = r.refresh(now);
+        self.reopen_if_replaced();
+        reply.map(|st| self.service = Some(ServiceView::of(&Ok(st))))
     }
 
-    /// The state of the cache; checks the live store's size and time.
+    /// The state of the cache; checks the live store's size and time. In
+    /// service mode `last_error` and `last_attempt_unix` are the service's.
     pub fn status(&self) -> Status<'_> {
         let meta = self.db.as_ref().map(|(_, m)| m);
+        let (last_error, last_attempt_unix) = match (&self.refresher, &self.service) {
+            (None, _) => (self.last_error.as_deref(), self.last_attempt_unix),
+            (Some(_), Some(v)) => (v.last_error.as_deref(), v.last_attempt_unix),
+            (Some(_), None) => (None, None),
+        };
         Status {
             store_path: &self.store,
             meta,
             store_changed: meta.map(|m| stamp(&self.store).ok() != m.stamp()),
-            last_error: self.last_error.as_deref(),
-            last_attempt_unix: self.last_attempt_unix,
+            last_error,
+            last_attempt_unix,
+            service: self.service.as_ref(),
+        }
+    }
+
+    /// Service mode, no usable `mail.db`: wait for the service's first
+    /// build. Every poll interval open `mail.db` when it appeared and ask
+    /// the service's status, for at most the first-build wait (see
+    /// [`Cache::with_first_build_wait`]). Fails at once when the service is
+    /// not available, when it reports a failed build (`last_error` while
+    /// not building), or when it is newer than this server and `mail.db`
+    /// has another format version (a database this server cannot read);
+    /// with [`FIRST_BUILD_PENDING`] when the wait is over.
+    fn wait_for_first_build(&mut self, now: i64) -> Result<(), String> {
+        let (wait, poll) = self.first_build_wait;
+        let deadline = Instant::now() + wait;
+        loop {
+            if let Some(v) = &self.service {
+                if !v.running {
+                    return Err(v.last_error.clone().unwrap_or_default());
+                }
+                let newer = v.version.as_deref().is_some_and(|ver| {
+                    proto::cmp_versions(ver, proto::VERSION) == std::cmp::Ordering::Greater
+                });
+                if newer && has_other_format(&self.db_path()) {
+                    return Err(OLDER_SERVER.into());
+                }
+                if let (false, Some(e)) = (v.building, &v.last_error) {
+                    return Err(e.clone());
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err(FIRST_BUILD_PENDING.into());
+            }
+            std::thread::sleep(poll);
+            if self.reopen_if_replaced() {
+                return Ok(());
+            }
+            let Some(r) = self.refresher.as_mut() else {
+                return Err("no refresh service".into());
+            };
+            let reply = r.status(now);
+            self.service = Some(ServiceView::of(&reply));
         }
     }
 
@@ -370,6 +524,13 @@ impl Cache {
             match open_db(&path, &self.store) {
                 Ok(db) => {
                     if file_id(&path) == Some(before) {
+                        let built = db.1.int("built_unix").map_or_else(|| "?".into(), iso);
+                        let verb = if self.db.is_some() {
+                            "reopened"
+                        } else {
+                            "opened"
+                        };
+                        log(&format!("{verb} {DB_NAME} (built {built})"));
                         // Releases the old file, if any.
                         self.db = Some(db);
                         self.db_id = Some(before);
@@ -597,6 +758,21 @@ fn open_db(path: &Path, store: &Path) -> Result<(Connection, Meta), String> {
         return Err(format!("{} was built from another store", path.display()));
     }
     Ok((conn, meta))
+}
+
+/// Whether `path` is a private database (see [`check_private`]) whose
+/// `mcp_meta` names another format version than [`FORMAT_VERSION`].
+fn has_other_format(path: &Path) -> bool {
+    if !std::fs::symlink_metadata(path).is_ok_and(|m| check_private(&m).is_ok()) {
+        return false;
+    }
+    Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .ok()
+    .and_then(|conn| read_meta(&conn).ok())
+    .is_some_and(|m| m.get("format_version").is_some_and(|v| v != FORMAT_VERSION))
 }
 
 /// All rows of `mcp_meta`.
@@ -989,7 +1165,8 @@ mod tests {
     use super::*;
     use crate::props::guid_hex;
     use crate::testutil::{
-        mail_store, mail_store_without_calendar, MAIL_EVENTS, MAIL_EVENT_TIMES, MAIL_MSGS, NOW,
+        fake_status, mail_store, mail_store_without_calendar, FakeOp, FakeRefresher, MAIL_EVENTS,
+        MAIL_EVENT_TIMES, MAIL_MSGS, NOW,
     };
     use rusqlite::OpenFlags;
     use std::os::unix::fs::PermissionsExt;
@@ -2222,6 +2399,264 @@ mod tests {
         build.join().unwrap().unwrap();
         assert!(started.elapsed() >= delay);
         assert_eq!(files(&dir), ["lock", "mail.db"]);
+    }
+
+    // --- service mode (thin reader) ---
+
+    const WAIT: Duration = Duration::from_millis(300);
+
+    /// A cache over a [`mail_store`] file in `t` that asks `fake` instead of
+    /// building, with a short first-build wait.
+    fn served(t: &TestDir, fake: &FakeRefresher) -> Cache {
+        lazy(t, 900)
+            .with_refresher(Box::new(fake.clone()))
+            .with_first_build_wait(WAIT, Duration::from_millis(10))
+    }
+
+    /// A status reply of a service that is building and has no database.
+    fn building() -> ServiceStatus {
+        ServiceStatus {
+            building: true,
+            ..fake_status(None)
+        }
+    }
+
+    #[test]
+    fn service_mode_touches_once_per_call_and_never_builds() {
+        let t = TestDir::new("svctouch");
+        let fake = FakeRefresher::new(Ok(fake_status(Some(NOW_I))));
+        let mut c = served(&t, &fake);
+        rebuild_in(&t.cache_dir(), NOW_I);
+        for dt in 0..3 {
+            assert_eq!(messages(&mut c, NOW_I + dt), 4);
+        }
+        assert_eq!(fake.counts(), (3, 0, 0));
+        // A changed store past the interval: still the service's business.
+        touch(c.store_path(), 1_000_000);
+        assert_eq!(messages(&mut c, NOW_I + 100_000), 4);
+        assert_eq!(fake.counts(), (4, 0, 0));
+        assert_eq!(c.builds, 0);
+        let st = c.status();
+        let view = st.service.expect("a service view");
+        assert!(view.running);
+        assert!(!view.building);
+        assert_eq!(view.version.as_deref(), Some(crate::mcp::proto::VERSION));
+        assert_eq!(view.pid, Some(4242));
+        assert_eq!(view.last_error, None);
+        assert_eq!(st.last_error, None);
+        assert_eq!(st.store_changed, Some(true));
+    }
+
+    #[test]
+    fn service_mode_reopens_a_replaced_database() {
+        let t = TestDir::new("svcreopen");
+        let fake = FakeRefresher::new(Ok(fake_status(Some(NOW_I))));
+        let mut c = served(&t, &fake);
+        rebuild_in(&t.cache_dir(), NOW_I);
+        messages(&mut c, NOW_I + 1);
+        assert_eq!(built_unix(&c), Some(NOW_I));
+        rebuild_in(&t.cache_dir(), NOW_I + 50);
+        assert_eq!(messages(&mut c, NOW_I + 60), 4);
+        assert_eq!(built_unix(&c), Some(NOW_I + 50));
+        assert_eq!(c.db_id, file_id(&c.db_path()));
+        assert!(c.db_id.is_some());
+        assert_eq!(c.builds, 0);
+    }
+
+    #[test]
+    fn service_mode_keeps_the_old_connection_for_a_rejected_file() {
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let t = TestDir::new("svcreject");
+        let fake = FakeRefresher::new(Ok(fake_status(Some(NOW_I))));
+        let mut c = served(&t, &fake);
+        let dir = t.cache_dir();
+        rebuild_in(&dir, NOW_I);
+        messages(&mut c, NOW_I);
+        rebuild_in(&dir, NOW_I + 10);
+        Connection::open(dir.join(DB_NAME))
+            .unwrap()
+            .execute(
+                "UPDATE mcp_meta SET value = '0' WHERE key = 'format_version'",
+                [],
+            )
+            .unwrap();
+        c.reopen_hook = Some(|_| {
+            N.fetch_add(1, Ordering::SeqCst);
+        });
+        assert_eq!(messages(&mut c, NOW_I + 20), 4);
+        assert_eq!(messages(&mut c, NOW_I + 30), 4);
+        assert_eq!(N.load(Ordering::SeqCst), 1);
+        assert_eq!(built_unix(&c), Some(NOW_I));
+        assert_eq!(c.builds, 0);
+    }
+
+    #[test]
+    fn unavailable_service_with_a_database_serves_from_disk() {
+        let t = TestDir::new("svcdown");
+        let why = "the refresh service did not start; see service.log";
+        let fake = FakeRefresher::new(Err(why.into()));
+        let mut c = served(&t, &fake);
+        rebuild_in(&t.cache_dir(), NOW_I);
+        assert_eq!(messages(&mut c, NOW_I), 4);
+        assert_eq!(c.builds, 0);
+        let st = c.status();
+        assert_eq!(st.last_error, Some(why));
+        let view = st.service.expect("a service view");
+        assert!(!view.running);
+        assert!(!view.building);
+        assert_eq!(view.last_error.as_deref(), Some(why));
+        assert_eq!(view.version, None);
+        assert_eq!(view.pid, None);
+    }
+
+    #[test]
+    fn unavailable_service_without_a_database_is_the_error() {
+        let t = TestDir::new("svcdownnodb");
+        let why = "the refresh service cannot read the store: permission denied";
+        let fake = FakeRefresher::new(Err(why.into()));
+        let mut c = served(&t, &fake);
+        let started = Instant::now();
+        assert_eq!(c.connection_at(NOW_I).err().as_deref(), Some(why));
+        assert!(started.elapsed() < WAIT, "{:?}", started.elapsed());
+        assert_eq!(fake.counts(), (1, 0, 0));
+        assert_eq!(c.builds, 0);
+        assert!(!c.db_path().exists());
+    }
+
+    #[test]
+    fn first_call_waits_for_the_first_build() {
+        let t = TestDir::new("svcfirst");
+        let fake = FakeRefresher::new(Ok(building()));
+        let dir = t.cache_dir();
+        fake.script().action = Some(Box::new(move |op, n| {
+            if op == FakeOp::Status && n == 3 {
+                rebuild_in(&dir, NOW_I);
+                return Some(Ok(fake_status(Some(NOW_I))));
+            }
+            None
+        }));
+        let mut c = served(&t, &fake);
+        assert_eq!(messages(&mut c, NOW_I), 4);
+        assert_eq!(built_unix(&c), Some(NOW_I));
+        let (touches, statuses, _) = fake.counts();
+        assert_eq!(touches, 1);
+        assert!((3..=4).contains(&statuses), "{statuses}");
+        assert_eq!(c.builds, 0);
+    }
+
+    #[test]
+    fn failed_first_build_of_the_service_is_the_error_at_once() {
+        let t = TestDir::new("svcfirstfail");
+        let fake = FakeRefresher::new(Ok(building()));
+        fake.script().action = Some(Box::new(|op, n| {
+            (op == FakeOp::Status && n == 2).then(|| {
+                Ok(ServiceStatus {
+                    last_error: Some("export: boom".into()),
+                    ..fake_status(None)
+                })
+            })
+        }));
+        let mut c = served(&t, &fake);
+        let started = Instant::now();
+        assert_eq!(
+            c.connection_at(NOW_I).err().as_deref(),
+            Some("export: boom")
+        );
+        assert!(started.elapsed() < WAIT, "{:?}", started.elapsed());
+        assert_eq!(fake.counts(), (1, 2, 0));
+        // Reported with building false right away: no status request.
+        let fake = FakeRefresher::new(Ok(ServiceStatus {
+            last_error: Some("export: boom".into()),
+            ..fake_status(None)
+        }));
+        let mut c = served(&t, &fake);
+        assert_eq!(
+            c.connection_at(NOW_I).err().as_deref(),
+            Some("export: boom")
+        );
+        assert_eq!(fake.counts(), (1, 0, 0));
+    }
+
+    #[test]
+    fn first_build_that_does_not_come_is_an_error_after_the_wait() {
+        let t = TestDir::new("svcfirstslow");
+        let fake = FakeRefresher::new(Ok(building()));
+        let mut c = served(&t, &fake);
+        let started = Instant::now();
+        assert_eq!(
+            c.connection_at(NOW_I).err().as_deref(),
+            Some(FIRST_BUILD_PENDING)
+        );
+        assert!(started.elapsed() >= WAIT, "{:?}", started.elapsed());
+        assert!(started.elapsed() < WAIT * 5, "{:?}", started.elapsed());
+        assert!(fake.counts().1 >= 5, "{:?}", fake.counts());
+    }
+
+    #[test]
+    fn database_of_a_newer_format_with_a_newer_service_asks_for_a_restart() {
+        let t = TestDir::new("svcnewer");
+        let newer = ServiceStatus {
+            version: "99.0.0".into(),
+            ..fake_status(Some(NOW_I))
+        };
+        let fake = FakeRefresher::new(Ok(newer));
+        let mut c = served(&t, &fake);
+        let dir = t.cache_dir();
+        rebuild_in(&dir, NOW_I);
+        Connection::open(dir.join(DB_NAME))
+            .unwrap()
+            .execute(
+                "UPDATE mcp_meta SET value = '99' WHERE key = 'format_version'",
+                [],
+            )
+            .unwrap();
+        let started = Instant::now();
+        assert_eq!(c.connection_at(NOW_I).err().as_deref(), Some(OLDER_SERVER));
+        assert!(started.elapsed() < WAIT, "{:?}", started.elapsed());
+        // With a service of this version the file is its to rebuild: wait.
+        let fake = FakeRefresher::new(Ok(building()));
+        let mut c = served(&t, &fake);
+        assert_eq!(
+            c.connection_at(NOW_I).err().as_deref(),
+            Some(FIRST_BUILD_PENDING)
+        );
+    }
+
+    #[test]
+    fn force_refresh_asks_the_service_and_serves_the_new_database() {
+        let t = TestDir::new("svcrefresh");
+        let fake = FakeRefresher::new(Ok(fake_status(Some(NOW_I))));
+        let dir = t.cache_dir();
+        fake.script().action = Some(Box::new(move |op, _| {
+            if op == FakeOp::Refresh {
+                rebuild_in(&dir, NOW_I + 100);
+            }
+            None
+        }));
+        let mut c = served(&t, &fake);
+        rebuild_in(&t.cache_dir(), NOW_I);
+        messages(&mut c, NOW_I);
+        c.force_refresh_at(NOW_I + 100).unwrap();
+        assert_eq!(fake.counts(), (1, 0, 1));
+        // In use at once, before the next call.
+        assert_eq!(built_unix(&c), Some(NOW_I + 100));
+        assert_eq!(c.db_id, file_id(&c.db_path()));
+        assert_eq!(c.builds, 0);
+    }
+
+    #[test]
+    fn failed_refresh_of_the_service_is_the_error_and_keeps_the_database() {
+        let t = TestDir::new("svcrefreshfail");
+        let fake = FakeRefresher::new(Ok(fake_status(Some(NOW_I))));
+        fake.script().refresh_reply = Some(Err("export: boom".into()));
+        let mut c = served(&t, &fake);
+        rebuild_in(&t.cache_dir(), NOW_I);
+        messages(&mut c, NOW_I);
+        assert_eq!(c.force_refresh_at(NOW_I + 5).unwrap_err(), "export: boom");
+        assert_eq!(built_unix(&c), Some(NOW_I));
+        assert_eq!(messages(&mut c, NOW_I + 6), 4);
+        assert_eq!(fake.counts(), (2, 0, 1));
+        assert_eq!(c.builds, 0);
     }
 
     /// Create the optional type tables the way [`prepare`] does, so a test
