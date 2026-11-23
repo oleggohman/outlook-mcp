@@ -55,7 +55,7 @@ const PROFILES_DIR: &str = "Library/Group Containers/UBF8T346G9.Office/Outlook/O
 const COPY_ATTEMPTS: usize = 3;
 
 /// `last_error` while a build runs; it stays when the build panics.
-const BUILD_UNFINISHED: &str = "the last cache build did not finish (internal error)";
+pub(crate) const BUILD_UNFINISHED: &str = "the last cache build did not finish (internal error)";
 
 /// Longest body text put in the search index, in chars.
 const MAX_FTS_BODY: usize = 200_000;
@@ -639,7 +639,7 @@ pub fn ensure_dir(dir: &Path) -> Result<(), String> {
 /// user that neither group nor others can access. The directory may have
 /// been open to others before [`ensure_dir`] tightened it, so a file in it
 /// is not trusted for being there.
-fn check_private(m: &std::fs::Metadata) -> Result<(), &'static str> {
+pub(crate) fn check_private(m: &std::fs::Metadata) -> Result<(), &'static str> {
     if !m.file_type().is_file() {
         return Err("is not a regular file");
     }
@@ -725,7 +725,7 @@ fn create_private(path: &Path) -> std::io::Result<()> {
 }
 
 /// `(len, mtime in ns)` of `path`.
-fn stamp(path: &Path) -> std::io::Result<(u64, i64)> {
+pub(crate) fn stamp(path: &Path) -> std::io::Result<(u64, i64)> {
     let m = std::fs::metadata(path)?;
     Ok((
         m.len(),

@@ -5,18 +5,28 @@
 //! touches a socket, a thread or the clock; every method takes the time as
 //! `now` (unix seconds). The work it decides on is done through a
 //! [`Backend`].
+//!
+//! [`serve`] is the runtime around it: the socket server, the build
+//! threads and the policy loop. [`InstanceLock`] makes the service the only
+//! one of its cache directory.
 
-use std::io;
-use std::sync::Arc;
+use std::fs::{File, OpenOptions};
+use std::io::{self, BufRead, Read, Write};
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::panic::{self, AssertUnwindSafe};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-use crate::mcp::cache::{DbInfo, FileId};
+use crate::mcp::cache::{self, DbInfo, FileId, BUILD_UNFINISHED};
+use crate::mcp::log;
 use crate::mcp::proto::{self, Request, ServiceStatus, UNUSABLE_REBUILD_SECS, VERSION};
-
-/// `last_error` while a build runs; it stays when the build never reports
-/// its end.
-const BUILD_UNFINISHED: &str = "the last cache build did not finish (internal error)";
 
 /// What the service works on: the live store and `mail.db`.
 pub trait Backend {
@@ -351,6 +361,505 @@ fn secs(s: u64) -> i64 {
     i64::try_from(s).unwrap_or(i64::MAX)
 }
 
+// --- runtime ---
+
+/// How long [`InstanceLock::acquire`] tries a held lock before it gives up,
+/// and how often. A service that just exited may hold its lock for a moment
+/// after it is seen as gone.
+const LOCK_RETRY: Duration = Duration::from_millis(250);
+const LOCK_RETRY_POLL: Duration = Duration::from_millis(10);
+
+/// `service.lock` could not be taken.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LockError {
+    /// Another process holds it.
+    Busy,
+    /// It could not be opened, locked or written.
+    Failed(String),
+}
+
+/// The single-instance lock `service.lock`, held for the life of the
+/// service. The kernel releases it when the process ends.
+#[derive(Debug)]
+pub struct InstanceLock {
+    _file: File,
+}
+
+impl InstanceLock {
+    /// Take `service.lock` in `dir` with an exclusive `flock` and write
+    /// `<pid> <version>` into it. A held lock is tried again for up to
+    /// [`LOCK_RETRY`] before this returns [`LockError::Busy`]. An existing
+    /// file that is not a private regular file (a symbolic link, say) is
+    /// removed and created again; a symbolic link is never followed.
+    pub fn acquire(dir: &Path) -> Result<InstanceLock, LockError> {
+        let path = dir.join(proto::LOCK_NAME);
+        let failed =
+            |what: &str, e: io::Error| LockError::Failed(format!("{what} {}: {e}", path.display()));
+        if std::fs::symlink_metadata(&path).is_ok_and(|m| cache::check_private(&m).is_err()) {
+            std::fs::remove_file(&path).map_err(|e| failed("remove", e))?;
+        }
+        // Not truncated here: the file is the record of the holder until
+        // this process holds the lock.
+        let mut f = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)
+            .map_err(|e| failed("open", e))?;
+        let deadline = Instant::now() + LOCK_RETRY;
+        loop {
+            // SAFETY: flock() on a descriptor owned by `f` for the whole call.
+            if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                break;
+            }
+            let e = io::Error::last_os_error();
+            match e.kind() {
+                io::ErrorKind::Interrupted => {}
+                io::ErrorKind::WouldBlock if Instant::now() >= deadline => {
+                    return Err(LockError::Busy)
+                }
+                io::ErrorKind::WouldBlock => thread::sleep(LOCK_RETRY_POLL),
+                _ => return Err(failed("lock", e)),
+            }
+        }
+        f.set_len(0)
+            .and_then(|()| f.write_all(format!("{} {VERSION}\n", std::process::id()).as_bytes()))
+            .map_err(|e| failed("write", e))?;
+        Ok(InstanceLock { _file: f })
+    }
+}
+
+/// The socket file a listener was bound to, by path and identity.
+#[derive(Debug, Clone)]
+pub struct SocketFile {
+    path: PathBuf,
+    dev: u64,
+    ino: u64,
+}
+
+impl SocketFile {
+    /// The socket file of `listener`, as it is now.
+    pub fn of(listener: &UnixListener) -> io::Result<SocketFile> {
+        let addr = listener.local_addr()?;
+        let path = addr
+            .as_pathname()
+            .ok_or_else(|| io::Error::other("the listener has no path"))?
+            .to_path_buf();
+        let m = std::fs::symlink_metadata(&path)?;
+        Ok(SocketFile {
+            path,
+            dev: m.dev(),
+            ino: m.ino(),
+        })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Whether the path still names this socket file (not removed, not
+    /// replaced).
+    pub fn is_present(&self) -> bool {
+        std::fs::symlink_metadata(&self.path)
+            .is_ok_and(|m| m.file_type().is_socket() && m.dev() == self.dev && m.ino() == self.ino)
+    }
+
+    /// Remove the socket file when it still is this one; whether it did.
+    pub fn remove_if_ours(&self) -> bool {
+        self.is_present() && std::fs::remove_file(&self.path).is_ok()
+    }
+}
+
+/// Bind the service's listening socket at `path`: remove whatever stale
+/// file is there (only the holder of `service.lock` calls this), bind with
+/// `umask(0o077)`, then set the socket to 0600.
+pub fn bind_socket(path: &Path) -> io::Result<UnixListener> {
+    match std::fs::symlink_metadata(path) {
+        Ok(m) if m.is_dir() => {
+            return Err(io::Error::other(format!(
+                "{} is a directory",
+                path.display()
+            )))
+        }
+        Ok(_) => std::fs::remove_file(path)?,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    // SAFETY: umask() has no preconditions and cannot fail.
+    let old = unsafe { libc::umask(0o077) };
+    let bound = UnixListener::bind(path);
+    // SAFETY: as above.
+    unsafe { libc::umask(old) };
+    let listener = bound?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    Ok(listener)
+}
+
+/// Asks [`serve`] to end, and wakes its policy loop. Clones share one
+/// state.
+#[derive(Debug, Clone, Default)]
+pub struct Stop(Arc<(Mutex<StopState>, Condvar)>);
+
+#[derive(Debug, Default)]
+struct StopState {
+    exit: Option<Exit>,
+    /// Something changed since the policy loop last looked.
+    woken: bool,
+}
+
+impl Stop {
+    pub fn new() -> Stop {
+        Stop::default()
+    }
+
+    /// End [`serve`] with `exit`; the first request wins.
+    pub fn request(&self, exit: Exit) {
+        let mut s = relock(&self.0 .0);
+        s.exit.get_or_insert(exit);
+        self.0 .1.notify_all();
+    }
+
+    /// The requested end, if any.
+    pub fn requested(&self) -> Option<Exit> {
+        relock(&self.0 .0).exit
+    }
+
+    /// Make the policy loop look at the state now.
+    fn wake(&self) {
+        relock(&self.0 .0).woken = true;
+        self.0 .1.notify_all();
+    }
+
+    /// Wait until an end is requested, the loop is woken, or `timeout`
+    /// passed; the requested end, if any.
+    fn wait(&self, timeout: Duration) -> Option<Exit> {
+        let s = relock(&self.0 .0);
+        let (mut s, _) = self
+            .0
+             .1
+            .wait_timeout_while(s, timeout, |s| s.exit.is_none() && !s.woken)
+            .unwrap_or_else(|e| e.into_inner());
+        s.woken = false;
+        s.exit
+    }
+}
+
+/// Lock `m`, also when a thread panicked while holding it.
+fn relock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The clock of [`serve`]: unix seconds.
+pub type Clock = Arc<dyn Fn() -> i64 + Send + Sync>;
+
+/// What the threads of [`serve`] share.
+struct Shared<B> {
+    core: Mutex<Core<B>>,
+    /// Notified at the end of every build and when `serve` ends.
+    built: Condvar,
+    clock: Clock,
+    tick: Duration,
+    stop: Stop,
+    /// `serve` is ending: threads stop waiting.
+    closing: AtomicBool,
+}
+
+/// Serve requests on `listener` and run the policy of `core` until it, a
+/// `shutdown` request or `stop` ends it; the reason.
+///
+/// The calling thread runs the policy: it polls `core` after every request,
+/// after every build and every `tick`, starts builds, and checks every
+/// tick that the socket file is still the one bound (removed or replaced:
+/// [`Exit::SocketGone`]). An accept thread serves each connection on a
+/// thread of its own (at most [`proto::MAX_CONNECTIONS`] at once, each with
+/// [`proto::CONNECTION_TIMEOUT`]); each build runs on a thread of its own.
+///
+/// On return the accept thread has ended and `listener` is closed; a
+/// running build and open connections are not waited for. Starts no signal
+/// handling.
+pub fn serve<B>(
+    core: Core<B>,
+    listener: UnixListener,
+    clock: Clock,
+    tick: Duration,
+    stop: Stop,
+) -> Exit
+where
+    B: Backend + Send + Sync + 'static,
+{
+    let socket = SocketFile::of(&listener).ok();
+    let shared = Arc::new(Shared {
+        core: Mutex::new(core),
+        built: Condvar::new(),
+        clock,
+        tick,
+        stop,
+        closing: AtomicBool::new(false),
+    });
+    // The accept thread waits on the listener and on this pair, which
+    // ends it at once also when the socket file is gone.
+    let wake = UnixStream::pair().ok();
+    let (wake_tx, wake_rx) = match wake {
+        Some((a, b)) => (Some(a), Some(b)),
+        None => (None, None),
+    };
+    let accept = {
+        let sh = Arc::clone(&shared);
+        thread::Builder::new()
+            .name("accept".into())
+            .spawn(move || accept_loop(&sh, listener, wake_rx))
+    };
+    let exit = match &accept {
+        Err(e) => {
+            log(&format!("cannot start the accept thread: {e}"));
+            Exit::SocketGone
+        }
+        Ok(_) => policy_loop(&shared, socket.as_ref()),
+    };
+    shared.closing.store(true, AtomicOrdering::SeqCst);
+    {
+        // Under the lock, so no waiter misses it between check and wait.
+        let _core = relock(&shared.core);
+        shared.built.notify_all();
+    }
+    if let Some(mut w) = wake_tx {
+        let _ = w.write_all(b"x");
+    }
+    if let Ok(h) = accept {
+        let _ = h.join();
+    }
+    exit
+}
+
+/// The policy thread of [`serve`]; returns the end.
+fn policy_loop<B>(shared: &Arc<Shared<B>>, socket: Option<&SocketFile>) -> Exit
+where
+    B: Backend + Send + Sync + 'static,
+{
+    loop {
+        if let Some(e) = shared.stop.requested() {
+            return e;
+        }
+        let now = (shared.clock)();
+        {
+            let mut core = relock(&shared.core);
+            match core.poll(now) {
+                Action::Exit(e) => return e,
+                Action::Build(reason) => {
+                    core.build_started(now);
+                    start_build(shared, &mut core, reason, now);
+                }
+                Action::Wait => {}
+            }
+        }
+        if !socket.is_some_and(SocketFile::is_present) {
+            return Exit::SocketGone;
+        }
+        if let Some(e) = shared.stop.wait(shared.tick) {
+            return e;
+        }
+    }
+}
+
+/// Run a build that `core` recorded as started at `now` on a thread of its
+/// own; a panic counts as a failed build.
+fn start_build<B>(shared: &Arc<Shared<B>>, core: &mut Core<B>, reason: BuildReason, now: i64)
+where
+    B: Backend + Send + Sync + 'static,
+{
+    log(&format!("build started ({})", reason.as_str()));
+    let backend = core.backend();
+    let sh = Arc::clone(shared);
+    let started = thread::Builder::new().name("build".into()).spawn(move || {
+        let result = panic::catch_unwind(AssertUnwindSafe(|| backend.build(now)))
+            .unwrap_or_else(|_| Err(BUILD_UNFINISHED.to_string()));
+        if let Err(e) = &result {
+            log(&format!("build failed: {e}"));
+        }
+        let end = (sh.clock)();
+        relock(&sh.core).build_finished(result, end);
+        sh.built.notify_all();
+        sh.stop.wake();
+    });
+    if let Err(e) = started {
+        let msg = format!("cannot start a build: {e}");
+        log(&msg);
+        core.build_finished(Err(msg), now);
+        shared.built.notify_all();
+    }
+}
+
+/// The accept thread of [`serve`]: waits for connections (and for a byte
+/// on `wake`), serves each on a thread of its own, and returns when
+/// `closing` is set.
+fn accept_loop<B>(shared: &Arc<Shared<B>>, listener: UnixListener, wake: Option<UnixStream>)
+where
+    B: Backend + Send + Sync + 'static,
+{
+    // Non-blocking, so a connection that vanished between the wait and
+    // `accept` cannot block this thread.
+    if listener.set_nonblocking(true).is_err() {
+        log("cannot make the listener non-blocking");
+    }
+    let active = Arc::new(AtomicUsize::new(0));
+    let mut fds = vec![libc::pollfd {
+        fd: listener.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    }];
+    if let Some(w) = &wake {
+        fds.push(libc::pollfd {
+            fd: w.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        });
+    }
+    // Without the wake pair, `closing` is still seen within a tick.
+    let timeout = if wake.is_some() {
+        -1
+    } else {
+        libc::c_int::try_from(shared.tick.as_millis().max(1)).unwrap_or(1000)
+    };
+    while !shared.closing.load(AtomicOrdering::SeqCst) {
+        // SAFETY: `fds` is a valid array of `fds.len()` entries whose
+        // descriptors stay open for the call.
+        let n = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout) };
+        if n < 0 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+            thread::sleep(Duration::from_millis(10));
+        }
+        if shared.closing.load(AtomicOrdering::SeqCst) {
+            break;
+        }
+        match listener.accept() {
+            Ok((stream, _)) => admit(shared, stream, &active),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                ) => {}
+            // Out of descriptors, say: do not spin.
+            Err(_) => thread::sleep(Duration::from_millis(10)),
+        }
+    }
+}
+
+/// Serve `stream` on a thread of its own, or close it at once when
+/// [`proto::MAX_CONNECTIONS`] are served already.
+fn admit<B>(shared: &Arc<Shared<B>>, stream: UnixStream, active: &Arc<AtomicUsize>)
+where
+    B: Backend + Send + Sync + 'static,
+{
+    if active.fetch_add(1, AtomicOrdering::SeqCst) >= proto::MAX_CONNECTIONS {
+        active.fetch_sub(1, AtomicOrdering::SeqCst);
+        return;
+    }
+    let sh = Arc::clone(shared);
+    let count = Arc::clone(active);
+    let spawned = thread::Builder::new()
+        .name("connection".into())
+        .spawn(move || {
+            connection(&sh, stream);
+            count.fetch_sub(1, AtomicOrdering::SeqCst);
+        });
+    if spawned.is_err() {
+        active.fetch_sub(1, AtomicOrdering::SeqCst);
+    }
+}
+
+/// One line read from a connection.
+enum Line {
+    Text(String),
+    /// Over [`proto::MAX_REQUEST_BYTES`], or not UTF-8.
+    Bad,
+    /// Nothing before end of input, an error or the timeout.
+    Nothing,
+}
+
+/// Read one request line, at most [`proto::MAX_REQUEST_BYTES`] and its
+/// newline.
+fn read_line(s: &UnixStream) -> Line {
+    let mut buf = Vec::new();
+    let limit = proto::MAX_REQUEST_BYTES as u64 + 2;
+    match io::BufReader::new(s.take(limit)).read_until(b'\n', &mut buf) {
+        Ok(0) | Err(_) => Line::Nothing,
+        Ok(_) if !buf.ends_with(b"\n") && buf.len() > proto::MAX_REQUEST_BYTES => Line::Bad,
+        Ok(_) => String::from_utf8(buf).map_or(Line::Bad, Line::Text),
+    }
+}
+
+/// Write `v` as one line; errors are ignored (the client went away).
+fn reply(mut s: &UnixStream, v: &Value) {
+    let _ = s.write_all(format!("{v}\n").as_bytes());
+}
+
+/// Serve one connection: one request, one reply.
+fn connection<B>(shared: &Arc<Shared<B>>, s: UnixStream)
+where
+    B: Backend + Send + Sync + 'static,
+{
+    // A listener's non-blocking mode can be inherited.
+    if s.set_nonblocking(false).is_err()
+        || s.set_read_timeout(Some(proto::CONNECTION_TIMEOUT)).is_err()
+        || s.set_write_timeout(Some(proto::CONNECTION_TIMEOUT))
+            .is_err()
+    {
+        return;
+    }
+    let req = match read_line(&s) {
+        Line::Nothing => return,
+        Line::Bad => return reply(&s, &proto::bad_request_reply()),
+        Line::Text(t) => match Request::parse(&t) {
+            Ok(r) => r,
+            Err(_) => return reply(&s, &proto::bad_request_reply()),
+        },
+    };
+    let now = (shared.clock)();
+    let mut core = relock(&shared.core);
+    if let Request::Shutdown { version } = &req {
+        log(&format!("shutdown requested by version {version}"));
+    }
+    let handled = core.handle(&req, now);
+    if let Some(reason) = handled.build {
+        start_build(shared, &mut core, reason, now);
+    }
+    match handled.reply {
+        Reply::Send(v) => {
+            if matches!(req, Request::Shutdown { .. }) {
+                // Written before the policy loop can see the stop (it needs
+                // the lock), so the reply leaves before the process ends. A
+                // reply this short never waits for the reader.
+                reply(&s, &v);
+                drop(core);
+                shared.stop.wake();
+            } else {
+                drop(core);
+                shared.stop.wake();
+                reply(&s, &v);
+            }
+        }
+        Reply::AfterBuild(n) => {
+            shared.stop.wake();
+            while core.generation() < n && !shared.closing.load(AtomicOrdering::SeqCst) {
+                core = shared
+                    .built
+                    .wait_timeout(core, shared.tick)
+                    .unwrap_or_else(|e| e.into_inner())
+                    .0;
+            }
+            if shared.closing.load(AtomicOrdering::SeqCst) {
+                // The service ends; the build may never finish.
+                return;
+            }
+            let v = core.refresh_reply();
+            drop(core);
+            reply(&s, &v);
+        }
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -377,6 +886,9 @@ pub(crate) mod tests {
         pub builds: u64,
         /// Calls of `db`.
         pub db_reads: u64,
+        /// `Some`: the next build blocks until the sender sends or is
+        /// dropped.
+        pub gate: Option<std::sync::mpsc::Receiver<()>>,
     }
 
     /// A backend whose answers the test sets.
@@ -393,6 +905,7 @@ pub(crate) mod tests {
                 fail: None,
                 builds: 0,
                 db_reads: 0,
+                gate: None,
             }))
         }
 
@@ -422,9 +935,17 @@ pub(crate) mod tests {
         }
 
         fn build(&self, _now: i64) -> Result<(), String> {
-            let mut s = self.0.lock().unwrap();
-            s.builds += 1;
-            match &s.fail {
+            let gate = {
+                let mut s = self.0.lock().unwrap();
+                s.builds += 1;
+                s.gate.take()
+            };
+            // Blocks without holding the state, so the service can still
+            // read it.
+            if let Some(g) = gate {
+                let _ = g.recv();
+            }
+            match &self.0.lock().unwrap().fail {
                 Some(e) => Err(e.clone()),
                 None => Ok(()),
             }
@@ -910,5 +1431,440 @@ pub(crate) mod tests {
             c.poll(NOW + t);
         }
         assert_eq!(c.backend().get(|s| s.db_reads), 1);
+    }
+
+    // --- runtime ---
+
+    use crate::mcp::proto::{exchange, ExchangeError, LOCK_NAME, SOCKET_NAME};
+    use crate::testutil::process_lock;
+    use serde_json::json;
+    use std::io::{Read, Write};
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::os::unix::net::UnixStream;
+    use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Instant;
+
+    const TEST_TICK: Duration = Duration::from_millis(10);
+    const REQ: Duration = Duration::from_secs(2);
+
+    /// A fresh directory with a short path under the system temp dir,
+    /// removed on drop.
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn new() -> TestDir {
+            static N: AtomicUsize = AtomicUsize::new(0);
+            let p = std::env::temp_dir().join(format!(
+                "hxv-{}-{}",
+                std::process::id(),
+                N.fetch_add(1, Ordering::Relaxed)
+            ));
+            let _ = std::fs::remove_dir_all(&p);
+            std::fs::create_dir_all(&p).unwrap();
+            TestDir(p)
+        }
+
+        fn sock(&self) -> PathBuf {
+            self.0.join(SOCKET_NAME)
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Poll `cond` every 5 ms until it holds; fails the test after
+    /// `timeout`.
+    fn wait_until(what: &str, timeout: Duration, mut cond: impl FnMut() -> bool) {
+        let started = Instant::now();
+        while !cond() {
+            assert!(started.elapsed() < timeout, "timed out waiting for {what}");
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Whether SIGTERM or SIGINT is blocked in the calling thread.
+    fn stop_signals_blocked() -> bool {
+        // SAFETY: plain data; the calls only read and write `set`.
+        unsafe {
+            let mut set: libc::sigset_t = std::mem::zeroed();
+            libc::pthread_sigmask(libc::SIG_BLOCK, std::ptr::null(), &mut set);
+            libc::sigismember(&set, libc::SIGTERM) == 1
+                || libc::sigismember(&set, libc::SIGINT) == 1
+        }
+    }
+
+    /// `serve` running on a thread with a fake backend, a test clock and a
+    /// 10 ms tick.
+    struct Running {
+        sock: PathBuf,
+        clock: Arc<AtomicI64>,
+        stop: Stop,
+        backend: Arc<FakeBackend>,
+        /// The exit, and whether `serve` left the stop signals blocked.
+        handle: Option<thread::JoinHandle<(Exit, bool)>>,
+        gate: Option<mpsc::Sender<()>>,
+    }
+
+    impl Running {
+        /// Serve `core` on `dir`; with `gated` the first build blocks until
+        /// [`Running::release`].
+        fn start(dir: &TestDir, core: Core<FakeBackend>, gated: bool) -> Running {
+            let backend = core.backend();
+            let gate = gated.then(|| {
+                let (tx, rx) = mpsc::channel();
+                backend.set(|s| s.gate = Some(rx));
+                tx
+            });
+            let listener = bind_socket(&dir.sock()).unwrap();
+            let clock = Arc::new(AtomicI64::new(NOW));
+            let c = Arc::clone(&clock);
+            let stop = Stop::new();
+            let s = stop.clone();
+            let handle = thread::spawn(move || {
+                let exit = serve(
+                    core,
+                    listener,
+                    Arc::new(move || c.load(Ordering::SeqCst)),
+                    TEST_TICK,
+                    s,
+                );
+                (exit, stop_signals_blocked())
+            });
+            Running {
+                sock: dir.sock(),
+                clock,
+                stop,
+                backend,
+                handle: Some(handle),
+                gate,
+            }
+        }
+
+        fn req(&self, r: &Request) -> Result<Value, ExchangeError> {
+            exchange(&self.sock, r, REQ)
+        }
+
+        /// Send `r` on another thread.
+        fn req_async(&self, r: Request) -> thread::JoinHandle<Result<Value, ExchangeError>> {
+            let sock = self.sock.clone();
+            thread::spawn(move || exchange(&sock, &r, Duration::from_secs(10)))
+        }
+
+        fn release(&mut self) {
+            self.gate.take();
+        }
+
+        fn builds(&self) -> u64 {
+            self.backend.get(|s| s.builds)
+        }
+
+        /// The exit of `serve`, which must come within `within`; checks
+        /// that its accept thread has ended and that it blocked no signal.
+        fn exit(&mut self, within: Duration) -> Exit {
+            let h = self.handle.take().unwrap();
+            wait_until("serve to return", within, || h.is_finished());
+            let (exit, blocked) = h.join().unwrap();
+            assert!(!blocked, "serve blocked a stop signal");
+            if self.sock.exists() {
+                // The listener is closed.
+                assert!(UnixStream::connect(&self.sock).is_err());
+            }
+            exit
+        }
+    }
+
+    impl Drop for Running {
+        fn drop(&mut self) {
+            self.stop.request(Exit::Signal);
+            self.release();
+            if let Some(h) = self.handle.take() {
+                let _ = h.join();
+            }
+        }
+    }
+
+    /// A core with an up-to-date database, never idle.
+    fn served(dir: &TestDir, gated: bool) -> Running {
+        Running::start(dir, fresh(900, 0), gated)
+    }
+
+    // --- InstanceLock ---
+
+    #[test]
+    fn instance_lock_writes_pid_and_version_privately() {
+        let t = TestDir::new();
+        let _l = InstanceLock::acquire(&t.0).unwrap();
+        let p = t.0.join(LOCK_NAME);
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            format!("{} {VERSION}\n", std::process::id())
+        );
+        assert_eq!(std::fs::metadata(&p).unwrap().mode() & 0o777, 0o600);
+    }
+
+    #[test]
+    fn instance_lock_is_busy_while_held_and_free_after_drop() {
+        let t = TestDir::new();
+        let first = InstanceLock::acquire(&t.0).unwrap();
+        let started = Instant::now();
+        assert_eq!(InstanceLock::acquire(&t.0).unwrap_err(), LockError::Busy);
+        // Tried again for a while before giving up.
+        assert!(started.elapsed() >= Duration::from_millis(200));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        // The loser did not change the holder's record.
+        assert_eq!(
+            std::fs::read_to_string(t.0.join(LOCK_NAME)).unwrap(),
+            format!("{} {VERSION}\n", std::process::id())
+        );
+        drop(first);
+        InstanceLock::acquire(&t.0).unwrap();
+    }
+
+    #[test]
+    fn instance_lock_released_shortly_after_the_first_attempt_is_taken() {
+        let t = TestDir::new();
+        let first = InstanceLock::acquire(&t.0).unwrap();
+        let h = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            drop(first);
+        });
+        InstanceLock::acquire(&t.0).unwrap();
+        h.join().unwrap();
+    }
+
+    #[test]
+    fn instance_lock_replaces_a_symlink() {
+        let t = TestDir::new();
+        let target = t.0.join("target");
+        std::fs::write(&target, b"keep").unwrap();
+        std::os::unix::fs::symlink(&target, t.0.join(LOCK_NAME)).unwrap();
+        let _l = InstanceLock::acquire(&t.0).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"keep");
+        let m = std::fs::symlink_metadata(t.0.join(LOCK_NAME)).unwrap();
+        assert!(m.file_type().is_file());
+        // A file open to others is replaced too.
+        drop(_l);
+        let p = t.0.join(LOCK_NAME);
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let _l = InstanceLock::acquire(&t.0).unwrap();
+        assert_eq!(std::fs::metadata(&p).unwrap().mode() & 0o777, 0o600);
+    }
+
+    // --- serve: requests ---
+
+    #[test]
+    fn serve_answers_status_and_touch() {
+        let _p = process_lock();
+        let t = TestDir::new();
+        let r = served(&t, false);
+        for req in [Request::Status, Request::Touch] {
+            let v = r.req(&req).unwrap();
+            assert_eq!(v["ok"], true);
+            assert_eq!(v["version"], VERSION);
+            assert_eq!(v["pid"], std::process::id());
+            assert_eq!(v["store_path"], STORE);
+            assert_eq!(v["building"], false);
+        }
+        assert_eq!(r.builds(), 0);
+    }
+
+    #[test]
+    fn touch_on_a_stale_cache_starts_a_build_without_waiting_for_it() {
+        let _p = process_lock();
+        let t = TestDir::new();
+        let core = fresh(0, 0);
+        core.backend().set(|s| s.stamp = Some(STAMP2));
+        let mut r = Running::start(&t, core, true);
+        let v = r.req(&Request::Touch).unwrap();
+        assert_eq!(v["building"], true);
+        wait_until("the build", REQ, || r.builds() == 1);
+        // The build is blocked; status still answers.
+        let v = r.req(&Request::Status).unwrap();
+        assert_eq!(v["building"], true);
+        assert_eq!(v["builds"], 0);
+        r.release();
+        wait_until("the build end", REQ, || {
+            r.req(&Request::Status).unwrap()["building"] == false
+        });
+        assert_eq!(r.req(&Request::Status).unwrap()["builds"], 1);
+    }
+
+    #[test]
+    fn first_build_runs_at_start_and_status_answers_meanwhile() {
+        let _p = process_lock();
+        let t = TestDir::new();
+        let mut r = Running::start(&t, core(900, 0), true);
+        wait_until("the first build", REQ, || r.builds() == 1);
+        let v = r.req(&Request::Status).unwrap();
+        assert_eq!(v["building"], true);
+        assert_eq!(v["db_usable"], false);
+        r.release();
+    }
+
+    #[test]
+    fn two_refreshes_during_one_build_share_it() {
+        let _p = process_lock();
+        let t = TestDir::new();
+        let mut r = served(&t, true);
+        let a = r.req_async(Request::Refresh);
+        wait_until("the build", REQ, || r.builds() == 1);
+        let b = r.req_async(Request::Refresh);
+        // Both wait for the blocked build.
+        thread::sleep(Duration::from_millis(100));
+        assert!(!a.is_finished() && !b.is_finished());
+        r.release();
+        for h in [a, b] {
+            let v = h.join().unwrap().unwrap();
+            assert_eq!(v["ok"], true);
+            assert_eq!(v["builds"], 1);
+            assert_eq!(v["building"], false);
+        }
+        assert_eq!(r.builds(), 1);
+    }
+
+    #[test]
+    fn failed_refresh_build_replies_with_the_error() {
+        let _p = process_lock();
+        let t = TestDir::new();
+        let r = served(&t, false);
+        r.backend.set(|s| s.fail = Some("boom".into()));
+        let v = r.req(&Request::Refresh).unwrap();
+        assert_eq!(v["ok"], false);
+        assert_eq!(v["error"], "boom");
+        assert_eq!(v["last_error"], "boom");
+        assert_eq!(v["db_usable"], true);
+    }
+
+    // --- serve: ends ---
+
+    #[test]
+    fn serve_returns_idle_when_the_clock_passes_idle_secs() {
+        let _p = process_lock();
+        let t = TestDir::new();
+        let mut r = Running::start(&t, fresh(900, 100), false);
+        r.req(&Request::Status).unwrap();
+        thread::sleep(Duration::from_millis(50));
+        assert!(!r.handle.as_ref().unwrap().is_finished());
+        r.clock.store(NOW + 100, Ordering::SeqCst);
+        assert_eq!(r.exit(REQ), Exit::Idle);
+    }
+
+    #[test]
+    fn shutdown_ends_serve_even_during_a_build() {
+        let _p = process_lock();
+        let t = TestDir::new();
+        let mut r = served(&t, true);
+        let refresh = r.req_async(Request::Refresh);
+        wait_until("the build", REQ, || r.builds() == 1);
+        // Another version is refused.
+        let v = r
+            .req(&Request::Shutdown {
+                version: "0.0.1".into(),
+            })
+            .unwrap();
+        assert_eq!(v, proto::version_mismatch_reply(VERSION));
+        let v = r
+            .req(&Request::Shutdown {
+                version: VERSION.into(),
+            })
+            .unwrap();
+        assert_eq!(v, json!({"ok": true, "stopping": true}));
+        assert_eq!(r.exit(REQ), Exit::Shutdown);
+        r.release();
+        // The waiting refresh gets no reply.
+        assert!(refresh.join().unwrap().is_err());
+    }
+
+    #[test]
+    fn stop_request_ends_serve() {
+        let _p = process_lock();
+        let t = TestDir::new();
+        let mut r = served(&t, false);
+        r.req(&Request::Status).unwrap();
+        r.stop.request(Exit::Signal);
+        assert_eq!(r.exit(Duration::from_millis(500)), Exit::Signal);
+    }
+
+    #[test]
+    fn removed_socket_ends_serve() {
+        let _p = process_lock();
+        let t = TestDir::new();
+        let mut r = served(&t, false);
+        r.req(&Request::Status).unwrap();
+        std::fs::remove_file(t.sock()).unwrap();
+        assert_eq!(r.exit(REQ), Exit::SocketGone);
+
+        // Also when it was replaced by another socket.
+        let t = TestDir::new();
+        let mut r = served(&t, false);
+        std::fs::remove_file(t.sock()).unwrap();
+        let other = UnixListener::bind(t.sock()).unwrap();
+        let h = r.handle.as_ref().unwrap();
+        wait_until("serve to return", REQ, || h.is_finished());
+        // The other listener is not serve's to close.
+        drop(other);
+        assert_eq!(r.exit(REQ), Exit::SocketGone);
+    }
+
+    // --- robustness ---
+
+    #[test]
+    fn bind_socket_replaces_a_stale_socket_and_is_private() {
+        let _p = process_lock();
+        let t = TestDir::new();
+        drop(UnixListener::bind(t.sock()).unwrap());
+        assert!(t.sock().exists());
+        let r = served(&t, false);
+        r.req(&Request::Status).unwrap();
+        let m = std::fs::symlink_metadata(t.sock()).unwrap();
+        assert_eq!(m.mode() & 0o777, 0o600);
+    }
+
+    #[test]
+    fn bad_and_silent_clients_do_not_stop_serve() {
+        let _p = process_lock();
+        let t = TestDir::new();
+        let r = served(&t, false);
+        // Connects and sends nothing.
+        let _silent = UnixStream::connect(t.sock()).unwrap();
+        // A line over the limit.
+        let mut s = UnixStream::connect(t.sock()).unwrap();
+        s.set_read_timeout(Some(REQ)).unwrap();
+        let long = format!("{{\"op\":\"status\",\"pad\":\"{}\"}}\n", "x".repeat(5000));
+        let _ = s.write_all(long.as_bytes());
+        let mut reply = String::new();
+        let _ = s.read_to_string(&mut reply);
+        assert_eq!(reply, format!("{}\n", proto::bad_request_reply()));
+        // Not a request.
+        let mut s = UnixStream::connect(t.sock()).unwrap();
+        s.set_read_timeout(Some(REQ)).unwrap();
+        s.write_all(b"hello\n").unwrap();
+        let mut reply = String::new();
+        s.read_to_string(&mut reply).unwrap();
+        assert_eq!(reply, format!("{}\n", proto::bad_request_reply()));
+        // Still served, while the silent client is connected.
+        assert_eq!(r.req(&Request::Status).unwrap()["ok"], true);
+    }
+
+    #[test]
+    fn connections_over_the_limit_are_closed_at_once() {
+        let _p = process_lock();
+        let t = TestDir::new();
+        let r = served(&t, false);
+        let held: Vec<UnixStream> = (0..proto::MAX_CONNECTIONS)
+            .map(|_| UnixStream::connect(t.sock()).unwrap())
+            .collect();
+        let started = Instant::now();
+        assert_eq!(r.req(&Request::Status), Err(ExchangeError::BadReply));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        drop(held);
+        wait_until("a free connection slot", REQ, || {
+            r.req(&Request::Status).is_ok()
+        });
     }
 }

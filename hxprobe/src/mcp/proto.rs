@@ -459,20 +459,11 @@ pub trait Refresher: std::fmt::Debug {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil::process_lock as serial;
     use std::os::unix::net::UnixListener;
     use std::process::Command;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
-    use std::sync::{Mutex, MutexGuard};
     use std::thread;
-
-    /// Taken by every test here that creates a socket or starts a process:
-    /// a child started by one test while another creates a socket could
-    /// inherit that socket before it is marked close-on-exec, and keep a
-    /// "closed" listener alive.
-    fn serial() -> MutexGuard<'static, ()> {
-        static SERIAL: Mutex<()> = Mutex::new(());
-        SERIAL.lock().unwrap_or_else(|e| e.into_inner())
-    }
 
     /// A fresh directory with a short path under the system temp dir,
     /// removed on drop.

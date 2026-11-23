@@ -7,6 +7,16 @@ use crate::props::PropValue;
 use crate::props_gen::TYPES;
 use crate::value::{ObjRef, COLLECTION_REF_TYPE, ENTRY_VERSION, MIN_ENTRY_LEN};
 
+/// Taken by every unit test that creates a socket or starts a process: a
+/// child started by one test while another creates a socket could inherit
+/// that socket before it is marked close-on-exec, and keep a "closed"
+/// listener alive. A test that failed while holding it does not fail the
+/// others.
+pub fn process_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Encode `data` as a single literal-only LZ4 sequence.
 ///
 /// Token `min(len, 15) << 4`; when `len >= 15` the 255-continuation for
