@@ -910,7 +910,8 @@ fn read_line(mut s: &UnixStream, timeout: Duration) -> Line {
     }
     if buf.is_empty() {
         Line::Nothing
-    } else if !buf.ends_with(b"\n") && buf.len() > proto::MAX_REQUEST_BYTES {
+    } else if buf.len() > limit || (!buf.ends_with(b"\n") && buf.len() > proto::MAX_REQUEST_BYTES) {
+        // A chunk can carry a newline past the limit: no longer a request.
         Line::Bad
     } else {
         String::from_utf8(buf).map_or(Line::Bad, Line::Text)
@@ -2212,6 +2213,16 @@ pub(crate) mod tests {
         let mut fits = vec![b'x'; proto::MAX_REQUEST_BYTES];
         fits.push(b'\n');
         assert!(matches!(line(&fits), Line::Text(t) if t.len() == proto::MAX_REQUEST_BYTES + 1));
+        // A newline after the limit does not make a long line a request,
+        // also when it comes in a later chunk than the limit.
+        for len in [proto::MAX_REQUEST_BYTES + 2, 5000] {
+            let mut over = vec![b'x'; len];
+            over.push(b'\n');
+            assert!(
+                matches!(line(&over), Line::Bad),
+                "{len} bytes and a newline"
+            );
+        }
     }
 
     #[test]
