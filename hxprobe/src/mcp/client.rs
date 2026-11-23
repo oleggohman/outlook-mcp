@@ -28,6 +28,8 @@ struct Timeouts {
     probe: Duration,
     /// How long an old service may take to be gone after `shutdown`.
     stop_wait: Duration,
+    /// Timeout of a `refresh` exchange, which waits for a build.
+    refresh: Duration,
 }
 
 /// Talks to the refresh service of one cache directory; starts it when
@@ -93,6 +95,7 @@ impl Client {
                 start: proto::START_TIMEOUT,
                 probe: proto::REQUEST_TIMEOUT,
                 stop_wait: proto::GONE_WAIT,
+                refresh: proto::REFRESH_TIMEOUT,
             },
             clock: Instant::now,
         })
@@ -111,6 +114,7 @@ impl Client {
             start,
             probe,
             stop_wait,
+            ..self.timeouts
         };
         self
     }
@@ -134,6 +138,9 @@ impl Client {
         match proto::exchange(&self.sock, req, self.timeout(req)) {
             Ok(v) => return self.accept(req, &v, now, round),
             Err(ExchangeError::BadReply) => return Err(self.unreadable()),
+            Err(ExchangeError::Timeout) if *req == Request::Refresh => {
+                return Err(self.refresh_pending())
+            }
             Err(ExchangeError::NotRunning | ExchangeError::Timeout) => {}
         }
         if let Some(e) = self.blocked(now) {
@@ -287,6 +294,9 @@ impl Client {
             match proto::exchange(&self.sock, req, self.timeout(req)) {
                 Ok(v) => return self.accept(req, &v, now, round),
                 Err(ExchangeError::BadReply) => return Err(self.unreadable()),
+                Err(ExchangeError::Timeout) if *req == Request::Refresh => {
+                    return Err(self.refresh_pending())
+                }
                 Err(ExchangeError::NotRunning | ExchangeError::Timeout) => {}
             }
             if (self.clock)() >= deadline {
@@ -386,13 +396,24 @@ impl Client {
 
     fn timeout(&self, req: &Request) -> Duration {
         match req {
-            Request::Refresh => proto::REFRESH_TIMEOUT,
+            Request::Refresh => self.timeouts.refresh,
             _ => self.timeouts.probe,
         }
     }
 
     fn log_path(&self) -> PathBuf {
         self.dir.join(proto::LOG_NAME)
+    }
+
+    /// The error of a `refresh` that got no reply in time: a service
+    /// answered the connection and its build goes on, so this is neither a
+    /// reason to start one nor to block starts.
+    fn refresh_pending(&self) -> String {
+        format!(
+            "the rebuild did not finish within {} s and may still be running; \
+             call store_status later",
+            self.timeouts.refresh.as_secs()
+        )
     }
 
     fn unreadable(&self) -> String {
@@ -861,6 +882,33 @@ mod tests {
             c.call(&Request::Refresh, NOW).unwrap_err(),
             "export: broken"
         );
+    }
+
+    #[test]
+    fn refresh_that_gets_no_reply_in_time_is_a_pending_rebuild_and_starts_nothing() {
+        let _p = process_lock();
+        let t = TestDir::new();
+        let store = t.store();
+        // A service whose build outlasts the client's wait.
+        let played = Played::start(&t.sock(), move |r| {
+            if *r == Request::Refresh {
+                thread::sleep(Duration::from_millis(400));
+            }
+            status_line(proto::VERSION, 4242, &store)
+        });
+        let mut c = t.client(t.script("svc", "exit 3"));
+        c.timeouts.refresh = Duration::from_millis(100);
+        let e = c.call(&Request::Refresh, NOW).unwrap_err();
+        assert!(e.contains("still be running"), "{e}");
+        assert!(e.contains("store_status"), "{e}");
+        assert!(!e.contains("did not start"), "{e}");
+        assert_eq!(t.runs(), 0);
+        // Starts are not blocked, and the service is still used.
+        assert_eq!(c.blocked_until, None);
+        thread::sleep(Duration::from_millis(400));
+        c.call(&Request::Touch, NOW).unwrap();
+        assert_eq!(played.requests(), [Request::Refresh, Request::Touch]);
+        assert_eq!(t.runs(), 0);
     }
 
     // --- back-offs ---
