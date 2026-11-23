@@ -11,6 +11,11 @@ memchr = "2"
 # `bundled` compiles SQLite from source, so there is no dependency on whatever
 # libsqlite3 happens to be installed.
 rusqlite = { version = "0.32", features = ["bundled"] }
+# JSON for the MCP server (`hxprobe mcp`): JSON-RPC framing and tool results.
+serde_json = "1"
+# flock() for the MCP cache build lock and getuid() for the cache directory
+# ownership check. Already in the dependency tree through memmap2.
+libc = "0.2"
 
 [profile.release]
 opt-level = 3
