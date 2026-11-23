@@ -1162,16 +1162,20 @@ fn cmd_service(args: &[String]) {
         }
         Err(LockError::Failed(e)) => fail(e),
     };
-    let mut backend = CacheBackend::new(&dir, &store);
-    // A test aid: pause every build after the store copy, so a test can
-    // stop the service in the middle of a build.
-    if let Some(ms) = env::var("HXPROBE_TEST_BUILD_DELAY_MS")
+    let backend = CacheBackend::new(&dir, &store);
+    // A test aid, not in a release build: pause every build after the
+    // store copy, so a test can stop the service in the middle of a build.
+    #[cfg(debug_assertions)]
+    let backend = match env::var("HXPROBE_TEST_BUILD_DELAY_MS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
     {
-        log(&format!("test build delay {ms} ms"));
-        backend = backend.with_build_delay(std::time::Duration::from_millis(ms));
-    }
+        Some(ms) => {
+            log(&format!("test build delay {ms} ms"));
+            backend.with_build_delay(std::time::Duration::from_millis(ms))
+        }
+        None => backend,
+    };
     if service::Backend::store_denied(&backend) {
         log(&format!(
             "{} cannot be read: permission denied; exiting",

@@ -680,6 +680,10 @@ fn old_database(d: &Dir) -> i64 {
     built.unwrap()
 }
 
+/// Whether the program under test reads `HXPROBE_TEST_BUILD_DELAY_MS`: only
+/// a debug build does (the tests and the program are built alike).
+const BUILD_DELAY: bool = cfg!(debug_assertions);
+
 /// A service whose builds pause 5 s after the store copy, in the middle of
 /// a build started by a touch on the changed store.
 fn delayed_build(d: &Dir) -> Service {
@@ -700,6 +704,9 @@ fn delayed_build(d: &Dir) -> Service {
 
 #[test]
 fn killed_during_a_build_keeps_the_database_and_the_next_start_cleans_up() {
+    if !BUILD_DELAY {
+        return;
+    }
     let _s = serial();
     let d = Dir::new();
     let built = old_database(&d);
@@ -727,6 +734,9 @@ fn killed_during_a_build_keeps_the_database_and_the_next_start_cleans_up() {
 
 #[test]
 fn shutdown_or_sigterm_during_a_build_exits_at_once_and_cleans_up() {
+    if !BUILD_DELAY {
+        return;
+    }
     let _s = serial();
     for by_signal in [false, true] {
         let d = Dir::new();
