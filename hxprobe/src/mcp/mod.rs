@@ -4,6 +4,7 @@
 pub mod cache;
 pub mod proto;
 pub mod rpc;
+pub mod service;
 pub mod text;
 pub mod tools;
 
