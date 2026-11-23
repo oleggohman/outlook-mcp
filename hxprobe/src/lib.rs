@@ -10,6 +10,7 @@ pub mod item;
 pub mod kv;
 mod le;
 pub mod lz;
+pub mod mcp;
 pub mod names;
 pub mod objects;
 pub mod props;
