@@ -2562,12 +2562,16 @@ mod tests {
             }
             None
         }));
-        let mut c = served(&t, &fake);
+        // The wait must end because the database appeared, not because of
+        // the clock: a budget far above the time of the polls and of the
+        // fake's build, so a slow machine cannot end the wait first.
+        let mut c = served(&t, &fake)
+            .with_first_build_wait(Duration::from_secs(60), Duration::from_millis(10));
         assert_eq!(messages(&mut c, NOW_I), 4);
         assert_eq!(built_unix(&c), Some(NOW_I));
-        let (touches, statuses, _) = fake.counts();
-        assert_eq!(touches, 1);
-        assert!((3..=4).contains(&statuses), "{statuses}");
+        // One touch, then polls until the fake reported the build done on
+        // the third status; the next poll found the file and ended the wait.
+        assert_eq!(fake.counts(), (1, 3, 0));
         assert_eq!(c.builds, 0);
     }
 

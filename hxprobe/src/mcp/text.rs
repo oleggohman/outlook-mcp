@@ -444,7 +444,7 @@ pub fn parse_time(v: &Value) -> Result<i64, String> {
 mod tests {
     use super::*;
     use serde_json::json;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     #[test]
     fn tags_are_stripped() {
@@ -704,13 +704,27 @@ mod tests {
         .collect()
     }
 
-    /// Shortest of three runs of `html_to_text` over `input`.
+    /// CPU time used so far by the calling thread. Unlike the wall clock it
+    /// does not grow while the thread waits for a CPU, so a busy machine
+    /// does not stretch a long run more than a short one.
+    fn thread_cpu_time() -> Duration {
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: `ts` is a valid, writable timespec.
+        let rc = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
+        assert_eq!(rc, 0, "clock_gettime(CLOCK_THREAD_CPUTIME_ID) failed");
+        Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32)
+    }
+
+    /// Shortest thread CPU time of three runs of `html_to_text` over `input`.
     fn best_time(input: &str) -> Duration {
         (0..3)
             .map(|_| {
-                let t = Instant::now();
+                let t = thread_cpu_time();
                 std::hint::black_box(html_to_text(std::hint::black_box(input)));
-                t.elapsed()
+                thread_cpu_time().saturating_sub(t)
             })
             .min()
             .unwrap()
@@ -737,9 +751,10 @@ mod tests {
         // much more than eight times as long. A scan that is quadratic in
         // the input takes 64 times as long, whatever the machine's speed;
         // the limit of 24 times (plus a little for timer noise) lies
-        // between the two.
+        // between the two. Times are CPU times of the test thread (see
+        // `thread_cpu_time`), so the ratio holds on a loaded machine too.
         const N: usize = 1 << 14;
-        let started = Instant::now();
+        let started = thread_cpu_time();
         for (small, large) in hostile_inputs(N).iter().zip(hostile_inputs(8 * N)) {
             let (t_small, t_large) = (best_time(small), best_time(&large));
             assert!(
@@ -749,7 +764,11 @@ mod tests {
             );
         }
         // And an absolute bound, far above what linear scans need.
-        assert!(started.elapsed() < Duration::from_secs(30), "too slow");
+        let used = thread_cpu_time().saturating_sub(started);
+        assert!(
+            used < Duration::from_secs(30),
+            "too slow: {used:?} of CPU time"
+        );
     }
 
     #[test]
