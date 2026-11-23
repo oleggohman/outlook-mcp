@@ -18,7 +18,9 @@
 # lists one. A release file that does not match its checksum stops the
 # launcher: nothing is built or run in its place. A download that fails is
 # followed by a build only when no program that answers is installed;
-# otherwise the installed one is run.
+# otherwise the installed one is run. When that one is a built program of the
+# wanted version, bin/.download-failed is left and the download is not tried
+# again while that file is younger than about 6 hours.
 #
 # stdout is the JSON-RPC channel of the server, so this script writes nothing
 # to it: stdout is parked on fd 3 and only handed back to the server at exec.
@@ -160,6 +162,16 @@ installed_origin() {
     if [ "$o" = release ]; then echo release; else echo build; fi
 }
 
+# Left when the release program could not be had while a built program of the
+# wanted version is installed. While it is younger than 6 hours that program
+# is run as it is: otherwise every start would wait for the download (up to
+# the connect timeout) under the install lock, one start after the other.
+backoff_file="$bindir/.download-failed"
+backoff_active() {
+    [ -f "$backoff_file" ] || return 1
+    [ -n "$(find "$backoff_file" -mmin -360 2>/dev/null)" ]
+}
+
 # Looks up the release program for this machine in the checksum file, once.
 # Succeeds when there is one; `asset` is then its name and `want` its SHA-256.
 asset=''
@@ -197,7 +209,7 @@ release_sum() {
 # different plugin versions would otherwise reinstall on every start). A
 # program of the wanted version that was built here is not run as it is while
 # a release program is listed for it: `upgrade` is then 1, and the release
-# program is tried first.
+# program is tried first, unless that failed a short while ago.
 upgrade=0
 installed_ok() {
     local have
@@ -205,7 +217,7 @@ installed_ok() {
     have=$(installed_version)
     [ -n "$have" ] || return 1
     case "$(version_cmp "$have" "$version")" in
-        0 ) if [ "$(installed_origin)" = build ] && release_sum; then
+        0 ) if [ "$(installed_origin)" = build ] && release_sum && ! backoff_active; then
                 upgrade=1
                 return 1
             fi
@@ -391,6 +403,7 @@ install_and_run() {
         die "cannot move $src to $bin"
     fi
     tmp_file=''
+    rm -f "$backoff_file" 2>/dev/null || true
     if [ -n "$legacy" ]; then
         for f in "$legacy"/hxprobe-*; do
             [ -f "$f" ] || continue
@@ -467,8 +480,14 @@ if [ "$downloaded" = 2 ] || [ "$upgrade" = 1 ]; then
     # Not a reason to build while a program that answers is installed.
     have=$(installed_version)
     if [ -n "$have" ]; then
+        if [ "$upgrade" = 1 ]; then
+            # Only read for a built program of the wanted version.
+            touch "$backoff_file" 2>/dev/null || true
+            log "running the installed hxprobe $have at $bin; the download is tried again in about 6 hours"
+        else
+            log "running the installed hxprobe $have at $bin; the next start tries the download again"
+        fi
         release_lock
-        log "running the installed hxprobe $have at $bin; the next start tries the download again"
         run_server "$bin" ${1+"$@"}
     fi
 fi

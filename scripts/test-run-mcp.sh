@@ -901,6 +901,54 @@ for have in "$version" 9.8.6; do
     else fail "$t" "rc=$rc out='$out' builds='$(cat "$r/builds" 2>/dev/null || true)' err='$err'"; fi
 done
 
+# (xvii-b2) After a failed download with a built program of the wanted
+# version installed, the download is not tried on every start: a stamp
+# (bin/.download-failed) holds it back for about 6 hours. A second start runs
+# the installed program without curl; with a stamp of 7 hours ago the
+# download is tried again, and an install removes the stamp.
+t='failed download is not tried again at once'
+r=$(make_repo)
+make_asset "$r"
+make_curl_fail "$r"
+make_cargo_stub "$r" ''
+mkdir -p "$r/inst/bin"
+make_fake "$r/inst/bin/hxprobe" "$r/old-ran" '' "$version"
+echo build > "$r/inst/bin/.origin"
+stamp="$r/inst/bin/.download-failed"
+curls() { { cat "$r/curl-args" 2>/dev/null || true; } | wc -l | tr -d ' '; }
+run "$r" HXPROBE_RELEASE_BASE="file://$r/rel" PATH="$r/stub:$nocargo_path" --
+n1=$(curls); s1=no; if [ -f "$stamp" ]; then s1=yes; fi
+run "$r" HXPROBE_RELEASE_BASE="file://$r/rel" PATH="$r/stub:$nocargo_path" --
+rc2=$rc; out2=$out; err2=$err; n2=$(curls)
+touch -t "$(date -v-7H +%Y%m%d%H%M)" "$stamp"
+run "$r" HXPROBE_RELEASE_BASE="file://$r/rel" PATH="$r/stub:$nocargo_path" --
+rc3=$rc; out3=$out; n3=$(curls)
+# The stamp is new again; make it old and let the download succeed.
+touch -t "$(date -v-7H +%Y%m%d%H%M)" "$stamp"
+make_curl_probe "$r"
+run "$r" HXPROBE_RELEASE_BASE="file://$r/rel" PATH="$r/stub:$nocargo_path" --
+if [ "$n1" = 1 ] && [ "$s1" = yes ] \
+    && [ "$rc2" = 0 ] && [ "$out2" = 'FAKE mcp' ] && [ -z "$err2" ] && [ "$n2" = 1 ] \
+    && [ "$rc3" = 0 ] && [ "$out3" = 'FAKE mcp' ] && [ "$n3" = 2 ] \
+    && [ "$rc" = 0 ] && [ "$out" = 'FAKE mcp' ] && [ -e "$r/ran" ] && [ ! -e "$stamp" ] \
+    && [[ "$(origin_of "$r/inst")" == 'release '* ]] && [ ! -e "$r/builds" ] \
+    && [ "$(leftovers "$r/inst")" = 0 ] && lock_free "$r/inst"; then pass "$t"
+else fail "$t" "curls=$n1/$n2/$n3 stamp1=$s1 rc=$rc2/$rc3/$rc out='$out2'/'$out3'/'$out' err='$err2' / '$err'"; fi
+
+# An older installed program is run after a failed download as well, but
+# nothing is held back: the next start tries the download again.
+t='failed download with an older program is tried again'
+r=$(make_repo)
+make_asset "$r"
+make_curl_fail "$r"
+mkdir -p "$r/inst/bin"
+make_fake "$r/inst/bin/hxprobe" "$r/old-ran" '' 9.8.6
+run "$r" HXPROBE_RELEASE_BASE="file://$r/rel" PATH="$r/stub:$nocargo_path" --
+run "$r" HXPROBE_RELEASE_BASE="file://$r/rel" PATH="$r/stub:$nocargo_path" --
+if [ "$rc" = 0 ] && [ "$out" = 'FAKE mcp' ] && [ "$(curls)" = 2 ] \
+    && [ ! -e "$r/inst/bin/.download-failed" ]; then pass "$t"
+else fail "$t" "rc=$rc out='$out' curls=$(curls) err='$err'"; fi
+
 # (xvii-c) With nothing usable installed, a failed download falls back to a
 # build; the record says that the program was built here.
 t='download fails, nothing installed: build'
