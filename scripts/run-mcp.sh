@@ -125,12 +125,12 @@ version_cmp() {
         }'
 }
 
-# The version that the program at $bin reports (`hxprobe <version>` from
+# The version that the program $1 reports (`hxprobe <version>` from
 # `--version`), or nothing when it is missing or gives no such answer.
-installed_version() {
+program_version() {
     local out
-    [ -f "$bin" ] && [ -x "$bin" ] || return 0
-    out=$("$bin" --version </dev/null 2>/dev/null 3>&- 9>&-) || return 0
+    [ -f "$1" ] && [ -x "$1" ] || return 0
+    out=$("$1" --version </dev/null 2>/dev/null 3>&- 9>&-) || return 0
     case "$out" in
         'hxprobe '* ) out=${out#hxprobe } ;;
         * ) return 0 ;;
@@ -140,6 +140,8 @@ installed_version() {
     esac
     printf '%s\n' "$out"
 }
+
+installed_version() { program_version "$bin"; }
 
 # Succeeds when the installed program is to be run: it reports the wanted
 # version or a newer one. A newer one is kept (never downgrade: clients with
@@ -311,9 +313,16 @@ remove_old_build_dirs() {
 # keep their file (overwriting a signed program in place would invalidate
 # the signature of running copies).
 install_and_run() {
-    local src=$1 f d
+    local src=$1 f d have
     shift
     chmod 700 "$src" || die "cannot make $src executable"
+    # The file must be the program it is named after: at least the wanted
+    # version, by its own answer.
+    have=$(program_version "$src")
+    case "$(version_cmp "${have:-none}" "$version")" in
+        0 | 1 ) ;;
+        * ) die "the new program is not hxprobe $version (it reports '${have:-no version}'); it was deleted and not run" ;;
+    esac
     # mv would put the file into a directory (or a link to one) of that name.
     [ ! -d "$bin" ] || die "$bin is a directory; remove it and start again"
     mv -f "$src" "$bin" || die "cannot move $src to $bin"

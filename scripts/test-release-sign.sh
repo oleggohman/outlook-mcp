@@ -34,7 +34,9 @@ TeamIdentifier=STUBTEAM"
 
 # A case directory with the stubs in $1/stub and the answers of codesign in
 # $1/req (designated requirement), $1/info (-dvv), $1/verify-rc and
-# $1/sign-rc; $1/sign-err is what the stub prints when signing fails.
+# $1/sign-rc; $1/sign-err is what the stub prints when signing fails. The
+# `lipo` stub prints $1/archs and the `uname` stub $1/host-arch for `-m`;
+# the program is a script that answers --version with $1/prog-version.
 make_case() {
     local c
     c=$(mktemp -d "$root/case.XXXXXX")
@@ -74,8 +76,25 @@ EOF
 printf '%s\n' "\$*" >> "$c/shasum-args"
 exec /usr/bin/shasum "\$@"
 EOF
-    chmod 755 "$c/stub/codesign" "$c/stub/shasum"
-    printf '\177ELF-like test program\n' > "$c/prog"
+    echo arm64 > "$c/archs"
+    echo arm64 > "$c/host-arch"
+    echo 'hxprobe 9.8.7' > "$c/prog-version"
+    cat > "$c/stub/lipo" <<EOF
+#!/bin/sh
+printf '%s\n' "\$*" >> "$c/lipo-args"
+cat "$c/archs"
+EOF
+    cat > "$c/stub/uname" <<EOF
+#!/bin/sh
+if [ "\$*" = -m ]; then cat "$c/host-arch"; exit 0; fi
+exec /usr/bin/uname "\$@"
+EOF
+    chmod 755 "$c/stub/codesign" "$c/stub/shasum" "$c/stub/lipo" "$c/stub/uname"
+    cat > "$c/prog" <<EOF
+#!/bin/sh
+if [ "\$1" = --version ]; then cat "$c/prog-version"; exit 0; fi
+exit 2
+EOF
     cp "$c/prog" "$c/prog.orig"
     printf '%s\n' "$c"
 }
@@ -213,6 +232,34 @@ check_stops 'development certificate' "$c" 'Developer ID Application'
 c=$(make_case)
 printf '%s\n' "${good_info//flags=0x10000(runtime)/flags=0x0(none)}" > "$c/info"
 check_stops 'no hardened runtime' "$c" 'runtime'
+
+# (iv-b) The file must be what its name says: a thin program of the named
+# architecture that, where this machine can run it, reports the version.
+c=$(make_case)
+echo x86_64 > "$c/archs"
+check_stops 'other architecture than named' "$c" 'architecture'
+
+c=$(make_case)
+echo 'x86_64 arm64' > "$c/archs"
+check_stops 'universal program' "$c" 'architecture'
+
+c=$(make_case)
+echo 'hxprobe 9.8.6' > "$c/prog-version"
+check_stops 'other version than named' "$c" 'version'
+
+c=$(make_case)
+: > "$c/prog-version"
+check_stops 'program without a version' "$c" 'version'
+
+# On a machine of another architecture the program cannot be asked.
+t='version not asked on another architecture'
+c=$(make_case)
+echo x86_64 > "$c/host-arch"
+echo 'hxprobe 9.8.6' > "$c/prog-version"
+run_signed "$c"
+if [ "$rc" = 0 ] && [[ "$out" == *"  $asset" ]] && [ -e "$c/work/$asset" ] \
+    && grep -q -e '-archs' "$c/lipo-args"; then pass "$t"
+else fail "$t" "rc=$rc out='$out' err='$err'"; fi
 
 # (v) A failing codesign that names the identity in its error: the script
 # stops and its output holds the error without the identity.

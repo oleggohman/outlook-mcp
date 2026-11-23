@@ -548,7 +548,7 @@ else fail "$t" "bad=$bad builds=$builds leftovers=$(leftovers "$r/inst") err='$(
 t='lock free while the server runs'
 r=$(make_repo)
 mkdir -p "$r/rel/v$version"
-make_fake "$r/rel/v$version/$asset" "$r/ran" 'sleep 2'
+make_fake "$r/rel/v$version/$asset" "$r/ran" 'sleep 2' "$version"
 printf '%s  %s\n' "$(shasum -a 256 "$r/rel/v$version/$asset" | awk '{print $1}')" "$asset" > "$r/release/SHA256SUMS"
 env -u HXPROBE_BIN -u HXPROBE_SUMS HOME="$root/home" HXPROBE_INSTALL_DIR="$r/inst" \
     CLAUDE_PLUGIN_DATA="$r/data" HXPROBE_RELEASE_BASE="file://$r/rel" PATH="$nocargo_path" \
@@ -804,6 +804,28 @@ run "$r" CLAUDE_PLUGIN_DATA="$r/inst" HXPROBE_RELEASE_BASE="file://$r/rel" PATH=
 if [ "$rc" = 0 ] && [ "$out" = 'FAKE mcp' ] && [ -f "$r/inst/install.lock" ] \
     && lock_free "$r/inst"; then pass "$t"
 else fail "$t" "rc=$rc out='$out' err='$err'"; fi
+
+# (xvi) A release file that matches its checksum but is not the program of
+# the wanted version (an older one under the new name, or one that gives no
+# version) is not installed and not run, and nothing is built in its place.
+for kind in older 'no version'; do
+    t="asset reports $kind"
+    r=$(make_repo)
+    make_cargo_stub "$r" ''
+    mkdir -p "$r/rel/v$version" "$r/inst/bin"
+    if [ "$kind" = older ]; then have=9.8.6; else have=''; fi
+    make_fake "$r/rel/v$version/$asset" "$r/ran" '' "$have"
+    printf '%s  %s\n' "$(shasum -a 256 "$r/rel/v$version/$asset" | awk '{print $1}')" "$asset" \
+        > "$r/release/SHA256SUMS"
+    make_fake "$r/inst/bin/hxprobe" "$r/old-ran" '' 9.8.5
+    ino=$(inode "$r/inst/bin/hxprobe")
+    run "$r" HXPROBE_RELEASE_BASE="file://$r/rel" PATH="$r/stub:$nocargo_path" --
+    if [ "$rc" = 1 ] && [ -z "$out" ] && [ ! -e "$r/ran" ] && [ ! -e "$r/old-ran" ] \
+        && [ ! -e "$r/builds" ] && [ "$(inode "$r/inst/bin/hxprobe")" = "$ino" ] \
+        && [[ "$err" == *"is not hxprobe $version"* ]] && [[ "$err" != *'installed hxprobe'* ]] \
+        && [ "$(leftovers "$r/inst")" = 0 ] && lock_free "$r/inst"; then pass "$t"
+    else fail "$t" "rc=$rc out='$out' err='$err'"; fi
+done
 
 if [ "$failures" -ne 0 ]; then
     printf '%d case(s) failed\n' "$failures"

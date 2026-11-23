@@ -11,7 +11,9 @@
 # checks the result: strict verification; a designated requirement that
 # names the identifier, the Apple anchor and the team (and no code hash,
 # which would tie a Full Disk Access grant to one build); a Developer ID
-# Application certificate; the runtime flag. Last it prints the line for
+# Application certificate; the runtime flag; the architecture named on the
+# command line and, when this machine has it, the version (the program is
+# run with --version). Last it prints the line for
 # release/SHA256SUMS, computed from the signed file, which is the file to
 # publish. Messages go to stderr; stdout holds only that line.
 #
@@ -111,6 +113,19 @@ esac
 if ! printf '%s\n' "$info" \
         | grep -Eq '^CodeDirectory .*flags=0x[0-9a-f]+\(([a-z-]+,)*runtime(,[a-z-]+)*\)'; then
     die "the hardened runtime flag (runtime) is not set"
+fi
+
+# The file must be what its name says: a program of that architecture only
+# and, where this machine can run it, of that version.
+archs=$(lipo -archs "$tmp" 2>/dev/null) || die "cannot read the architecture of the program (lipo)"
+[ "$archs" = "$arch" ] \
+    || die "the program has architecture '$archs', not $arch as the name of the asset says"
+if [ "$(uname -m)" = "$arch" ]; then
+    said=$("$tmp" --version </dev/null 2>/dev/null) || said=''
+    [ "$said" = "hxprobe $version" ] \
+        || die "the program reports version '${said#hxprobe }', not $version as the name of the asset says"
+else
+    log "not asking the program for its version: this machine is not $arch"
 fi
 
 mv -f "$tmp" "$asset"
