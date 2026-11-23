@@ -145,9 +145,69 @@ pub struct Cache {
     /// by another process sharing the directory) and reuses it builds
     /// nothing and is not counted.
     pub builds: u64,
+    /// Identity of the `mail.db` file `db` was opened from.
+    db_id: Option<FileId>,
+    /// Identity of a `mail.db` that [`open_db`] refused, so the same file
+    /// is not tried again on every call.
+    rejected_id: Option<FileId>,
     /// Called at the start of every build, with the lock held.
     #[cfg(test)]
     pub(crate) build_hook: Option<fn()>,
+    /// Called by [`Cache::reopen_if_replaced`] between reading the file's
+    /// identity and opening it, with the cache directory.
+    #[cfg(test)]
+    reopen_hook: Option<fn(&Path)>,
+}
+
+/// Identity of a file, to notice that it was replaced: a new file put in
+/// place by `rename` has another inode, a file changed in place another
+/// length or time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileId {
+    pub dev: u64,
+    pub ino: u64,
+    pub len: u64,
+    pub mtime_ns: i64,
+}
+
+/// The identity of `path` itself (a symbolic link is not followed); `None`
+/// when it does not exist or cannot be examined.
+pub fn file_id(path: &Path) -> Option<FileId> {
+    let m = std::fs::symlink_metadata(path).ok()?;
+    Some(FileId {
+        dev: m.dev(),
+        ino: m.ino(),
+        len: m.len(),
+        mtime_ns: m.mtime().saturating_mul(1_000_000_000) + m.mtime_nsec(),
+    })
+}
+
+/// What a usable `mail.db` says about its build.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DbInfo {
+    /// `built_unix` of `mcp_meta`.
+    pub built_unix: Option<i64>,
+    /// `(store_len, store_mtime_ns)` of the store it was built from.
+    pub stamp: Option<(u64, i64)>,
+}
+
+/// [`DbInfo`] of `mail.db` in `dir` when it is usable for `store` (see
+/// [`open_db`]); `None` otherwise. `store` is resolved as [`Cache::new`]
+/// does. The connection is closed before this returns.
+pub fn db_info(dir: &Path, store: &Path) -> Option<DbInfo> {
+    let (_, meta) = open_db(&dir.join(DB_NAME), &resolve_store(store)).ok()?;
+    Some(DbInfo {
+        built_unix: meta.int("built_unix"),
+        stamp: meta.stamp(),
+    })
+}
+
+/// `store` as an absolute path without symbolic links (only made absolute
+/// when it does not exist yet).
+fn resolve_store(store: &Path) -> PathBuf {
+    std::fs::canonicalize(store)
+        .or_else(|_| std::path::absolute(store))
+        .unwrap_or_else(|_| store.to_path_buf())
 }
 
 impl Cache {
@@ -161,9 +221,7 @@ impl Cache {
     /// working directory.
     pub fn new(dir: &Path, store: &Path) -> Result<Cache, String> {
         ensure_dir(dir)?;
-        let store = std::fs::canonicalize(store)
-            .or_else(|_| std::path::absolute(store))
-            .unwrap_or_else(|_| store.to_path_buf());
+        let store = resolve_store(store);
         Ok(Cache {
             dir: dir.to_path_buf(),
             store,
@@ -172,8 +230,12 @@ impl Cache {
             last_attempt_unix: None,
             last_error: None,
             builds: 0,
+            db_id: None,
+            rejected_id: None,
             #[cfg(test)]
             build_hook: None,
+            #[cfg(test)]
+            reopen_hook: None,
         })
     }
 
@@ -197,9 +259,13 @@ impl Cache {
     ///   rebuild; if that fails the old database stays in use. A build or
     ///   attempt time after `now` does not count;
     /// - otherwise the open database is used.
+    ///
+    /// Before deciding, a `mail.db` that another process put in place since
+    /// it was opened here is opened instead (see
+    /// [`Cache::reopen_if_replaced`]), so the decision is made on the file
+    /// on disk.
     pub fn connection_at(&mut self, now: i64) -> Result<&Connection, String> {
-        if self.db.is_none() {
-            self.db = open_db(&self.db_path(), &self.store).ok();
+        if self.reopen_if_replaced() {
             if let Some((_, meta)) = &self.db {
                 // Up to date without a build of this value (another process
                 // built it, or it could not be opened right after a build):
@@ -259,6 +325,49 @@ impl Cache {
         }
     }
 
+    /// Open `mail.db` when it is not the file the database in use was
+    /// opened from (or nothing is open); true when a new connection is now
+    /// in use. The file's identity is read before and after opening it;
+    /// the new connection is accepted only when both are equal (otherwise
+    /// the file was replaced meanwhile and it is tried once more). When
+    /// that fails twice, or [`open_db`] refuses the file, the connection in
+    /// use stays; a refused file is not tried again until it changes.
+    fn reopen_if_replaced(&mut self) -> bool {
+        let path = self.db_path();
+        let on_disk = file_id(&path);
+        if on_disk.is_none()
+            || (self.db.is_some() && on_disk == self.db_id)
+            || on_disk == self.rejected_id
+        {
+            return false;
+        }
+        for _ in 0..2 {
+            let Some(before) = file_id(&path) else {
+                return false;
+            };
+            #[cfg(test)]
+            if let Some(hook) = self.reopen_hook {
+                hook(&self.dir);
+            }
+            match open_db(&path, &self.store) {
+                Ok(db) => {
+                    if file_id(&path) == Some(before) {
+                        // Releases the old file, if any.
+                        self.db = Some(db);
+                        self.db_id = Some(before);
+                        self.rejected_id = None;
+                        return true;
+                    }
+                }
+                Err(_) => {
+                    self.rejected_id = Some(before);
+                    return false;
+                }
+            }
+        }
+        false
+    }
+
     /// One build attempt at `now`, recorded in `last_attempt_unix` and
     /// `last_error`. `reuse`: accept an up-to-date `mail.db` found after
     /// taking the lock instead of building.
@@ -305,18 +414,27 @@ impl Cache {
     }
 
     /// [`Cache::build`]; with `reuse`, first (holding the lock) check
-    /// whether `mail.db` is usable and was built from the store as it is
-    /// now, and if so open it and return `None` without building.
+    /// whether `mail.db` is usable and either was built from the store as
+    /// it is now or was built less than `refresh_secs` before `now` (by
+    /// another process, while this one waited for the lock; a build time
+    /// after `now` does not count), and if so open it and return `None`
+    /// without building.
     fn build_locked(&mut self, now: i64, reuse: bool) -> Result<Option<BuildInfo>, String> {
         ensure_dir(&self.dir)?;
         let _lock = lock(&self.dir)?;
         if reuse {
+            // Builds take the lock, so the file cannot be replaced here.
+            let id = file_id(&self.db_path());
             if let Ok((conn, meta)) = open_db(&self.db_path(), &self.store) {
-                if stamp(&self.store)
+                let current = stamp(&self.store)
                     .ok()
-                    .is_some_and(|s| meta.stamp() == Some(s))
-                {
+                    .is_some_and(|s| meta.stamp() == Some(s));
+                let young = meta
+                    .int("built_unix")
+                    .is_some_and(|t| t <= now && now.saturating_sub(t) < self.refresh_secs);
+                if current || young {
                     self.db = Some((conn, meta));
+                    self.db_id = id;
                     return Ok(None);
                 }
             }
@@ -390,10 +508,13 @@ impl Cache {
         // The old database is gone from the directory: stop using it even
         // if the new one cannot be opened now (the next call tries again).
         self.db = None;
+        self.db_id = None;
+        let id = file_id(&self.db_path());
         self.db = Some(
             open_db(&self.db_path(), &self.store)
                 .map_err(|e| format!("the new database is in place, but: {e}"))?,
         );
+        self.db_id = id;
 
         log(&format!(
             "cache built in {} ms (copy {copy_ms}, export {export_ms}, prepare {prepare_ms}); \
@@ -1732,6 +1853,213 @@ mod tests {
             Err("the store kept changing during the copy".to_string())
         );
         assert_eq!(n, 2 * COPY_ATTEMPTS);
+    }
+
+    // --- file identity and reopen on replace ---
+
+    #[test]
+    fn file_id_tells_a_replaced_file_apart() {
+        let t = TestDir::new("fileid");
+        let a = t.0.join("a");
+        let b = t.0.join("b");
+        std::fs::write(&a, b"one").unwrap();
+        let first = file_id(&a).expect("an existing file has an id");
+        assert_eq!(file_id(&a), Some(first));
+        // Same length and time, another file put in place by a rename.
+        std::fs::write(&b, b"two").unwrap();
+        touch(&a, 1_000_000);
+        touch(&b, 1_000_000);
+        let first = file_id(&a).unwrap();
+        std::fs::rename(&b, &a).unwrap();
+        assert_ne!(file_id(&a), Some(first));
+        assert_eq!(file_id(&t.0.join("missing")), None);
+    }
+
+    #[test]
+    fn file_id_does_not_follow_a_symbolic_link() {
+        let t = TestDir::new("fileidlink");
+        let target = t.0.join("target");
+        std::fs::write(&target, b"some content").unwrap();
+        let link = t.0.join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let id = file_id(&link).unwrap();
+        let m = std::fs::symlink_metadata(&link).unwrap();
+        assert_eq!((id.dev, id.ino, id.len), (m.dev(), m.ino(), m.len()));
+        assert_ne!(Some(id), file_id(&target));
+        // A link to nothing still has an id of its own.
+        let dangling = t.0.join("dangling");
+        std::os::unix::fs::symlink(t.0.join("absent"), &dangling).unwrap();
+        assert!(file_id(&dangling).is_some());
+    }
+
+    #[test]
+    fn open_database_is_replaced_by_a_rebuild_of_another_cache() {
+        let t = TestDir::new("reopen");
+        let mut a = lazy(&t, 900);
+        messages(&mut a, NOW_I);
+        let mut b = Cache::new(&t.cache_dir(), a.store_path()).unwrap();
+        messages(&mut b, NOW_I);
+        a.build(NOW_I + 10).unwrap();
+        // Inside the interval and the store unchanged: B serves A's file.
+        assert_eq!(messages(&mut b, NOW_I + 20), 4);
+        assert_eq!(b.builds, 0);
+        assert_eq!(built_unix(&b), Some(NOW_I + 10));
+        assert_eq!(b.db_id, file_id(&b.db_path()));
+        assert!(b.db_id.is_some());
+    }
+
+    /// Rebuild `mail.db` in the cache directory `dir` (layout of
+    /// [`TestDir`]) with another cache, built at `at`.
+    fn rebuild_in(dir: &Path, at: i64) {
+        let store = dir.parent().unwrap().join("HxStore.hxd");
+        Cache::new(dir, &store).unwrap().build(at).unwrap();
+    }
+
+    #[test]
+    fn file_replaced_once_while_opening_is_opened_again() {
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let t = TestDir::new("raceonce");
+        let mut b = lazy(&t, 900);
+        messages(&mut b, NOW_I);
+        rebuild_in(&t.cache_dir(), NOW_I + 10);
+        b.reopen_hook = Some(|dir| {
+            if N.fetch_add(1, Ordering::SeqCst) == 0 {
+                rebuild_in(dir, NOW_I + 100);
+            }
+        });
+        assert_eq!(messages(&mut b, NOW_I + 20), 4);
+        assert_eq!(N.load(Ordering::SeqCst), 2);
+        assert_eq!(built_unix(&b), Some(NOW_I + 100));
+        assert_eq!(b.db_id, file_id(&b.db_path()));
+        assert_eq!(b.builds, 1);
+    }
+
+    #[test]
+    fn file_replaced_on_every_attempt_keeps_the_old_connection() {
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let t = TestDir::new("raceever");
+        let mut b = lazy(&t, 900);
+        messages(&mut b, NOW_I);
+        let old_id = b.db_id;
+        assert!(old_id.is_some());
+        rebuild_in(&t.cache_dir(), NOW_I + 10);
+        b.reopen_hook = Some(|dir| {
+            let n = N.fetch_add(1, Ordering::SeqCst) as i64;
+            rebuild_in(dir, NOW_I + 100 * (n + 1));
+        });
+        assert_eq!(messages(&mut b, NOW_I + 20), 4);
+        assert_eq!(N.load(Ordering::SeqCst), 2);
+        assert_eq!(built_unix(&b), Some(NOW_I));
+        assert_eq!(b.db_id, old_id);
+        assert_ne!(b.db_id, file_id(&b.db_path()));
+        // The next call, without the hook, picks up the newest file.
+        b.reopen_hook = None;
+        assert_eq!(messages(&mut b, NOW_I + 30), 4);
+        assert_eq!(built_unix(&b), Some(NOW_I + 200));
+        assert_eq!(b.db_id, file_id(&b.db_path()));
+        assert_eq!(b.builds, 1);
+    }
+
+    #[test]
+    fn rejected_replacement_keeps_the_old_connection_and_is_not_retried() {
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let t = TestDir::new("rejected");
+        let mut b = lazy(&t, 900);
+        messages(&mut b, NOW_I);
+        // Another program puts a database of another format in place.
+        let dir = t.cache_dir();
+        rebuild_in(&dir, NOW_I + 10);
+        Connection::open(dir.join(DB_NAME))
+            .unwrap()
+            .execute(
+                "UPDATE mcp_meta SET value = '0' WHERE key = 'format_version'",
+                [],
+            )
+            .unwrap();
+        b.reopen_hook = Some(|_| {
+            N.fetch_add(1, Ordering::SeqCst);
+        });
+        assert_eq!(messages(&mut b, NOW_I + 20), 4);
+        assert_eq!(built_unix(&b), Some(NOW_I));
+        assert_eq!(N.load(Ordering::SeqCst), 1);
+        assert_eq!(messages(&mut b, NOW_I + 30), 4);
+        assert_eq!(N.load(Ordering::SeqCst), 1);
+        assert_eq!(b.builds, 1);
+    }
+
+    #[test]
+    fn peer_database_younger_than_the_interval_is_reused_after_a_store_change() {
+        let t = TestDir::new("peerreuse");
+        // B holds an older database and is past its interval.
+        let mut b = lazy(&t, 900);
+        b.build(NOW_I - 1000).unwrap();
+        let mut a = Cache::new(&t.cache_dir(), b.store_path()).unwrap();
+        a.build(NOW_I).unwrap();
+        touch(a.store_path(), 1_000_000);
+        assert_eq!(messages(&mut b, NOW_I + 5), 4);
+        assert_eq!(b.builds, 1);
+        assert_eq!(built_unix(&b), Some(NOW_I));
+    }
+
+    /// A cache over the store of `t` that holds nothing, after another
+    /// cache built at `built` and the store changed again.
+    fn after_peer_build(t: &TestDir, built: i64) -> Cache {
+        let mut a = lazy(t, 900);
+        a.build(built).unwrap();
+        touch(a.store_path(), 1_000_000);
+        Cache::new(&t.cache_dir(), a.store_path())
+            .unwrap()
+            .with_refresh_secs(900)
+    }
+
+    #[test]
+    fn build_reuses_a_peer_database_only_while_it_is_young() {
+        let t = TestDir::new("reuseyoung");
+        let mut b = after_peer_build(&t, NOW_I);
+        b.attempt(NOW_I + 5, true).unwrap();
+        assert_eq!(b.builds, 0);
+        assert_eq!(built_unix(&b), Some(NOW_I));
+        assert_eq!(b.db_id, file_id(&b.db_path()));
+
+        let t = TestDir::new("reuseold");
+        let mut b = after_peer_build(&t, NOW_I);
+        b.attempt(NOW_I + 900, true).unwrap();
+        assert_eq!(b.builds, 1);
+        assert_eq!(built_unix(&b), Some(NOW_I + 900));
+
+        let t = TestDir::new("reusefuture");
+        let mut b = after_peer_build(&t, NOW_I + 100);
+        b.attempt(NOW_I, true).unwrap();
+        assert_eq!(b.builds, 1);
+        assert_eq!(built_unix(&b), Some(NOW_I));
+
+        let t = TestDir::new("reuseforce");
+        let mut b = after_peer_build(&t, NOW_I);
+        b.force_refresh_at(NOW_I + 5).unwrap();
+        assert_eq!(b.builds, 1);
+        assert_eq!(built_unix(&b), Some(NOW_I + 5));
+        assert_eq!(b.db_id, file_id(&b.db_path()));
+    }
+
+    #[test]
+    fn db_info_reads_a_usable_database_only() {
+        let t = TestDir::new("dbinfo");
+        let store = t.store(&mail_store());
+        let dir = t.cache_dir();
+        assert_eq!(db_info(&dir, &store), None);
+        let mut c = Cache::new(&dir, &store).unwrap();
+        let info = c.build(NOW_I).unwrap();
+        let got = db_info(&dir, &store).expect("a usable database");
+        assert_eq!(got.built_unix, Some(NOW_I));
+        assert_eq!(got.stamp, Some((info.store_len, info.store_mtime_ns)));
+        // The store under another name resolves to the same file.
+        let link = t.0.join("link.hxd");
+        std::os::unix::fs::symlink(&store, &link).unwrap();
+        assert_eq!(db_info(&dir, &link), Some(got));
+        // Another store: not usable.
+        let other = t.0.join("Other.hxd");
+        std::fs::write(&other, mail_store()).unwrap();
+        assert_eq!(db_info(&dir, &other), None);
     }
 
     /// Create the optional type tables the way [`prepare`] does, so a test
