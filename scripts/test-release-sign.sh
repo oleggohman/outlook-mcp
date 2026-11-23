@@ -12,6 +12,9 @@ script="$here/release-sign.sh"
 ident='io.github.oleggohman.hxprobe'
 # A made-up identity; it must never appear in the script's output.
 identity='Stub Identity For Tests QX7'
+# The same as a certificate hash: codesign then names the signer itself.
+identity_hash='0123456789ABCDEF0123456789ABCDEF01234567'
+sign_debug=0
 
 root=$(mktemp -d "${TMPDIR:-/tmp}/test-release-sign.XXXXXX")
 trap 'rm -rf "$root"' EXIT
@@ -103,18 +106,23 @@ EOF
 }
 
 # Runs the script in $1/work with the script arguments $3...; $2 is the
-# identity: `unset`, `empty` or `set` (the made-up one). Sets out, err, rc.
+# identity: `unset`, `empty`, `set` (the made-up one) or `hash` (a
+# certificate hash, as codesign also accepts). HOME is $1/home; with
+# sign_debug=1 the script runs with HXPROBE_SIGN_DEBUG=1. Sets out, err, rc.
 run() {
     local c=$1 mode=$2
     shift 2
     rc=0
     (
         cd "$c/work"
-        unset HXPROBE_SIGN_IDENTITY
+        unset HXPROBE_SIGN_IDENTITY HXPROBE_SIGN_DEBUG
+        export HOME="$c/home"
         case "$mode" in
             empty ) export HXPROBE_SIGN_IDENTITY='' ;;
             set ) export HXPROBE_SIGN_IDENTITY="$identity" ;;
+            hash ) export HXPROBE_SIGN_IDENTITY="$identity_hash" ;;
         esac
+        if [ "${sign_debug:-0}" = 1 ]; then export HXPROBE_SIGN_DEBUG=1; fi
         PATH="$c/stub:/usr/bin:/bin" bash "$script" "$@" > "$c/out" 2> "$c/err"
     ) || rc=$?
     out=$(cat "$c/out")
@@ -126,9 +134,12 @@ run_signed() {
     run "$1" set "$1/prog" 9.8.7 arm64
 }
 
-# Succeeds when the identity appears nowhere in the script's output of case $1.
+# Succeeds when neither the identity nor what codesign may say about the
+# signer (name, team, a path under HOME) appears in the script's output of
+# case $1.
 no_identity() {
-    ! grep -qF "$identity" "$1/out" "$1/err"
+    ! grep -qF -e "$identity" -e "$identity_hash" -e 'Stub Person' -e 'STUBTEAM' \
+        -e "$1/home" "$1/out" "$1/err"
 }
 
 # Number of files in the work directory of case $1.
@@ -147,7 +158,8 @@ rc1=$rc; err1=$err
 run "$c" empty "$c/prog" 9.8.7 arm64
 if [ "$rc1" != 0 ] && [ "$rc" != 0 ] && [[ "$err1" == *HXPROBE_SIGN_IDENTITY* ]] \
     && [[ "$err" == *HXPROBE_SIGN_IDENTITY* ]] && [ -z "$out" ] \
-    && [ ! -e "$c/codesign-args" ] && [ "$(work_files "$c")" = 0 ]; then pass "$t"
+    && [ ! -e "$c/codesign-args" ] && [ "$(work_files "$c")" = 0 ] \
+    && no_identity "$c"; then pass "$t"
 else fail "$t" "rc=$rc1/$rc err='$err1' / '$err'"; fi
 
 # (ii) Wrong arguments: usage and status 2, nothing signed.
@@ -271,11 +283,47 @@ echo 1 > "$c/shasum-rc"
 check_stops 'checksum fails, no asset left' "$c" 'SHA-256'
 
 # (v) A failing codesign that names the identity in its error: the script
-# stops and its output holds the error without the identity.
+# stops with the status and shows nothing of what codesign printed.
 c=$(make_case)
 echo 1 > "$c/sign-rc"
 printf 'error: %s: no identity found\n' "$identity" > "$c/sign-err"
-check_stops 'codesign fails, identity hidden' "$c" 'no identity found'
+check_stops 'codesign fails, output not shown' "$c" 'codesign failed (status 1)'
+t='codesign fails, output not shown: no codesign text'
+if [[ "$err" != *'no identity found'* ]] && [[ "$err" == *HXPROBE_SIGN_DEBUG* ]]; then pass "$t"
+else fail "$t" "err='$err'"; fi
+
+# (v-b) With the identity given as a hash, codesign names the signer, the
+# team and a keychain under HOME by itself. None of it is shown, and with
+# HXPROBE_SIGN_DEBUG=1 the output is shown without them.
+for sign_debug in 0 1; do
+    t="signer, team and keychain path hidden (debug $sign_debug)"
+    c=$(make_case)
+    echo 1 > "$c/sign-rc"
+    {
+        printf '%s: ambiguous (matches "Developer ID Application: Stub Person (STUBTEAM01)" and "Developer ID Application: Stub Person (STUBTEAM02)" in %s/Library/Keychains/login.keychain-db)\n' \
+            "$identity_hash" "$c/home"
+        printf 'Developer ID Application: Stub Person (STUBTEAM01): no identity found\n'
+        printf 'team (STUBTEAM03) has no such certificate\n'
+    } > "$c/sign-err"
+    run "$c" hash "$c/prog" 9.8.7 arm64
+    shown=0
+    if [[ "$err" == *'ambiguous (matches "<signer>" and "<signer>" in <home>/Library'* ]] \
+        && [[ "$err" == *'team (<team>) has no such certificate'* ]]; then shown=1; fi
+    if [ "$rc" = 1 ] && [ -z "$out" ] && [[ "$err" == *'codesign failed (status 1)'* ]] \
+        && [ "$shown" = "$sign_debug" ] && no_identity "$c" \
+        && [ "$(work_files "$c")" = 0 ]; then pass "$t"
+    else fail "$t" "rc=$rc out='$out' err='$err'"; fi
+done
+sign_debug=0
+
+# (v-c) The same for a signature that does not verify.
+t='verify output not shown'
+c=$(make_case)
+echo 3 > "$c/verify-rc"
+run_signed "$c"
+if [ "$rc" = 1 ] && [[ "$err" == *'does not verify (status 3)'* ]] \
+    && [[ "$err" != *'valid on disk'* ]] && no_identity "$c"; then pass "$t"
+else fail "$t" "rc=$rc err='$err'"; fi
 
 if [ "$failures" -ne 0 ]; then
     printf '%d case(s) failed\n' "$failures"

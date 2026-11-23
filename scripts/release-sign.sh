@@ -15,7 +15,9 @@
 # command line and, when this machine has it, the version (the program is
 # run with --version). Last it prints the line for
 # release/SHA256SUMS, computed from the signed file, which is the file to
-# publish. Messages go to stderr; stdout holds only that line.
+# publish. Messages go to stderr; stdout holds only that line. What codesign
+# prints when it fails is not shown, as it can name the signer; with
+# HXPROBE_SIGN_DEBUG=1 it is shown with those names removed.
 #
 # Written for the macOS system bash (3.2).
 
@@ -31,19 +33,44 @@ usage() {
     exit 2
 }
 
-# The text $1 with every occurrence of the identity replaced, so that no
-# output of this script shows it.
+# The text $1 without what tells who signs: the identity, a certificate name
+# (`Developer ID Application: ...` up to a quote or the end of the line), a
+# team in brackets and the home directory.
 redact() {
-    printf '%s\n' "$1" | HXPROBE_REDACT="$HXPROBE_SIGN_IDENTITY" awk '
-        BEGIN { id = ENVIRON["HXPROBE_REDACT"] }
-        {
-            line = $0; out = ""
-            while (id != "" && (i = index(line, id)) > 0) {
-                out = out substr(line, 1, i - 1) "<identity>"
-                line = substr(line, i + length(id))
+    printf '%s\n' "$1" | HXPROBE_REDACT="$HXPROBE_SIGN_IDENTITY" HXPROBE_REDACT_HOME="${HOME:-}" awk '
+        function cut(line, what, with,    out, i) {
+            out = ""
+            while (what != "" && (i = index(line, what)) > 0) {
+                out = out substr(line, 1, i - 1) with
+                line = substr(line, i + length(what))
             }
-            print out line
+            return out line
+        }
+        BEGIN {
+            id = ENVIRON["HXPROBE_REDACT"]
+            home = ENVIRON["HXPROBE_REDACT_HOME"]
+            if (home == "/") home = ""
+            c = "[A-Z0-9]"
+            team = "\\(" c c c c c c c c c c "\\)"
+        }
+        {
+            line = cut(cut($0, id, "<identity>"), home, "<home>")
+            gsub(/Developer ID Application:[^"]*/, "<signer>", line)
+            gsub(team, "(<team>)", line)
+            print line
         }'
+}
+
+# Stops with message $1 and the status $2 of a codesign run. What codesign
+# printed ($3) can name the signer, the team and keychain paths, so it is
+# shown only with HXPROBE_SIGN_DEBUG=1, and then through `redact`.
+codesign_failed() {
+    if [ "${HXPROBE_SIGN_DEBUG:-}" = 1 ]; then
+        log "what codesign printed (signer, team and home directory removed):"
+        redact "$3" >&2
+        die "$1 (status $2)"
+    fi
+    die "$1 (status $2); run again with HXPROBE_SIGN_DEBUG=1 to see what codesign printed"
 }
 
 [ "$#" = 3 ] || usage
@@ -77,13 +104,12 @@ cp "$prog" "$tmp"
 # mktemp made the file 0600 and cp keeps the mode of an existing file.
 chmod 755 "$tmp"
 
-if ! out=$(codesign --force --options runtime --timestamp --identifier "$identifier" \
-        --sign "$HXPROBE_SIGN_IDENTITY" "$tmp" 2>&1); then
-    die "codesign failed: $(redact "$out")"
-fi
-if ! out=$(codesign --verify --strict --verbose=2 "$tmp" 2>&1); then
-    die "the signature does not verify: $(redact "$out")"
-fi
+rc=0
+out=$(codesign --force --options runtime --timestamp --identifier "$identifier" \
+    --sign "$HXPROBE_SIGN_IDENTITY" "$tmp" 2>&1) || rc=$?
+[ "$rc" = 0 ] || codesign_failed "codesign failed" "$rc" "$out"
+out=$(codesign --verify --strict --verbose=2 "$tmp" 2>&1) || rc=$?
+[ "$rc" = 0 ] || codesign_failed "the signature does not verify" "$rc" "$out"
 
 # codesign prints the requirement and the details on stderr.
 req=$(codesign -d -r- "$tmp" 2>&1) || die "cannot read the designated requirement"
