@@ -20,8 +20,9 @@
 #                         $HOME/Library/Application Support/hxprobe; required
 #                         when HOME is not set)
 #   CLAUDE_PLUGIN_DATA    plugin data directory (set by Claude Code); only
-#                         legacy programs bin/hxprobe-<version> are removed
-#                         from it after an install
+#                         what earlier launchers left there is removed after
+#                         an install: bin/hxprobe-<version>, target,
+#                         target.<pid> and install.lock
 #   HXPROBE_RELEASE_BASE  base URL of the release downloads
 #   HXPROBE_SUMS          checksum file (default: release/SHA256SUMS)
 #
@@ -298,7 +299,6 @@ remove_old_build_dirs() {
     if [ "$lock_held" = 1 ]; then
         rm -f "$bindir"/.download.* "$bindir"/.build.* 2>/dev/null || true
     fi
-    if [ "$lock_held" = 1 ]; then rm -rf "$inst/target"; fi
     for d in "$inst"/target.*; do
         [ -d "$d" ] || continue
         if [ "$lock_held" = 1 ] || pid_gone "${d##*.}"; then rm -rf "$d"; fi
@@ -311,7 +311,7 @@ remove_old_build_dirs() {
 # keep their file (overwriting a signed program in place would invalidate
 # the signature of running copies).
 install_and_run() {
-    local src=$1 f
+    local src=$1 f d
     shift
     chmod 700 "$src" || die "cannot make $src executable"
     # mv would put the file into a directory (or a link to one) of that name.
@@ -323,6 +323,17 @@ install_and_run() {
             [ -f "$f" ] || continue
             rm -f "$f" || true
         done
+        # They also built and locked in the plugin data directory. Not when
+        # that is the install directory: its lock is the one held here.
+        d=${legacy%/bin}
+        if [ "$d" != "$inst" ]; then
+            for f in "$d/target" "$d"/target.*; do
+                [ -d "$f" ] || continue
+                rm -rf "$f" 2>/dev/null || true
+            done
+            rm -f "$d/install.lock/pid" "$d/install.lock" 2>/dev/null || true
+            rmdir "$d/install.lock" 2>/dev/null || true
+        fi
     fi
     release_lock
     log "installed hxprobe $version at $bin"

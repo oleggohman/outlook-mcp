@@ -507,7 +507,7 @@ for variant in 'fresh' 'leftover lock of a dead process'; do
         r=$(make_repo)
         make_cargo_stub "$r" 'sleep 0.3'
         if [ "$variant" != fresh ]; then
-            mkdir -p "$r/inst/bin" "$r/inst/target/release" "$r/inst/target.$(dead_pid)/release"
+            mkdir -p "$r/inst/bin" "$r/inst/target.$(dead_pid)/release"
             # The holder waits for the lock: lock_free below holds it for
             # a moment, and a holder that tried only once could miss it.
             ( exec 9>> "$r/inst/install.lock"; lockf -s -t 10 9; exec sleep 30 ) &
@@ -777,6 +777,33 @@ run "$r" HXPROBE_RELEASE_BASE="file://$r/rel" PATH="$nocargo_path" --
 if [ "$rc" = 0 ] && [ "$out" = 'FAKE mcp' ] && [ "$(leftovers "$r/inst")" = 0 ] \
     && [ -e "$r/inst/bin/notes" ]; then pass "$t"
 else fail "$t" "rc=$rc out='$out' leftovers=$(leftovers "$r/inst") err='$err'"; fi
+
+# (xv) Build directories. The launcher builds in <install dir>/target.<pid>
+# and never made <install dir>/target: a directory of that name is not its
+# to remove. What an earlier launcher left in the plugin data directory
+# (target, target.<pid>, install.lock) goes after a successful install;
+# other files there stay.
+t='build directories of earlier launchers'
+r=$(make_repo)
+make_asset "$r"
+mkdir -p "$r/inst/target/keep" "$r/data/target/release" "$r/data/target.$(dead_pid)/release" "$r/data/bin"
+: > "$r/data/install.lock"
+: > "$r/data/notes"
+run "$r" HXPROBE_RELEASE_BASE="file://$r/rel" PATH="$nocargo_path" --
+if [ "$rc" = 0 ] && [ "$out" = 'FAKE mcp' ] && [ -d "$r/inst/target/keep" ] \
+    && [ "$(leftovers "$r/data")" = 0 ] && [ ! -e "$r/data/install.lock" ] \
+    && [ -e "$r/data/notes" ]; then pass "$t"
+else fail "$t" "rc=$rc out='$out' data='$(ls -A "$r/data")' inst='$(ls -A "$r/inst")' err='$err'"; fi
+
+# The plugin data directory may be the install directory itself: then its
+# lock is the one in use and stays.
+t='plugin data directory is the install directory'
+r=$(make_repo)
+make_asset "$r"
+run "$r" CLAUDE_PLUGIN_DATA="$r/inst" HXPROBE_RELEASE_BASE="file://$r/rel" PATH="$nocargo_path" --
+if [ "$rc" = 0 ] && [ "$out" = 'FAKE mcp' ] && [ -f "$r/inst/install.lock" ] \
+    && lock_free "$r/inst"; then pass "$t"
+else fail "$t" "rc=$rc out='$out' err='$err'"; fi
 
 if [ "$failures" -ne 0 ]; then
     printf '%d case(s) failed\n' "$failures"
