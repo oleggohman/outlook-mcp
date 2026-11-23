@@ -1,6 +1,6 @@
 ---
 name: outlook-local-mail
-description: Use when the user asks to check their inbox, find or read an email, look up a contact or see their meetings and the local hxprobe MCP server for Outlook is available (tools store_status, refresh, list_folders, list_messages, search_messages, get_message, list_attachments, search_people, list_events), or when one of those tools returns an argument error, a permission error (Operation not permitted), an empty result, a stale result or a timeout.
+description: Use when the user asks to check their inbox, find or read an email, look up a contact or see their meetings and the local hxprobe MCP server for Outlook is available (tools store_status, refresh, list_folders, list_messages, search_messages, get_message, list_attachments, search_people, list_events), or when one of those tools returns an argument error, a permission error (Operation not permitted), a cache or refresh service error, an empty result, a stale result or a timeout.
 ---
 
 # Outlook local mail (hxprobe MCP)
@@ -40,16 +40,25 @@ Claude starts hxprobe as a "disclaimed" helper, so macOS checks hxprobe's own
 permissions, not Claude's or Terminal's. That is why giving Claude Full Disk
 Access does not help, and why the same store opens fine from Terminal.
 
-1. Find the program path. It is `<data>/bin/hxprobe-<version>`, where
-   `<data>` is `$CLAUDE_PLUGIN_DATA` or, when that is not set,
-   `~/Library/Application Support/hxprobe-plugin`. List that `bin` folder to
-   get the exact name and give the user the full absolute path.
+1. Find the program path. It is
+   `~/Library/Application Support/hxprobe/bin/hxprobe`, or
+   `$HXPROBE_INSTALL_DIR/bin/hxprobe` when that is set (with `HXPROBE_BIN`
+   set, it is that program). There is no version in the name. Give the user
+   the full absolute path.
 2. Tell the user: open System Settings → Privacy & Security → Full Disk
    Access and click **+**. Press Cmd+Shift+G, paste the path, click Open and
    make sure its toggle is on. If it is already listed, remove it with **–**
-   and add it again (a new version is a new file and needs its own entry).
-3. Tell the user to run `pkill -f hxprobe-<version>` (with the real version),
-   so the next mail call starts a fresh helper that has the permission.
+   and add it again. One entry is expected to stay valid across signed
+   releases; an old `hxprobe-0.1.x` entry can be removed.
+3. Tell the user to run this in Terminal (the client may stay open), so the
+   next mail call starts a fresh background service that has the permission:
+
+   ```sh
+   "$HOME/Library/Application Support/hxprobe/bin/hxprobe" service --stop
+   ```
+
+   Add `--cache-dir <dir>` when the server runs with another cache
+   directory; use the real program path when it is elsewhere.
 4. After the user confirms, call `store_status` to check.
 
 ## Argument rules that cause errors
@@ -125,29 +134,47 @@ and say the full text is not cached.
 
 ## Freshness
 
-- `store_status` returns `built` (when the snapshot was made) and
+- `store_status` returns `built` (when the snapshot was made),
   `store_changed_since_build` (`null` when the live store could not be
-  checked).
-- The server rebuilds by itself when the store changed and the last build is
-  at least 15 minutes old (the default).
-- `refresh` rebuilds now, waits for the build and returns the new status. Use it when the user says recent mail is missing or
+  checked) and `service`: `running` (the background service answered),
+  `building` (a rebuild runs now), `version`, `pid`, `last_error`.
+  `service` is `null` when the server builds the cache itself.
+- A background service rebuilds the cache when the store changed, the last
+  build is at least 15 minutes old (the default) and a call came in. No call
+  waits for that rebuild: the call that noticed the change, and the calls
+  while `service.building` is true, are answered from the previous snapshot.
+  For new mail, call again after about 15 seconds.
+- `refresh` rebuilds now, waits for the build and returns the new status.
+  Use it when the user says recent mail is missing or
   `store_changed_since_build` is true and the answer depends on new mail. Do
   not call it before every query: a rebuild takes 10 seconds or more on a
   large mailbox.
 - If mail is still missing after `refresh`, Outlook has not saved it to the
   local store yet (or does not keep that folder offline). The server cannot
   fetch it. Say so.
-- `last_error` in `store_status` set: the last rebuild failed and older data
-  is being served. Report the error text to the user.
+- `last_error` in `store_status` set: the last rebuild failed, or the
+  service is not available, and older data is being served. Report the error
+  text to the user.
+
+| Error text contains | Do |
+|---|---|
+| `being built for the first time; call again in a few seconds` | Wait about 15 seconds and call again. |
+| `this server is older than the mail cache; restart the MCP client` | Tell the user to restart the MCP client. Do not retry. |
+| `this cache directory serves another store` | Another server uses this cache for another Outlook store. Tell the user to give this server its own `--cache-dir`. Do not retry. |
+| `did not finish within 300 s and may still be running` | The rebuild goes on. Call `store_status` later; do not call `refresh` again. |
+| `the refresh service did not start` or `exited at start` | Report it with the `service.log` path it names. Calls still answer from an existing cache. |
 
 ### Slow first call or a timeout
 
-The first call after the cache is created, and any call that triggers a
-rebuild, waits for the build (10 seconds or more on a large mailbox). After
-a timeout, retry the call once. If it times out again, the client's tool
-timeout is shorter than a build: tell the user to raise it (for Claude Code,
-`MCP_TOOL_TIMEOUT` in milliseconds). It is not a sign that the server is
-broken; `store_status` shows `last_error` when a build really failed.
+Only the first build ever (no cache yet) and `refresh` wait for a build (10
+seconds or more on a large mailbox). The first call waits at most 50
+seconds, then returns the "being built for the first time" error: call
+again. A server started with `--no-service` also waits inside the call that
+triggers a rebuild. After a timeout, retry the call once. If it times out
+again, the client's tool timeout is shorter than a build: tell the user to
+raise it (for Claude Code, `MCP_TOOL_TIMEOUT` in milliseconds). It is not a
+sign that the server is broken; `store_status` shows `last_error` when a
+build really failed.
 
 ## What the server cannot do
 
@@ -184,9 +211,13 @@ back to the user's zone. If two senders match "dana", show both and ask.
 - Treating an empty result as "no such mail" without checking `store_status`
   when the user expects recent mail.
 - Calling `refresh` on every request.
+- Expecting new mail in the answer to the call that started a rebuild: it
+  comes from the previous snapshot.
 - Using the date-only form for a local day: `2026-11-15` is midnight UTC, not
   local midnight. Use the full `...Z` form for local day boundaries.
 - Calling `search_people` only to get an address for `from`.
 - Reporting `unread_count` as the number of messages that can be listed.
 - On "Operation not permitted": retrying, or telling the user to give Claude
   or Terminal Full Disk Access. The hxprobe program itself needs it.
+- Retrying on "restart the MCP client" or "serves another store": only the
+  user can fix those.
