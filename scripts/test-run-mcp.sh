@@ -25,13 +25,23 @@ failures=0
 pass() { printf 'PASS %s\n' "$1"; }
 fail() { printf 'FAIL %s: %s\n' "$1" "$2"; failures=$((failures + 1)); }
 
-# Fake program: prints its arguments to stdout and leaves a marker file.
+# Shell code for the stubs: sets f3 and f9 to `open` or `closed`, the state of
+# fd 3 (the parked stdout of the launcher) and fd 9 (the install lock).
+fd_probe='f3=closed; f9=closed
+if ( : >&3 ) 2>/dev/null; then f3=open; fi
+if ( : >&9 ) 2>/dev/null; then f9=open; fi'
+fds_closed='fd3=closed fd9=closed'
+
+# Fake program: prints its arguments to stdout and leaves a marker file that
+# holds the state of fd 3 and fd 9. $3 is optional shell code to run last.
 make_fake() {
     # $1 = path, $2 = marker file
     cat > "$1" <<EOF
 #!/bin/sh
 echo "FAKE \$*"
-: > "$2"
+$fd_probe
+echo "fd3=\$f3 fd9=\$f9" > "$2"
+${3:-}
 EOF
     chmod 755 "$1"
 }
@@ -57,7 +67,8 @@ EOF
 }
 
 # Runs the launcher of repo $1 with the remaining arguments as `env` settings
-# followed by `--` and launcher arguments. Sets out, err, rc.
+# followed by `--` and launcher arguments. Sets out, err, rc. The launcher
+# starts with fd 9 open, as it would under a parent that leaks one.
 run() {
     local r=$1
     shift
@@ -68,7 +79,7 @@ run() {
     # shellcheck disable=SC2086
     env -u HXPROBE_BIN -u HXPROBE_RELEASE_BASE -u HXPROBE_SUMS -u CLAUDE_PLUGIN_DATA \
         HOME="$root/home" $envs \
-        bash "$r/scripts/run-mcp.sh" "$@" > "$root/out" 2> "$root/err" || rc=$?
+        bash "$r/scripts/run-mcp.sh" "$@" > "$root/out" 2> "$root/err" 9> "$root/fd9" || rc=$?
     out=$(cat "$root/out")
     err=$(cat "$root/err")
 }
@@ -91,14 +102,28 @@ dead_pid() {
     printf '%s\n' "$p"
 }
 
-# A cargo stub in $1/stub: appends a line to $1/builds, runs the shell code $2
-# and leaves a program where cargo would.
+# Succeeds when the process with pid $1 is gone, within about 1 s.
+gone() {
+    local i=0
+    while kill -0 "$1" 2>/dev/null; do
+        [ "$i" -lt 10 ] || return 1
+        sleep 0.1
+        i=$((i + 1))
+    done
+}
+
+# A cargo stub in $1/stub: appends a line to $1/builds and the state of fd 3
+# and fd 9 to $1/cargo-fds, copies its stdin to $1/cargo-stdin, runs the
+# shell code $2 and leaves a program where cargo would.
 make_cargo_stub() {
     mkdir -p "$1/stub"
     cat > "$1/stub/cargo" <<EOF
 #!/bin/sh
 echo "cargo noise on stdout"
 echo start >> "$1/builds"
+$fd_probe
+echo "fd3=\$f3 fd9=\$f9" >> "$1/cargo-fds"
+cat >> "$1/cargo-stdin"
 $2
 # Locate --target-dir and leave a program where cargo would.
 while [ \$# -gt 0 ]; do
@@ -138,8 +163,9 @@ t='HXPROBE_BIN'
 r=$(make_repo)
 make_fake "$r/fake" "$r/ran"
 run "$r" HXPROBE_BIN="$r/fake" CLAUDE_PLUGIN_DATA="$r/data" -- --store /x
-if [ "$rc" = 0 ] && [ "$out" = 'FAKE mcp --store /x' ] && [ -z "$err" ]; then pass "$t"
-else fail "$t" "rc=$rc out='$out' err='$err'"; fi
+if [ "$rc" = 0 ] && [ "$out" = 'FAKE mcp --store /x' ] && [ -z "$err" ] \
+    && [ "$(cat "$r/ran")" = "$fds_closed" ]; then pass "$t"
+else fail "$t" "rc=$rc out='$out' err='$err' fds='$(cat "$r/ran" 2>/dev/null || true)'"; fi
 
 # (i-b) HXPROBE_BIN that is not executable is an error, not a fallback.
 t='HXPROBE_BIN not executable'
@@ -154,8 +180,9 @@ r=$(make_repo)
 mkdir -p "$r/data/bin"
 make_fake "$r/data/bin/hxprobe-$version" "$r/ran"
 run "$r" CLAUDE_PLUGIN_DATA="$r/data" PATH="$nocargo_path" --
-if [ "$rc" = 0 ] && [ "$out" = 'FAKE mcp' ] && [ -z "$err" ]; then pass "$t"
-else fail "$t" "rc=$rc out='$out' err='$err'"; fi
+if [ "$rc" = 0 ] && [ "$out" = 'FAKE mcp' ] && [ -z "$err" ] \
+    && [ "$(cat "$r/ran")" = "$fds_closed" ]; then pass "$t"
+else fail "$t" "rc=$rc out='$out' err='$err' fds='$(cat "$r/ran" 2>/dev/null || true)'"; fi
 
 # (ii-b) Default data directory under HOME, created with mode 0700.
 t='default data dir'
@@ -200,7 +227,8 @@ else fail "$t" "rc=$rc out='$out' err='$err'"; fi
 
 # (iii-c) The options that curl is given, recorded by a stub: https only
 # (also for redirects), TLS 1.2 or later and time limits; `file` only for a
-# file:// base URL.
+# file:// base URL. The stub also records that it has neither the lock (fd 9)
+# nor the real stdout (fd 3).
 t='curl options'
 r=$(make_repo)
 printf '%s  %s\n' "$sum" "$asset" > "$r/release/SHA256SUMS"
@@ -208,6 +236,8 @@ mkdir -p "$r/stub"
 cat > "$r/stub/curl" <<EOF
 #!/bin/sh
 printf '%s\n' "\$*" >> "$r/curl-args"
+$fd_probe
+echo "fd3=\$f3 fd9=\$f9" >> "$r/curl-fds"
 exit 22
 EOF
 chmod 755 "$r/stub/curl"
@@ -230,8 +260,9 @@ done
 [[ " $a3 " == *' --proto =file --proto-redir =file '* ]] && [[ "$a3" != *'=https'* ]] || curl_ok=0
 if [ "$curl_ok" = 1 ] && [[ "$a1" == *" https://github.com/"*"/v$version/$asset" ]] \
     && [[ "$a2" == *" http://127.0.0.1:9/v$version/$asset" ]] \
+    && [ "$(sort -u "$r/curl-fds")" = "$fds_closed" ] \
     && [ "$rc" = 1 ] && [ -z "$out" ] && [[ "$err" == *"download of $asset failed"* ]]; then pass "$t"
-else fail "$t" "rc=$rc a1='$a1' a2='$a2' a3='$a3' err='$err'"; fi
+else fail "$t" "rc=$rc a1='$a1' a2='$a2' a3='$a3' fds='$(cat "$r/curl-fds" 2>/dev/null || true)' err='$err'"; fi
 
 # (iii-d) A failed move into place stops the install: nothing is reported as
 # installed and no temp file is left.
@@ -280,13 +311,18 @@ else fail "$t" "rc=$rc out='$out' err='$err'"; fi
 
 # (vi) The launcher itself writes nothing to stdout: with a cargo stub that
 # prints to stdout, and with a download, stdout holds only the server output.
+# The cargo stub has neither the lock (fd 9) nor the real stdout (fd 3), and
+# reads nothing from the stdin of the launcher, which belongs to the server.
 t='stdout clean'
 r=$(make_repo)
 make_cargo_stub "$r" ''
-run "$r" CLAUDE_PLUGIN_DATA="$r/data" PATH="$r/stub:$nocargo_path" -- x
+printf 'request\n' > "$r/stdin"
+run "$r" CLAUDE_PLUGIN_DATA="$r/data" PATH="$r/stub:$nocargo_path" -- x < "$r/stdin"
 built_ok=0
 if [ "$rc" = 0 ] && [ "$out" = 'BUILT mcp x' ] && [[ "$err" == *'cargo noise on stdout'* ]] \
-    && [ "$(leftovers "$r/data")" = 0 ] && [ -x "$r/data/bin/hxprobe-$version" ]; then built_ok=1; fi
+    && [ "$(leftovers "$r/data")" = 0 ] && [ -x "$r/data/bin/hxprobe-$version" ] \
+    && [ "$(cat "$r/cargo-fds")" = "$fds_closed" ] && [ -e "$r/cargo-stdin" ] \
+    && [ ! -s "$r/cargo-stdin" ]; then built_ok=1; fi
 r2=$(make_repo)
 make_fake "$r2/rel-$asset" "$r2/ran"
 mkdir -p "$r2/rel/v$version"
@@ -294,7 +330,7 @@ mv "$r2/rel-$asset" "$r2/rel/v$version/$asset"
 printf '%s  %s\n' "$(shasum -a 256 "$r2/rel/v$version/$asset" | awk '{print $1}')" "$asset" > "$r2/release/SHA256SUMS"
 run "$r2" CLAUDE_PLUGIN_DATA="$r2/data" HXPROBE_RELEASE_BASE="file://$r2/rel" PATH="$nocargo_path" --
 if [ "$built_ok" = 1 ] && [ "$rc" = 0 ] && [ "$out" = 'FAKE mcp' ]; then pass "$t"
-else fail "$t" "built_ok=$built_ok rc=$rc out='$out' err='$err'"; fi
+else fail "$t" "built_ok=$built_ok rc=$rc out='$out' cargo-fds='$(cat "$r/cargo-fds" 2>/dev/null || true)' err='$err'"; fi
 
 # (vii) The install lock. A lock directory left by an earlier launcher is
 # replaced by the lock file; a held lock is waited for until the holder has
@@ -368,17 +404,73 @@ if [ "$bad" = 0 ] && [ "$builds" -ge 1 ] && [ "$(leftovers "$r/data")" = 0 ] \
     && [[ "$(cat "$r/err.0")" == *'installing without a lock'* ]]; then pass "$t"
 else fail "$t" "bad=$bad builds=$builds leftovers=$(leftovers "$r/data") err='$(cat "$r"/err.*)'"; fi
 
+# (vii-b) The lock is free while the server that was just installed runs, and
+# the server has neither fd 9 nor fd 3.
+t='lock free while the server runs'
+r=$(make_repo)
+mkdir -p "$r/rel/v$version"
+make_fake "$r/rel/v$version/$asset" "$r/ran" 'sleep 2'
+printf '%s  %s\n' "$(shasum -a 256 "$r/rel/v$version/$asset" | awk '{print $1}')" "$asset" > "$r/release/SHA256SUMS"
+env -u HXPROBE_BIN -u HXPROBE_SUMS HOME="$root/home" CLAUDE_PLUGIN_DATA="$r/data" \
+    HXPROBE_RELEASE_BASE="file://$r/rel" PATH="$nocargo_path" \
+    bash "$r/scripts/run-mcp.sh" > "$r/out" 2> "$r/err" 9> "$root/fd9" &
+pid=$!
+i=0
+while [ ! -e "$r/ran" ] && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+running=0; free=0
+if kill -0 "$pid" 2>/dev/null; then running=1; fi
+if lock_free "$r/data"; then free=1; fi
+rc=0
+wait "$pid" || rc=$?
+if [ "$running" = 1 ] && [ "$free" = 1 ] && [ "$rc" = 0 ] && [ "$(cat "$r/out")" = 'FAKE mcp' ] \
+    && [ "$(cat "$r/ran" 2>/dev/null || true)" = "$fds_closed" ]; then pass "$t"
+else fail "$t" "running=$running free=$free rc=$rc fds='$(cat "$r/ran" 2>/dev/null || true)' err='$(cat "$r/err")'"; fi
+
 # (ix) TERM during a build or a download ends the launcher within about 2 s
-# with a non-zero status; the lock is free and nothing is left behind.
-for what in build download; do
+# with a non-zero status; the lock is free and nothing is left behind. The
+# command and what it started are gone as well: each stub starts a second
+# process, which during a build keeps writing into the build directory. In
+# the third variant that process ignores TERM, so the launcher has to kill it
+# (after 2 s).
+for what in build download 'build, TERM ignored'; do
     t="TERM during $what"
     r=$(make_repo)
     mkdir -p "$r/stub"
-    if [ "$what" = build ]; then
-        printf '#!/bin/sh\n: > "%s"\nexec sleep 30\n' "$r/started" > "$r/stub/cargo"
-    else
+    limit=2
+    ignore=''
+    if [ "$what" = 'build, TERM ignored' ]; then limit=4; ignore="trap '' TERM"; fi
+    if [ "$what" = download ]; then
         printf '%s  %s\n' "$sum" "$asset" > "$r/release/SHA256SUMS"
-        printf '#!/bin/sh\n: > "%s"\nexec sleep 30\n' "$r/started" > "$r/stub/curl"
+        cat > "$r/stub/curl" <<EOF
+#!/bin/sh
+sleep 30 &
+echo \$! > "$r/grandchild.pid"
+echo \$\$ > "$r/stub.pid"
+: > "$r/started"
+sleep 30
+EOF
+    else
+        cat > "$r/stub/cargo" <<EOF
+#!/bin/sh
+while [ \$# -gt 0 ]; do
+    if [ "\$1" = --target-dir ]; then t=\$2; fi
+    shift
+done
+(
+    $ignore
+    i=0
+    while :; do
+        mkdir -p "\$t/release"
+        : > "\$t/release/f.\$i"
+        i=\$((i + 1))
+        sleep 0.05
+    done
+) &
+echo \$! > "$r/grandchild.pid"
+echo \$\$ > "$r/stub.pid"
+: > "$r/started"
+sleep 30
+EOF
     fi
     chmod 755 "$r/stub"/*
     env -u HXPROBE_BIN -u HXPROBE_RELEASE_BASE -u HXPROBE_SUMS \
@@ -392,11 +484,62 @@ for what in build download; do
     rc=0
     wait "$pid" || rc=$?
     took=$(( $(date +%s) - before ))
-    if [ -e "$r/started" ] && [ "$rc" = 143 ] && [ "$took" -le 2 ] && [ ! -s "$r/out" ] \
+    stub_pid=$(cat "$r/stub.pid" 2>/dev/null || true)
+    grandchild_pid=$(cat "$r/grandchild.pid" 2>/dev/null || true)
+    alive=''
+    for p in $stub_pid $grandchild_pid; do
+        if ! gone "$p"; then alive="$alive $p"; fi
+    done
+    # A writer that survived would have put the build directory back by now.
+    sleep 0.3
+    if [ -e "$r/started" ] && [ "$rc" = 143 ] && [ "$took" -le "$limit" ] && [ ! -s "$r/out" ] \
+        && [ -n "$stub_pid" ] && [ -n "$grandchild_pid" ] && [ -z "$alive" ] \
         && [ "$(leftovers "$r/data")" = 0 ] && lock_free "$r/data" \
         && [ ! -e "$r/data/bin/hxprobe-$version" ]; then pass "$t"
-    else fail "$t" "rc=$rc took=${took}s leftovers=$(leftovers "$r/data") err='$(cat "$r/err")'"; fi
+    else fail "$t" "rc=$rc took=${took}s alive='$alive' leftovers=$(leftovers "$r/data") err='$(cat "$r/err")'"; fi
+    for p in $stub_pid $grandchild_pid; do kill -KILL "$p" 2>/dev/null || true; done
 done
+
+# (ix-b) TERM while the launcher waits for the lock: it ends at once and the
+# lockf process that was waiting is gone. A lockf stub records the pids.
+t='TERM during the wait for the lock'
+r=$(make_repo)
+mkdir -p "$r/stub" "$r/data/bin"
+cat > "$r/stub/lockf" <<EOF
+#!/bin/sh
+echo \$\$ >> "$r/lockf.pids"
+exec /usr/bin/lockf "\$@"
+EOF
+chmod 755 "$r/stub/lockf"
+( exec 9>> "$r/data/install.lock"; lockf -s -t 0 9; exec sleep 30 ) &
+holder=$!
+i=0
+while lock_free "$r/data" && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+env -u HXPROBE_BIN -u HXPROBE_RELEASE_BASE -u HXPROBE_SUMS \
+    HOME="$root/home" CLAUDE_PLUGIN_DATA="$r/data" PATH="$r/stub:$nocargo_path" \
+    bash "$r/scripts/run-mcp.sh" > "$r/out" 2> "$r/err" &
+pid=$!
+# Two lockf runs: the attempt that fails at once and the one that waits.
+i=0
+while [ "$(cat "$r/lockf.pids" 2>/dev/null | wc -l)" -lt 2 ] && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+sleep 0.2
+before=$(date +%s)
+kill -TERM "$pid"
+rc=0
+wait "$pid" || rc=$?
+took=$(( $(date +%s) - before ))
+waiters=$(cat "$r/lockf.pids" 2>/dev/null || true)
+alive=''
+for p in $waiters; do
+    if ! gone "$p"; then alive="$alive $p"; fi
+done
+if [ "$(printf '%s\n' "$waiters" | wc -l | tr -d ' ')" = 2 ] && [ "$rc" = 143 ] && [ "$took" -le 2 ] \
+    && [ ! -s "$r/out" ] && [ -z "$alive" ] && [[ "$(cat "$r/err")" == *'waiting'* ]] \
+    && kill -0 "$holder" 2>/dev/null; then pass "$t"
+else fail "$t" "rc=$rc took=${took}s waiters='$waiters' alive='$alive' err='$(cat "$r/err")'"; fi
+for p in $waiters; do kill -KILL "$p" 2>/dev/null || true; done
+kill -KILL "$holder" 2>/dev/null || true
+wait "$holder" 2>/dev/null || true
 
 if [ "$failures" -ne 0 ]; then
     printf '%d case(s) failed\n' "$failures"

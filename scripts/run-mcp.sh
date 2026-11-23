@@ -70,18 +70,40 @@ fi
 # for the lock) run in the background and the launcher waits for them, so a
 # trap can stop the command and clean up.
 child=''
+starting=0
+pending=''
 tmp_file=''
 build_dir=''
 
+# Runs at exit; a failing rm must not replace the exit status.
 cleanup() {
-    if [ -n "$tmp_file" ]; then rm -f "$tmp_file"; fi
-    if [ -n "$build_dir" ]; then rm -rf "$build_dir"; fi
+    if [ -n "$tmp_file" ]; then rm -f "$tmp_file" 2>/dev/null || true; fi
+    if [ -n "$build_dir" ]; then rm -rf "$build_dir" 2>/dev/null || true; fi
 }
 on_signal() {
+    local i=0
+    # A command is being started and `child` is not set yet: whoever starts
+    # it calls on_signal again as soon as it is.
+    if [ "$starting" = 1 ]; then pending=$1; return 0; fi
     trap '' INT TERM HUP
     if [ -n "$child" ]; then
-        kill "$child" 2>/dev/null || true
+        # The whole process group of the command (cargo does not pass a
+        # signal on to the compilers it started), or the single process when
+        # it has no group of its own.
+        kill -TERM -- -"$child" 2>/dev/null || kill "$child" 2>/dev/null || true
+        # Give the group 2 s to end, then kill what is left, so that nothing
+        # writes into the build directory while cleanup removes it.
+        while kill -0 -- -"$child" 2>/dev/null && [ "$i" -lt 20 ]; do
+            sleep 0.1
+            i=$((i + 1))
+        done
+        kill -KILL -- -"$child" 2>/dev/null || true
         wait "$child" 2>/dev/null || true
+        i=0
+        while kill -0 -- -"$child" 2>/dev/null && [ "$i" -lt 10 ]; do
+            sleep 0.1
+            i=$((i + 1))
+        done
     fi
     exit "$1"
 }
@@ -91,11 +113,19 @@ trap 'on_signal 143' TERM
 trap 'on_signal 129' HUP
 
 # Runs a command without the lock (fd 9) and the real stdout (fd 3), and
-# returns its exit status.
+# returns its exit status. The command gets a process group of its own
+# (`set -m`), so a signal can stop it together with everything it started.
+# With job control a background command would keep the stdin of the launcher,
+# which belongs to the server, so it reads /dev/null instead.
 run_child() {
     local rc=0
-    "$@" 3>&- 9>&- &
+    starting=1
+    set -m
+    "$@" </dev/null 3>&- 9>&- &
     child=$!
+    set +m
+    starting=0
+    if [ -n "$pending" ]; then on_signal "$pending"; fi
     wait "$child" || rc=$?
     child=''
     return "$rc"
@@ -129,8 +159,11 @@ acquire_lock() {
     if [ "$rc" = 75 ]; then
         log "another start is installing hxprobe $version; waiting"
         rc=0
+        starting=1
         $block 3>&- &
         child=$!
+        starting=0
+        if [ -n "$pending" ]; then on_signal "$pending"; fi
         wait "$child" || rc=$?
         child=''
     fi
