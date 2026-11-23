@@ -48,6 +48,10 @@ hxprobe db     <file> [out.db]            legacy: SQLite database with FTS5 (def
 hxprobe map    <file> [n]                 legacy: dump the named field map for n records
 hxprobe find   <file> <term> [n]          legacy: show records whose text contains <term>
 hxprobe mcp    [options]                  read-only MCP server on stdin/stdout (see "MCP server")
+hxprobe service [options]                 background builder of the MCP cache (see "Background service")
+hxprobe service --status|--stop [--cache-dir <dir>]
+                                          show or stop that builder
+hxprobe --version                         print "hxprobe <version>"
 ```
 
 The outputs below are made up; they show the format, not real data.
@@ -305,10 +309,12 @@ messages, read a message body, list attachments, search people and list
 calendar events. It has no write tools and no SQL tool, and it opens no
 network connections.
 
-The server does not read the live store in place. It copies the store into a
-private cache directory, exports the copy (as `export` does), adds indexes, a
-full-text index and event times, and answers every tool call from that
-database.
+The server does not read the live store in place. The cache is built by
+copying the store into a private cache directory, exporting the copy (as
+`export` does) and adding indexes, a full-text index and event times. Every
+tool call is answered from that database. By default the build runs in a
+separate background process, `hxprobe service`, one per cache directory (see
+"Background service"); the MCP servers only read the database.
 
 ### Tools
 
@@ -319,8 +325,8 @@ before `limit` and `offset`. Times in results are UTC, as
 
 | Tool | Arguments | Result |
 |---|---|---|
-| `store_status` | none | store path, build time, whether the store changed since the build, counts of messages, folders, people and events, build time per phase, the last build error |
-| `refresh` | none | rebuilds the cache now (even when the store did not change), then returns `store_status` |
+| `store_status` | none | store path, build time, whether the store changed since the build, counts of messages, folders, people and events, build time per phase, the last build error, and the background service (`service`, see "Background service"); answered at once |
+| `refresh` | none | rebuilds the cache now (even when the store did not change), waits for the build, then returns `store_status` |
 | `list_folders` | `limit`, `offset` | folders with `guid, name, parent`, the counts stored by Outlook (`total_count, unread_count`) and the counts of locally cached mail (`cached_messages, cached_unread`); most cached messages first |
 | `list_messages` | `folder`, `unread_only`, `has_attachment`, `from`, `since`, `until`, `limit`, `offset` | messages with `guid, subject, sender_name, sender_address, sent, is_read, has_attachment, folder, preview`; newest first |
 | `search_messages` | `query` (required), plus the `list_messages` arguments | the `list_messages` fields plus `snippet`; best matches first |
@@ -372,31 +378,112 @@ how to use the tools. The plugin starts the server through
 `scripts/run-mcp.sh`, which finds or installs the `hxprobe` program for the
 version in `hxprobe/Cargo.toml` and then runs `hxprobe mcp`.
 
-On the first start the launcher installs the program:
+The program is installed at one stable path for every version:
+
+```
+<install dir>/bin/hxprobe
+```
+
+`<install dir>` is `$HXPROBE_INSTALL_DIR`, or
+`~/Library/Application Support/hxprobe` when that is not set. The directory
+and its `bin` folder must belong to the current user; the launcher sets both
+to mode `0700`. The path stays the same across upgrades, so every client and
+every version use one program file and one Full Disk Access entry.
+
+On each start the launcher asks the installed program for its version
+(`hxprobe --version`):
+
+* The version of the plugin, or a newer one: it is run as it is. The launcher
+  never downgrades; with a newer program it logs that it runs it.
+* Missing, older, or no answer: a new program is installed under the lock
+  `<install dir>/install.lock`, by a rename over `bin/hxprobe`. A running
+  server or service keeps its old file.
+
+How a new program is installed:
 
 * When `release/SHA256SUMS` lists a prebuilt program for the release and the
-  Mac's architecture, it downloads it from the GitHub release over HTTPS and
-  uses it only if its SHA-256 matches the listed sum. A file that does not
-  match is deleted and never run.
-* Otherwise it builds the program with `cargo build --release --locked`. This
-  needs Rust (install it from <https://rustup.rs>) and takes about a minute,
-  so the first connection can time out; reconnect the MCP server once the
-  build has finished. Without a prebuilt program and without `cargo` the
-  server does not start, and the message on stderr says what to do.
+  Mac's architecture, the launcher downloads it from the GitHub release over
+  HTTPS and installs it only if its SHA-256 matches the listed sum. A file
+  that does not match is deleted, and the launcher stops: nothing is built or
+  run in its place.
+* When the download fails (no network, for example) and a program that
+  answers `--version` is installed, that program is run, even an older one;
+  the next start tries the download again.
+* Otherwise the launcher builds the program with
+  `cargo build --release --locked`. This needs Rust (install it from
+  <https://rustup.rs>) and takes about a minute, so the first connection can
+  time out; reconnect the MCP server once the build has finished. Without a
+  prebuilt program and without `cargo` the server does not start, and the
+  message on stderr says what to do.
+* A new program must report the wanted version or a newer one; otherwise it
+  is deleted and not run.
 
-Later starts run the installed program directly. The program is kept as
-`bin/hxprobe-<version>` in the plugin's data directory (`$CLAUDE_PLUGIN_DATA`,
-or `~/Library/Application Support/hxprobe-plugin` when that is not set).
-Programs of other versions are removed after an update installs a new one.
+The launcher records where the installed program came from in
+`<install dir>/bin/.origin`: `release <sha256>` for a verified download,
+`build` for a program built with `cargo` (no record counts as `build`). A
+program built here is replaced by the release program of the same version as
+soon as `release/SHA256SUMS` lists one. A program built here is not signed
+with the release identity, so its Full Disk Access grant may not survive the
+next build; the launcher logs a note when it builds.
 
 To use a program you built yourself, set `HXPROBE_BIN` to its absolute path
-in the environment of Claude Code; the launcher then runs it and installs
-nothing. `scripts/test-run-mcp.sh` tests the launcher.
+in the environment of Claude Code. The launcher then runs it as it is and
+installs nothing; the background service is started from that same program,
+which needs its own Full Disk Access entry (see below).
+
+Upgrading from 0.1.x: earlier launchers kept the program as
+`bin/hxprobe-<version>` in the plugin's data directory (`$CLAUDE_PLUGIN_DATA`,
+or `~/Library/Application Support/hxprobe-plugin` when that is not set). After
+a successful install those `hxprobe-*` files, and the build directories and
+lock that earlier launchers left there, are removed. The Full Disk Access
+entry of the old `hxprobe-0.1.x` program no longer applies; add the new path
+(see below) and remove the old entry. Restart the MCP clients after the
+update, so that no 0.1.x server keeps building the cache on its own.
+
+### Full Disk Access
+
+The Outlook store lives in another app's container. Depending on how the MCP
+client starts the server, macOS checks the permission of the hxprobe program
+itself, not that of the client; giving the client Full Disk Access then does
+not help. When a tool or `store_status` reports `Operation not permitted` or
+`permission denied` for the store, give the program Full Disk Access:
+
+1. Open System Settings, Privacy & Security, Full Disk Access and click
+   **+**.
+2. Press Cmd+Shift+G, paste the path of the program and click Open. The path
+   is `~/Library/Application Support/hxprobe/bin/hxprobe`, or
+   `$HXPROBE_INSTALL_DIR/bin/hxprobe` when that is set, or the program named
+   by `HXPROBE_BIN`. Make sure its toggle is on.
+3. Stop the background service, so that the next tool call starts one with
+   the permission (this works while the client stays open):
+
+   ```sh
+   "$HOME/Library/Application Support/hxprobe/bin/hxprobe" service --stop
+   ```
+
+   Add `--cache-dir <dir>` when the server runs with another cache directory,
+   and use the program's real path when it is elsewhere.
+
+macOS remembers the grant by the program's code signature (Apple, TN3127
+"Inside Code Signing: Requirements"). Releases from 0.2.0 on are signed with a Developer ID
+and a fixed signing identifier, and an upgrade replaces the file at the same
+path, so the grant is expected to survive upgrades without a new entry. A
+program you built yourself (the `cargo` fallback, or `HXPROBE_BIN`) is not
+signed that way, so its grant may need to be given again after each build.
+
+### Signed, not notarized
+
+Releases from 0.2.0 on are signed with a Developer ID but are not notarized.
+The launcher's own download is not affected. A release program downloaded by
+hand with a browser from the release page is blocked by macOS on its first
+run; allow it once in System Settings, Privacy & Security.
 
 ### Registration
 
 Build `hxprobe` (see Build) and register the program with its absolute path.
-For Claude Code:
+When the plugin is installed too, register its installed program instead
+(`~/Library/Application Support/hxprobe/bin/hxprobe`), so that every client
+uses one program and one Full Disk Access entry. For Claude Code:
 
 ```sh
 claude mcp add outlook -- /absolute/path/to/hxprobe mcp
@@ -414,6 +501,7 @@ Options go after `mcp`, in `args` for the JSON form.
 
 ```
 hxprobe mcp [--store <file>] [--cache-dir <dir>] [--refresh-secs <n>]
+            [--idle-secs <n>] [--no-service]
 ```
 
 * `--store`: the `HxStore.hxd` to serve. Without it the server looks under
@@ -430,81 +518,239 @@ hxprobe mcp [--store <file>] [--cache-dir <dir>] [--refresh-secs <n>]
   share without them).
 * `--refresh-secs`: the shortest time between two builds of a changed store,
   default 900; 0 rebuilds whenever the store changed.
+* `--idle-secs`: the background service this server starts exits after this
+  many seconds without a request, default 1800 (30 minutes); 0 means never.
+* `--no-service`, or `HXPROBE_SERVICE=0` in the environment: fallback mode.
+  The server builds the cache itself, inside the tool call that needs it, and
+  starts no service (see "Cache and refresh").
+
+`--refresh-secs` and `--idle-secs` are passed on to the service the server
+starts. A running service keeps the values it was started with, also for
+servers started later with other values; `service --status` shows them.
 
 An unknown option or a bad value exits with status 2 and the usage text.
 stdout carries only JSON-RPC messages; all logging goes to stderr. A closed
 stderr does not stop the server.
 
+### Background service
+
+`hxprobe service` is the one process per cache directory that builds and
+refreshes `mail.db`. The MCP servers that use the directory never build in
+service mode; they tell the service that a client is active, open `mail.db`
+again when the service replaced it, and answer from it.
+
+* **Started automatically.** The first tool call that finds no service
+  running starts one, from the same program file as the server, in the
+  background. No launchd job is installed, and no client stops it when it
+  quits.
+* **One per cache directory.** Several servers, also from several MCP
+  clients, share one service and one database.
+* **Idle exit.** The service exits after `--idle-secs` (default 30 minutes)
+  without a request; the next tool call starts it again.
+* **Upgrades.** A server that finds an older service stops it and starts its
+  own; a newer service is used as it is.
+* **Another store.** A cache directory serves one store at a time: the store
+  of the server that started the service. A server with another `--store` gets
+  the error `this cache directory serves another store: <path>; use another
+  --cache-dir`. After an idle exit or a stop, the first caller's store wins,
+  so the roles can change. Use one `--cache-dir` per store.
+
+Show the status of the service, or stop it:
+
+```sh
+"$HOME/Library/Application Support/hxprobe/bin/hxprobe" service --status
+"$HOME/Library/Application Support/hxprobe/bin/hxprobe" service --stop
+```
+
+Add `--cache-dir <dir>` when the server runs with another cache directory
+(and use the program's real path when it is not installed there).
+
+* `--status` prints the service's status as one JSON line on stdout: `ok`,
+  `version`, `pid`, `store_path`, `building`, `db_usable`, `built_unix`,
+  `store_changed`, `last_attempt_unix`, `last_error`, `refresh_secs`,
+  `idle_secs`, `started_unix` and `builds`. Exit status 0; 1 with
+  `hxprobe service: the refresh service is not running (<dir>)` on stderr
+  when no service answers.
+* `--stop` asks the service to stop, whatever its version, and waits up to
+  5 s until it is gone. Exit status 0 when it stopped or none was running. A
+  service that does not answer or does not stop gives exit status 1 and a
+  message with its pid from `service.lock` and the command to end it
+  (`kill <pid>`).
+* A usage error exits with status 2. The service process itself exits with
+  0 (idle, stop request, signal, or its socket was removed), 1 (it cannot
+  start: store, directory, socket), 2 (usage), 75 (another service holds the
+  directory) or 77 (the store cannot be read: permission denied).
+
+The service writes its log to `<cache dir>/service.log`
+(`~/Library/Caches/hxprobe-mcp/service.log` by default): start, builds with
+their reason, timings and counts, failed builds, and why it exited. A log
+larger than 5 MB is moved to `service.log.1` when a server starts a new
+service.
+
+`store_status` has a `service` object in service mode (`null` in fallback
+mode):
+
+```json
+"service": {"running": true, "building": false, "version": "0.2.0", "pid": 4242, "last_error": null}
+```
+
+`running` tells whether the service answered the last request and `building`
+whether a rebuild is running. `last_error`, here and at the top level of
+`store_status`, is the error of the last build, or why the service is not
+available.
+
+Errors of the tools in service mode:
+
+| Error | Meaning and what to do |
+|---|---|
+| `the mail cache is being built for the first time; call again in a few seconds` | No cache exists yet and the first build took longer than the 50 s a call waits. Call again. |
+| `this server is older than the mail cache; restart the MCP client` | A newer version built the cache in a format this server cannot read. Restart the MCP client, so it starts the new version. |
+| `this cache directory serves another store: <path>; use another --cache-dir` | See "Another store" above. |
+| `the rebuild did not finish within 300 s and may still be running; call store_status later` | `refresh` stopped waiting; the build goes on. Check `store_status` later. |
+| `the refresh service did not start; see <cache dir>/service.log` | No service answered within 10 s. See the log; a new start is tried after 30 s. |
+| `the refresh service exited at start (<status>); see <cache dir>/service.log` | The service failed at start. See the log. |
+| `the refresh service cannot read the store: permission denied; see <cache dir>/service.log` | See "Full Disk Access". |
+
+When a usable `mail.db` exists, a service that is not available does not
+stop the tools: calls are answered from the database on disk, and the reason
+shows in `last_error`.
+
+Fallback mode (`--no-service`, `HXPROBE_SERVICE=0`) is also used when the
+path of the socket `<cache dir>/service.sock` is too long for a Unix socket
+address (about 100 bytes on macOS); the server logs why at start.
+
+On Linux, a server whose program file was replaced while it runs may be
+unable to start the service; the error then asks to restart the MCP client.
+
 ### Cache and refresh
 
-The cache directory holds `mail.db`, a `lock` file and, during a build, the
-temporary files `store.copy-<pid>` and `mail.db.tmp-<pid>`.
+The cache directory holds:
 
-* A start builds nothing. A `mail.db` from an earlier run is used at once.
-  When there is none, the first tool call builds it.
-* A tool call rebuilds the cache when the live store's size or modification
-  time differs from the one the cache was built from and the last build or
-  build attempt is at least `--refresh-secs` old (a build time later than
-  the current time does not count). A `mail.db` that cannot be read, has
-  another cache format, was built for another store, or is not a regular
-  file owned by the user and closed to group and others is rebuilt at once.
-  A `lock` that is not such a file is removed and created again.
-* The `refresh` tool rebuilds at once, whatever the interval.
-* A failed build (one stopped by an internal error included) keeps the
-  previous `mail.db` in use (unless the new one was already put in its
-  place; the next call then opens that one) and is not retried before
-  `--refresh-secs` have passed; `store_status` shows the error in
+| File | Purpose |
+|---|---|
+| `mail.db` | the database the tools read |
+| `lock` | build lock |
+| `store.copy-<pid>`, `mail.db.tmp-<pid>` | temporary files of a running build |
+| `service.lock` | held by the running service; holds its pid and version |
+| `service.sock` | socket of the running service |
+| `service.log`, `service.log.1` | log of the service, and one older log |
+
+In service mode:
+
+* When there is no usable `mail.db`, the service builds it right after it
+  starts, and the first tool call waits for that build (up to 50 s).
+* The service rebuilds when all three hold: the live store's size or
+  modification time differs from the one the cache was built from; the last
+  build or build attempt is at least `--refresh-secs` old (a time later than
+  the current time does not count); and a tool call arrived since the last
+  build started. A service without calls does not rebuild.
+* The rebuild runs in the background. The tool call that found the store
+  changed is answered at once from the previous database, so recent mail can
+  be missing from that answer; `store_status` shows `building: true` in
+  `service` while it runs. Later calls read the new database once it is in
+  place.
+* After an idle exit, the first call starts a new service (a fraction of a
+  second) and is answered from the existing database; the rebuild that
+  follows a long idle period is not waited for, so that first answer may come
+  from the older snapshot.
+* The `refresh` tool rebuilds at once, whatever the interval, and waits for
+  the build (up to 300 s). When a build is already running, it waits for that
+  one instead of starting a second one.
+* A failed build keeps the previous `mail.db` in use and is not retried
+  before `--refresh-secs` have passed; `store_status` shows the error in
   `last_error`. With no previous database the tool calls fail with that
-  error.
-* Two servers that share a cache directory build one after the other; when
-  the store did not change in between, the second uses the database the
-  first built.
+  error, and a new attempt needs a tool call and waits at least
+  `--refresh-secs` (and at least 60 s) after the failed one.
+* A `mail.db` that cannot be read, has another cache format, was built for
+  another store, or is not a regular file owned by the user and closed to
+  group and others counts as missing. A `lock` that is not such a file is
+  removed and created again.
 
-A build runs inside the tool call that triggers it, so that call waits for
-it. On a store of 330 MB with about 21,500 messages a build takes about 11 to
+In fallback mode the server builds the cache itself, inside the tool call
+that needs it, with the same rules except the one about a tool call: that
+call waits for the build. Servers that share a cache directory build one
+after the other; a server uses a database another one built less than
+`--refresh-secs` ago.
+
+On a store of 330 MB with about 21,500 messages a build takes about 11 to
 13 s (the export about 10 s, the search index about 1 s); after that, list
-calls take 10 to 50 ms and searches 50 to 90 ms. Raise the client's tool
-timeout if it is shorter than a build, for example `MCP_TOOL_TIMEOUT` (in
-milliseconds) for Claude Code.
+calls take 10 to 50 ms and searches 50 to 90 ms. Only the first call ever,
+`refresh` and, in fallback mode, a call that triggers a rebuild wait for a
+build. Raise the client's tool timeout if it is shorter than a build, for
+example `MCP_TOOL_TIMEOUT` (in milliseconds) for Claude Code.
 
 On that store `mail.db` is about 830 MB. During a rebuild the old database,
 the new one and the store copy exist side by side: about twice the database
 size plus the store size. On APFS the copy is a clone and takes no extra
 space.
 
-To delete the cache, stop the server (or the client) and remove the
-directory:
+To delete the cache, stop the service (and the servers in fallback mode),
+then remove the directory:
 
 ```sh
+"$HOME/Library/Application Support/hxprobe/bin/hxprobe" service --stop
 rm -rf ~/Library/Caches/hxprobe-mcp
 ```
 
-The next start builds it again on the first tool call.
+The next tool call builds it again.
+
+### Uninstall
+
+1. Quit the MCP clients that use the server, so that no call starts the
+   service again, and stop the service:
+
+   ```sh
+   "$HOME/Library/Application Support/hxprobe/bin/hxprobe" service --stop
+   ```
+
+   Add `--cache-dir <dir>` for every other cache directory in use.
+2. Remove the plugin, or the MCP registration, from each client.
+3. Remove the install directory and the cache directory, and the data
+   directory of 0.1.x if it is still there:
+
+   ```sh
+   rm -rf ~/"Library/Application Support/hxprobe" ~/Library/Caches/hxprobe-mcp
+   rm -rf ~/"Library/Application Support/hxprobe-plugin"
+   ```
+
+   Use `$HXPROBE_INSTALL_DIR`, your `--cache-dir` and `$CLAUDE_PLUGIN_DATA`
+   instead when they were set.
+4. Remove the `hxprobe` entry, and any old `hxprobe-0.1.x` entry, from System
+   Settings, Privacy & Security, Full Disk Access.
 
 ### Privacy and safety
 
-* **Local only.** The server opens no network connections and has no tool
-  that writes, sends or deletes mail.
-* **Read-only, on a private copy.** It reads the live store only to copy it
-  (and its first bytes at start, to check the version) and never writes to
-  it.
+* **Local only.** The server and the service open no network connections and
+  have no tool that writes, sends or deletes mail. Only the launcher
+  downloads, and only the release program.
+* **Read-only, on a private copy.** The store is read only to copy it (and
+  its first bytes at server start, to check the version; the service also
+  opens it at start to check the permission); nothing writes to it.
 * **Owner-only files.** The cache directory is mode `0700` and its files
   `0600`. An existing cache directory that is a symbolic link, not a
   directory, or owned by another user is refused; a wider mode is tightened
   to `0700`.
+* **The socket.** The service listens on the Unix socket
+  `<cache dir>/service.sock` (mode `0600`), not on a network port. Only the
+  user (and root) can reach it, because the directory is closed to everyone
+  else; that directory mode is its access control. It carries only status,
+  refresh and stop requests, never mail content.
 * **The cache is a plaintext copy of the mailbox.** `mail.db` holds the
   cached messages, bodies, people and events unencrypted. Protect it like the
   mailbox itself, or delete it when it is no longer needed.
-* **Logs.** stderr carries tool names, counts, timings, paths and error
-  messages, never message content. A crash prints only where it happened.
+* **Logs.** The servers' stderr and `service.log` carry tool names, counts,
+  timings, paths and error messages, never message content. A crash prints
+  only where it happened.
+* **A process without a client.** The service keeps running after the last
+  client quit, until its idle time is over or it is stopped with
+  `service --stop`.
 * **Untrusted content.** Messages come from other people. The server tells
   the client, in its instructions and in every tool description, that message
   content is untrusted data and must not be treated as instructions. An agent
   that reads mail can still be steered by what the mail says; review what it
   does with the results.
-* **macOS permission.** The store lives in another app's container. macOS may
-  ask whether the MCP client app (the terminal or the AI app that starts the
-  server) may read another app's data.
+* **macOS permission.** The program needs Full Disk Access to read the store
+  (see "Full Disk Access").
 
 ### Limits
 
@@ -606,6 +852,20 @@ cargo fmt --check
 Unit and CLI tests build synthetic stores in code; no mail data is in the
 repository.
 
+The service tests (`tests/service.rs`, and the socket and process tests in
+`src/mcp`) bind Unix sockets and start background processes in temporary
+directories only, and take a lock so that they run one at a time. A sandbox
+that forbids sockets makes them fail with `Operation not permitted`; run them
+outside it.
+
+The launcher and the release script have shell tests with stub programs on
+`PATH`, no network and no signing identity:
+
+```sh
+bash scripts/test-run-mcp.sh
+bash scripts/test-release-sign.sh
+```
+
 The integration test against a real store is opt-in. Without the
 `HXSTORE_SNAPSHOT` variable it prints `skipped: HXSTORE_SNAPSHOT not set` and
 passes:
@@ -636,6 +896,31 @@ python3 tools/gen_props.py schema/layout.json hxprobe/src/props_gen.rs
 ```
 
 Do not edit `names.rs` or `props_gen.rs` by hand.
+
+## Releases (maintainers)
+
+Build the release program for each architecture from the tagged commit
+(`cargo build --release --locked`), then sign it on a Mac that has the
+Developer ID Application identity:
+
+```sh
+HXPROBE_SIGN_IDENTITY=<identity> scripts/release-sign.sh <program> <version> <arm64|x86_64>
+```
+
+The script writes the signed copy `hxprobe-<version>-macos-<arch>` to the
+current directory and leaves the input file unchanged. It signs with the
+hardened runtime, a secure timestamp and the fixed signing identifier, then
+checks the signature (strict verification, a designated requirement with the
+identifier, the Apple anchor and the team and without a code hash, a
+Developer ID Application certificate, the runtime flag), the architecture
+and, on a machine of that architecture, the version. `HXPROBE_SIGN_IDENTITY`
+is required and never printed. What `codesign` prints when it fails is not
+shown; run with `HXPROBE_SIGN_DEBUG=1` to see it, with the signer, team and
+home directory removed.
+
+On success the script prints one line on stdout, `<sha256>  <asset>`,
+computed from the signed file. Publish exactly that file as the asset of the
+GitHub release `v<version>` and add the line to `release/SHA256SUMS`.
 
 ## License
 
