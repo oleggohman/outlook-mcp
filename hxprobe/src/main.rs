@@ -15,6 +15,8 @@
 //!   hxprobe db     <file> [out.db]   build a SQLite database with FTS5 search
 //!   hxprobe map    <file> [n]        dump the named field map for n records
 //!   hxprobe find   <file> <term>     show records whose text contains <term>
+//!   hxprobe mcp [--store <file>] [--cache-dir <dir>] [--refresh-secs <n>]
+//!                                    MCP server over stdin/stdout
 //! ```
 //!
 //! The file is memory-mapped throughout and never read into an owned buffer, so
@@ -787,12 +789,118 @@ usage:
   hxprobe db    <file> [out.db]     build a SQLite database (default mail.db)
   hxprobe map    <file> [n]          dump the field map for n records (0 = stats)
   hxprobe find   <file> <term> [n]   show records whose text contains <term>
+  hxprobe mcp [--store <file>] [--cache-dir <dir>] [--refresh-secs <n>]
+                                     read-only MCP server on stdin/stdout; --store
+                                     defaults to the Outlook profile's HxStore.hxd,
+                                     --cache-dir to ~/Library/Caches/hxprobe-mcp,
+                                     --refresh-secs (shortest time between two
+                                     rebuilds of a changed store) to 900
 
 Work on a snapshot, not the live store: Outlook holds HxStore.lock and
 rewrites the file while it runs.";
 
+/// Options of `hxprobe mcp`; `None` where not given.
+#[derive(Debug, Default)]
+struct McpOptions {
+    store: Option<PathBuf>,
+    cache_dir: Option<PathBuf>,
+    refresh_secs: Option<u64>,
+}
+
+/// Parse the options after `mcp`; a usage error message on failure.
+fn parse_mcp_options(args: &[String]) -> Result<McpOptions, String> {
+    let mut o = McpOptions::default();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        let mut value = || it.next().ok_or_else(|| format!("{a} needs a value"));
+        match a.as_str() {
+            "--store" => o.store = Some(PathBuf::from(value()?)),
+            "--cache-dir" => o.cache_dir = Some(PathBuf::from(value()?)),
+            "--refresh-secs" => {
+                let v = value()?;
+                o.refresh_secs = Some(
+                    v.parse()
+                        .map_err(|_| format!("--refresh-secs: {v:?} is not a number"))?,
+                );
+            }
+            other => return Err(format!("unknown mcp option {other:?}")),
+        }
+    }
+    Ok(o)
+}
+
+/// `hxprobe mcp`: serve the MCP tools on stdin/stdout until end of input.
+/// stdout carries only JSON-RPC messages; logs go to stderr.
+fn cmd_mcp(args: &[String]) {
+    use hxprobe::mcp::{cache, rpc};
+
+    // A panic message could hold mail content: print only where it happened.
+    std::panic::set_hook(Box::new(|info| match info.location() {
+        Some(l) => eprintln!("hxprobe mcp: internal error at {}:{}", l.file(), l.line()),
+        None => eprintln!("hxprobe mcp: internal error"),
+    }));
+    let fail = |msg: String| -> ! {
+        eprintln!("hxprobe mcp: {msg}");
+        std::process::exit(1);
+    };
+    let opts = parse_mcp_options(args).unwrap_or_else(|e| {
+        eprintln!("{e}\n\n{USAGE}");
+        std::process::exit(2);
+    });
+    let store = opts
+        .store
+        .or_else(cache::default_store_path)
+        .unwrap_or_else(|| {
+            fail("no Outlook store found under the default profile directory; pass --store".into())
+        });
+    if !std::fs::metadata(&store).is_ok_and(|m| m.is_file()) {
+        fail(format!("{} is not a store file", store.display()));
+    }
+    // Only the header: the store itself is read from a private copy.
+    let mut head = Vec::with_capacity(0x40);
+    let header = File::open(&store)
+        .and_then(|f| f.take(0x40).read_to_end(&mut head))
+        .map_err(|e| e.to_string())
+        .and_then(|_| header::check(&head));
+    match header {
+        Err(e) => eprintln!("hxprobe mcp: warning: {}: {e}", store.display()),
+        Ok(h) if !h.known => eprintln!(
+            "hxprobe mcp: warning: {}: store version {:?} (0x{:02x}) is untested",
+            store.display(),
+            h.version as char,
+            h.version
+        ),
+        Ok(_) => {}
+    }
+    let cache_dir = opts
+        .cache_dir
+        .or_else(|| env::var_os("HOME").map(|h| Path::new(&h).join("Library/Caches/hxprobe-mcp")))
+        .unwrap_or_else(|| fail("HOME is not set; pass --cache-dir".into()));
+    let cache = cache::Cache::new(&cache_dir, &store)
+        .unwrap_or_else(|e| fail(format!("cache directory {}: {e}", cache_dir.display())))
+        .with_refresh_secs(opts.refresh_secs.unwrap_or(cache::DEFAULT_REFRESH_SECS));
+    eprintln!(
+        "hxprobe mcp: serving {} with cache {}",
+        store.display(),
+        cache_dir.display()
+    );
+    let mut server = rpc::Server::new(cache);
+    if let Err(e) = rpc::run(
+        &mut server,
+        std::io::stdin().lock(),
+        std::io::stdout().lock(),
+    ) {
+        fail(format!("i/o error: {e}"));
+    }
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
+    // `mcp` takes only options, all optional.
+    if args.get(1).map(String::as_str) == Some("mcp") {
+        cmd_mcp(&args[2..]);
+        return;
+    }
     // `export` accepts `--force` anywhere after the command.
     if args.get(1).map(String::as_str) == Some("export") {
         let force = args[2..].iter().any(|a| a == "--force");

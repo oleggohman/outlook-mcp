@@ -291,14 +291,24 @@ fn parse_iso(s: &str) -> Option<i64> {
     Some(days * 86_400 + secs)
 }
 
-/// Unix seconds of a time argument: an integer (unix seconds), `YYYY-MM-DD`
-/// (midnight UTC) or `YYYY-MM-DDThh:mm:ssZ`, in the years 1970 to 9999.
+/// Unix seconds of a string of ASCII digits, or `None`.
+fn parse_unix_digits(s: &str) -> Option<i64> {
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    s.parse().ok()
+}
+
+/// Unix seconds of a time argument: an integer or a string of digits (unix
+/// seconds), `YYYY-MM-DD` (midnight UTC) or `YYYY-MM-DDThh:mm:ssZ`, in the
+/// years 1970 to 9999.
 pub fn parse_time(v: &Value) -> Result<i64, String> {
     let t = match v {
-        Value::Number(n) => n.as_i64().filter(|t| (0..=MAX_UNIX).contains(t)),
-        Value::String(s) => parse_iso(s),
+        Value::Number(n) => n.as_i64(),
+        Value::String(s) => parse_unix_digits(s).or_else(|| parse_iso(s)),
         _ => None,
-    };
+    }
+    .filter(|t| (0..=MAX_UNIX).contains(t));
     t.ok_or_else(|| {
         "expected unix seconds or a UTC time YYYY-MM-DD or YYYY-MM-DDThh:mm:ssZ \
          in the years 1970 to 9999"
@@ -480,6 +490,28 @@ mod tests {
         assert_eq!(parse_time(&json!("1970-01-01")), Ok(0));
         assert_eq!(parse_time(&json!(1_795_421_730)), Ok(1_795_421_730));
         assert_eq!(parse_time(&json!(0)), Ok(0));
+        // A string of ASCII digits is unix seconds too.
+        assert_eq!(parse_time(&json!("1795421730")), Ok(1_795_421_730));
+        assert_eq!(parse_time(&json!("0")), Ok(0));
+        assert_eq!(parse_time(&json!("253402300799")), Ok(253_402_300_799));
+    }
+
+    #[test]
+    fn parse_time_rejects_bad_digit_strings() {
+        for s in [
+            "-1",
+            "+5",
+            "12a",
+            " 5",
+            "5 ",
+            "1.5",
+            "1e9",
+            "253402300800",
+            "99999999999999999999999",
+            "１２",
+        ] {
+            assert!(parse_time(&json!(s)).is_err(), "{s}");
+        }
     }
 
     #[test]

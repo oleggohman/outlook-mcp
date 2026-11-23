@@ -471,3 +471,200 @@ fn real_snapshot_aggregate_facts() {
     assert!(!db_path.exists(), "temp db was not removed");
     println!("elapsed: {:.1}s", started.elapsed().as_secs_f64());
 }
+
+/// Removes a directory tree when dropped, so it goes away even when an
+/// assertion fails.
+struct TempDir(PathBuf);
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// The result of `tools/call name args` through `rpc::handle_line`, parsed,
+/// with the call's time in ms. Fails with fixed messages only: a tool
+/// failure's text could quote mail.
+fn mcp_call(
+    server: &mut hxprobe::mcp::rpc::Server,
+    name: &str,
+    args: serde_json::Value,
+) -> (serde_json::Value, f64) {
+    let req = serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": { "name": name, "arguments": args },
+    });
+    let t = Instant::now();
+    let line = hxprobe::mcp::rpc::handle_line(server, &req.to_string());
+    let ms = t.elapsed().as_secs_f64() * 1e3;
+    let Some(line) = line else {
+        panic!("no response to tools/call");
+    };
+    let Ok(r) = serde_json::from_str::<serde_json::Value>(&line) else {
+        panic!("response is not JSON");
+    };
+    assert!(
+        r.get("error").is_none(),
+        "tools/call returned a JSON-RPC error"
+    );
+    assert!(
+        r["result"]["isError"] == false,
+        "a tool call failed: {name}"
+    );
+    let text = r["result"]["content"][0]["text"].as_str();
+    let v = text
+        .and_then(|t| serde_json::from_str(t).ok())
+        .expect("tool result text is JSON");
+    (v, ms)
+}
+
+/// The most frequent word (4 or more letters or digits, lowercased) of the
+/// message subjects. Never printed.
+fn frequent_subject_word(conn: &rusqlite::Connection) -> Option<String> {
+    let mut st = conn
+        .prepare("SELECT Subject FROM messages WHERE Subject IS NOT NULL")
+        .expect("prepare");
+    let subjects = st
+        .query_map([], |r| r.get::<_, rusqlite::types::Value>(0))
+        .expect("query");
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    for s in subjects.flatten() {
+        let rusqlite::types::Value::Text(s) = s else {
+            continue;
+        };
+        for w in s.split(|c: char| !c.is_alphanumeric()) {
+            if w.chars().count() >= 4 {
+                *counts.entry(w.to_lowercase()).or_default() += 1;
+            }
+        }
+    }
+    counts.into_iter().max_by_key(|(_, n)| *n).map(|(w, _)| w)
+}
+
+/// The first two characters of a person's address. Never printed.
+fn address_part(conn: &rusqlite::Connection) -> Option<String> {
+    let mut st = conn
+        .prepare(
+            "SELECT EmailAddress FROM \"Person\"
+             WHERE typeof(EmailAddress) = 'text' AND length(EmailAddress) >= 2 LIMIT 1",
+        )
+        .expect("prepare");
+    st.query_row([], |r| r.get::<_, String>(0))
+        .ok()
+        .map(|a| a.chars().take(2).collect())
+}
+
+#[test]
+fn real_snapshot_mcp_tools() {
+    use hxprobe::mcp::{cache::Cache, rpc::Server};
+    use serde_json::json;
+
+    let Some(path) = std::env::var_os("HXSTORE_SNAPSHOT") else {
+        println!("skipped: HXSTORE_SNAPSHOT not set");
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!("hxprobe-snapshot-mcp-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    // Declared before the server, so it is dropped (and the directory
+    // removed) after the server closed its database.
+    let guard = TempDir(dir.clone());
+    let cache = Cache::new(&dir.join("cache"), &PathBuf::from(&path)).expect("cache directory");
+    let db_path = cache.db_path();
+    let mut server = Server::new(cache);
+
+    // The first call builds the cache.
+    let (status, build_wall_ms) = mcp_call(&mut server, "store_status", json!({}));
+    assert!(status["last_error"].is_null(), "the cache build failed");
+    let messages = status["messages"].as_i64().unwrap_or(0);
+    let folders = status["folders"].as_i64().unwrap_or(0);
+    let phase = |k: &str| status["build_ms"][k].as_i64().unwrap_or(-1);
+    let (copy_ms, export_ms, prepare_ms) = (phase("copy"), phase("export"), phase("prepare"));
+    let db_size = std::fs::metadata(&db_path).map_or(0, |m| m.len());
+    println!(
+        "mcp build: {:.1} s wall (copy {copy_ms} ms, export {export_ms} ms, prepare \
+         {prepare_ms} ms), database {:.1} MB",
+        build_wall_ms / 1e3,
+        db_size as f64 / 1e6
+    );
+    println!(
+        "mcp store_status: {messages} messages, {folders} folders, {} people, {} events",
+        status["people"], status["events"]
+    );
+    assert!(messages > 0, "store_status reports no messages");
+    assert!(folders > 0, "store_status reports no folders");
+
+    // Facts for the checks, read from the database directly; never printed.
+    let conn =
+        rusqlite::Connection::open_with_flags(&db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .expect("open mail.db");
+    let folder_rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM folders", [], |r| r.get(0))
+        .expect("count folders");
+    let word = frequent_subject_word(&conn).expect("no subject word");
+    let part = address_part(&conn).expect("no person address");
+    drop(conn);
+
+    let (v, _) = mcp_call(&mut server, "list_folders", json!({}));
+    assert!(
+        v["total"].as_i64() == Some(folder_rows),
+        "list_folders total differs from the folders view"
+    );
+
+    let (v, list_ms) = mcp_call(&mut server, "list_messages", json!({"limit": 5}));
+    let items = v["items"].as_array().cloned().unwrap_or_default();
+    assert!(items.len() == 5, "list_messages did not return 5 items");
+    assert!(
+        items
+            .iter()
+            .all(|it| it["sent"].as_str().is_some_and(|s| s.len() == 20)),
+        "a listed message has no 20-character ISO time"
+    );
+    assert!(
+        items
+            .iter()
+            .any(|it| it["subject"].as_str().is_some_and(|s| !s.is_empty())),
+        "no listed message has a subject"
+    );
+    let first = items[0]["guid"].as_str().map(str::to_string);
+    let first = first.expect("a listed message has no guid");
+
+    let (v, search_ms) = mcp_call(&mut server, "search_messages", json!({ "query": word }));
+    let found = v["total"].as_i64().unwrap_or(0);
+    assert!(
+        found >= 1,
+        "search for the most frequent subject word found nothing"
+    );
+    assert!(
+        !v["items"].as_array().is_none_or(Vec::is_empty),
+        "search returned no items"
+    );
+
+    let (v, get_ms) = mcp_call(&mut server, "get_message", json!({ "guid": first }));
+    assert!(v["guid"].is_string(), "get_message returned no message");
+    let (v, _) = mcp_call(
+        &mut server,
+        "list_attachments",
+        json!({ "message_guid": first }),
+    );
+    assert!(v["total"].is_i64(), "list_attachments returned no total");
+    let (v, events_ms) = mcp_call(
+        &mut server,
+        "list_events",
+        json!({"since": "2026-01-01", "until": "2028-01-01"}),
+    );
+    let events = v["total"].as_i64().unwrap_or(0);
+    assert!(events > 0, "list_events found no event in 2026-2027");
+    let (v, people_ms) = mcp_call(&mut server, "search_people", json!({ "query": part }));
+    let people = v["total"].as_i64().unwrap_or(0);
+    assert!(people >= 1, "search_people found nobody");
+
+    println!(
+        "mcp calls: list_messages {list_ms:.1} ms, search_messages {search_ms:.1} ms \
+         ({found} hits), get_message {get_ms:.1} ms, list_events {events_ms:.1} ms \
+         ({events} events), search_people {people_ms:.1} ms ({people} hits)"
+    );
+
+    drop(server);
+    drop(guard);
+    assert!(!dir.exists(), "temp cache dir was not removed");
+}

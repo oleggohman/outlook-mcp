@@ -2,5 +2,6 @@
 //! store.
 
 pub mod cache;
+pub mod rpc;
 pub mod text;
 pub mod tools;

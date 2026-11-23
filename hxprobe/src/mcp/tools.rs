@@ -37,7 +37,9 @@ enum Kind {
     Str,
     Bool,
     Int,
-    /// Unix seconds (integer) or an ISO date or time (string).
+    /// A time: published as a string (`YYYY-MM-DD`, `YYYY-MM-DDThh:mm:ssZ`
+    /// or unix seconds as digits); a JSON integer (unix seconds) is accepted
+    /// as well.
     Time,
 }
 
@@ -82,12 +84,12 @@ const P_FROM: Param = param("from", Kind::Str, "Part of the sender's name or add
 const P_SINCE: Param = param(
     "since",
     Kind::Time,
-    "Sent at or after: unix seconds, YYYY-MM-DD or YYYY-MM-DDThh:mm:ssZ (UTC).",
+    "Sent at or after (UTC): YYYY-MM-DD, YYYY-MM-DDThh:mm:ssZ, or unix seconds.",
 );
 const P_UNTIL: Param = param(
     "until",
     Kind::Time,
-    "Sent before: unix seconds, YYYY-MM-DD or YYYY-MM-DDThh:mm:ssZ (UTC).",
+    "Sent before (UTC): YYYY-MM-DD, YYYY-MM-DDThh:mm:ssZ, or unix seconds.",
 );
 
 /// One tool: name, description and arguments.
@@ -110,7 +112,7 @@ impl Tool {
                     Kind::Str => json!("string"),
                     Kind::Bool => json!("boolean"),
                     Kind::Int => json!("integer"),
-                    Kind::Time => json!(["integer", "string"]),
+                    Kind::Time => json!("string"),
                 };
                 (
                     p.name.to_string(),
@@ -268,13 +270,14 @@ pub const TOOLS: &[Tool] = &[
             param(
                 "since",
                 Kind::Time,
-                "Window start: unix seconds, YYYY-MM-DD or YYYY-MM-DDThh:mm:ssZ (UTC); \
+                "Window start (UTC): YYYY-MM-DD, YYYY-MM-DDThh:mm:ssZ, or unix seconds; \
                  default now.",
             ),
             param(
                 "until",
                 Kind::Time,
-                "Window end (exclusive), same forms; default since + 14 days.",
+                "Window end, exclusive (UTC): YYYY-MM-DD, YYYY-MM-DDThh:mm:ssZ, or unix \
+                 seconds; default since + 14 days.",
             ),
             param(
                 "include_cancelled",
@@ -1288,6 +1291,61 @@ mod tests {
             assert_eq!(v["total"], 0, "{pat}");
         }
         assert_eq!(f.msgs("list_messages", json!({"from": "n L"})), [0]);
+    }
+
+    #[test]
+    fn schemas_have_no_type_arrays() {
+        /// Every `type` value anywhere in `v` is a string.
+        fn check(v: &Value, tool: &str) {
+            match v {
+                Value::Object(o) => {
+                    if let Some(t) = o.get("type") {
+                        assert!(t.is_string(), "{tool}: type {t}");
+                    }
+                    o.values().for_each(|x| check(x, tool));
+                }
+                Value::Array(a) => a.iter().for_each(|x| check(x, tool)),
+                _ => {}
+            }
+        }
+        for t in TOOLS {
+            check(&t.input_schema(), t.name);
+        }
+    }
+
+    #[test]
+    fn time_arguments_are_published_as_strings() {
+        for t in TOOLS {
+            let s = t.input_schema();
+            for k in ["since", "until"] {
+                if let Some(p) = s["properties"].get(k) {
+                    assert_eq!(p["type"], "string", "{} {k}", t.name);
+                    let d = p["description"].as_str().unwrap();
+                    assert!(
+                        d.contains("YYYY-MM-DD, YYYY-MM-DDThh:mm:ssZ, or unix seconds"),
+                        "{} {k}: {d}",
+                        t.name
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn time_arguments_accept_integers_and_digit_strings() {
+        let mut f = fixture();
+        let t = MAIL_SENT[1];
+        assert_eq!(
+            f.msgs("list_messages", json!({"since": t.to_string()})),
+            [2, 1]
+        );
+        assert_eq!(f.msgs("list_messages", json!({"since": t})), [2, 1]);
+        assert_eq!(
+            f.msgs("list_messages", json!({"until": t.to_string()})),
+            [0, 3]
+        );
+        f.err("list_messages", json!({"since": "-5"}));
+        f.err("list_messages", json!({"since": 1.5}));
     }
 
     #[test]
