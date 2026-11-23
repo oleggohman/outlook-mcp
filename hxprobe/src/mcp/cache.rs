@@ -70,7 +70,8 @@ pub const FIRST_BUILD_PENDING: &str =
     "the mail cache is being built for the first time; call again in a few seconds";
 
 /// Error of a call in service mode when `mail.db` has another format
-/// version and the service is newer than this server.
+/// version and the service is newer than this server (also when this
+/// server still has the database of before open).
 pub const OLDER_SERVER: &str = "this server is older than the mail cache; restart the MCP client";
 
 /// Longest body text put in the search index, in chars.
@@ -368,7 +369,9 @@ impl Cache {
     /// waits for one), opens `mail.db` again when it was replaced, and
     /// answers from it. Without a usable database: the error when the
     /// service is not available; otherwise it waits for the first build
-    /// (see [`Cache::wait_for_first_build`]).
+    /// (see [`Cache::wait_for_first_build`]). When a newer service replaced
+    /// the open database with one of another format version, the call
+    /// fails with [`OLDER_SERVER`] instead of answering from the old one.
     pub fn connection_at(&mut self, now: i64) -> Result<&Connection, String> {
         if let Some(r) = self.refresher.as_mut() {
             let reply = r.touch(now);
@@ -378,6 +381,10 @@ impl Cache {
                 // The service is not available: nothing to wait for.
                 reply?;
                 self.wait_for_first_build(now)?;
+            } else if self.rejected_id.is_some() && self.older_than_the_cache() {
+                // The open database was replaced by one this server cannot
+                // read: not the old data without a word.
+                return Err(OLDER_SERVER.into());
             }
             return self
                 .db
@@ -477,10 +484,7 @@ impl Cache {
                 if !v.running {
                     return Err(v.last_error.clone().unwrap_or_default());
                 }
-                let newer = v.version.as_deref().is_some_and(|ver| {
-                    proto::cmp_versions(ver, proto::VERSION) == std::cmp::Ordering::Greater
-                });
-                if newer && has_other_format(&self.db_path()) {
+                if self.older_than_the_cache() {
                     return Err(OLDER_SERVER.into());
                 }
                 if let (false, Some(e)) = (v.building, &v.last_error) {
@@ -500,6 +504,20 @@ impl Cache {
             let reply = r.status(now);
             self.service = Some(ServiceView::of(&reply));
         }
+    }
+
+    /// Whether the service is newer than this server and `mail.db` has
+    /// another format version: a database this server cannot read and the
+    /// service will not replace with one it can.
+    fn older_than_the_cache(&self) -> bool {
+        let newer = self
+            .service
+            .as_ref()
+            .and_then(|v| v.version.as_deref())
+            .is_some_and(|ver| {
+                proto::cmp_versions(ver, proto::VERSION) == std::cmp::Ordering::Greater
+            });
+        newer && has_other_format(&self.db_path())
     }
 
     /// Open `mail.db` when it is not the file the database in use was
@@ -2514,6 +2532,41 @@ mod tests {
         assert_eq!(messages(&mut c, NOW_I + 30), 4);
         assert_eq!(N.load(Ordering::SeqCst), 1);
         assert_eq!(built_unix(&c), Some(NOW_I));
+        assert_eq!(c.builds, 0);
+    }
+
+    #[test]
+    fn database_of_a_newer_format_replacing_the_open_one_asks_for_a_restart() {
+        let t = TestDir::new("svcstale");
+        let fake = FakeRefresher::new(Ok(fake_status(Some(NOW_I))));
+        let mut c = served(&t, &fake);
+        let dir = t.cache_dir();
+        rebuild_in(&dir, NOW_I);
+        assert_eq!(messages(&mut c, NOW_I), 4);
+        // A newer service replaced the database with one of its format.
+        rebuild_in(&dir, NOW_I + 10);
+        Connection::open(dir.join(DB_NAME))
+            .unwrap()
+            .execute(
+                "UPDATE mcp_meta SET value = '99' WHERE key = 'format_version'",
+                [],
+            )
+            .unwrap();
+        fake.script().reply = Ok(ServiceStatus {
+            version: "99.0.0".into(),
+            ..fake_status(Some(NOW_I + 10))
+        });
+        // Not the old data without a word.
+        for dt in [20, 30] {
+            assert_eq!(
+                c.connection_at(NOW_I + dt).err().as_deref(),
+                Some(OLDER_SERVER)
+            );
+        }
+        // A database this server can read ends it.
+        rebuild_in(&dir, NOW_I + 40);
+        assert_eq!(messages(&mut c, NOW_I + 50), 4);
+        assert_eq!(built_unix(&c), Some(NOW_I + 40));
         assert_eq!(c.builds, 0);
     }
 
