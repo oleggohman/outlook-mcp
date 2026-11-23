@@ -15,12 +15,14 @@
 # bin/.origin: `release <sha256>` for a verified download, `build` for a
 # cargo build (no record counts as `build`). A built program of the wanted
 # version is replaced by the release program as soon as the checksum file
-# lists one. A release file that does not match its checksum stops the
-# launcher: nothing is built or run in its place. A download that fails is
-# followed by a build only when no program that answers is installed;
-# otherwise the installed one is run. When that one is a built program of the
-# wanted version, bin/.download-failed is left and the download is not tried
-# again while that file is younger than about 6 hours.
+# lists one. A release file that does not match its checksum is deleted and
+# never run, and nothing is built in its place: the launcher stops, unless a
+# built program of the wanted version is installed, which is then run. A
+# download that fails is followed by a build only when no program that
+# answers is installed; otherwise the installed one is run. When the release
+# program could not be had and a built program of the wanted version is run
+# instead, bin/.download-failed is left and the download is not tried again
+# while that file is younger than about 6 hours.
 #
 # stdout is the JSON-RPC channel of the server, so this script writes nothing
 # to it: stdout is parked on fd 3 and only handed back to the server at exec.
@@ -436,8 +438,9 @@ remove_old_build_dirs
 
 # d. Verified prebuilt program from the release. On success the file is at
 # $tmp_file. Returns 1 when no release program is listed for this machine and
-# 2 when it could not be downloaded; a file that does not match its checksum
-# ends the launcher.
+# 2 when it could not be downloaded. A file that does not match its checksum
+# is deleted and ends the launcher; when a built program of the wanted
+# version is installed (`upgrade` is 1) the function returns 3 instead.
 try_download() {
     local base url proto got
     release_sum || return 1
@@ -462,6 +465,10 @@ try_download() {
     got=$(shasum -a 256 "$tmp_file" | awk '{ print tolower($1) }')
     if [ "$got" != "$want" ]; then
         rm -f "$tmp_file"; tmp_file=''
+        if [ "$upgrade" = 1 ]; then
+            log "checksum mismatch for $asset (expected $want, got $got); the file was deleted and not run. Check release/SHA256SUMS and the release."
+            return 3
+        fi
         die "checksum mismatch for $asset (expected $want, got $got); the file was deleted and not run, and nothing is built or run in its place. Check release/SHA256SUMS and the release, or set HXPROBE_BIN."
     fi
     log "checksum of $asset verified"
@@ -477,7 +484,8 @@ if [ "$downloaded" = 0 ]; then
     install_and_run "$tmp_file" "release $want" ${1+"$@"}
 fi
 if [ "$downloaded" = 2 ] || [ "$upgrade" = 1 ]; then
-    # Not a reason to build while a program that answers is installed.
+    # Not a reason to build while a program that answers is installed. With
+    # `upgrade` this is the built program of the wanted version.
     have=$(installed_version)
     if [ -n "$have" ]; then
         if [ "$upgrade" = 1 ]; then
@@ -491,6 +499,8 @@ if [ "$downloaded" = 2 ] || [ "$upgrade" = 1 ]; then
         run_server "$bin" ${1+"$@"}
     fi
 fi
+# A file that did not match its checksum is never answered with a build.
+[ "$downloaded" != 3 ] || die "the installed hxprobe $version at $bin no longer answers and the release file did not match its checksum; nothing is built in its place. Check release/SHA256SUMS and the release, or set HXPROBE_BIN."
 
 # e. Build from source with cargo, in a directory of this process.
 if command -v cargo >/dev/null 2>&1; then

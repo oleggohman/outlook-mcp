@@ -962,9 +962,11 @@ if [ "$rc" = 0 ] && [ "$out" = 'BUILT mcp' ] && [ "$(origin_of "$r/inst")" = bui
     && [ "$(leftovers "$r/inst")" = 0 ] && lock_free "$r/inst"; then pass "$t"
 else fail "$t" "rc=$rc out='$out' err='$err'"; fi
 
-# (xvii-d) A checksum mismatch is never answered with a build, and never
-# with the program that is installed: the launcher stops. With cargo on PATH,
-# with nothing installed and with a built program of the wanted version.
+# (xvii-d) A checksum mismatch is never answered with a build. With nothing
+# of the wanted version installed the launcher stops. With a built program of
+# the wanted version that program is run, the file is deleted, the mismatch
+# is logged and the download is held back like a failed one: the next start
+# runs the program without a word.
 for installed in nothing built; do
     t="checksum mismatch with cargo on PATH, $installed installed"
     r=$(make_repo)
@@ -979,7 +981,19 @@ for installed in nothing built; do
         ino=$(inode "$r/inst/bin/hxprobe")
     fi
     run "$r" HXPROBE_RELEASE_BASE="file://$r/rel" PATH="$r/stub:$nocargo_path" --
-    if [ "$rc" = 1 ] && [ -z "$out" ] && [ ! -e "$r/ran" ] && [ ! -e "$r/old-ran" ] \
+    ok=0
+    if [ "$installed" = nothing ]; then
+        if [ "$rc" = 1 ] && [ -z "$out" ] && [ ! -e "$r/old-ran" ] \
+            && [ ! -e "$r/inst/bin/.download-failed" ]; then ok=1; fi
+    elif [ "$rc" = 0 ] && [ "$out" = 'FAKE mcp' ] && [ "$(cat "$r/old-ran")" = "$fds_closed" ] \
+        && [ "$(origin_of "$r/inst")" = build ] && [ -f "$r/inst/bin/.download-failed" ] \
+        && [[ "$err" == *"running the installed hxprobe $version"* ]]; then
+        err1=$err
+        run "$r" HXPROBE_RELEASE_BASE="file://$r/rel" PATH="$r/stub:$nocargo_path" --
+        if [ "$rc" = 0 ] && [ "$out" = 'FAKE mcp' ] && [ -z "$err" ]; then ok=1; fi
+        err=$err1
+    fi
+    if [ "$ok" = 1 ] && [ ! -e "$r/ran" ] \
         && [ ! -e "$r/builds" ] && [ "$(inode "$r/inst/bin/hxprobe")" = "$ino" ] \
         && [[ "$err" == *'checksum mismatch'* ]] && [[ "$err" != *'building hxprobe'* ]] \
         && [ "$(leftovers "$r/inst")" = 0 ] && lock_free "$r/inst"; then pass "$t"
