@@ -110,18 +110,22 @@ EOF
 # followed by `--` and launcher arguments. Sets out, err, rc. The launcher
 # starts with fd 9 open, as it would under a parent that leaks one. The
 # install directory is $1/inst and the plugin data directory $1/data unless
-# the settings say otherwise (an empty value selects the default).
+# the settings say otherwise (an empty value selects the default). The
+# setting NOHOME runs it without HOME in the environment.
 run() {
     local r=$1
     shift
-    local envs=''
-    while [ "$1" != -- ]; do envs="$envs $1"; shift; done
+    local envs='' home="$root/home" nohome=''
+    while [ "$1" != -- ]; do
+        if [ "$1" = NOHOME ]; then nohome='-u HOME'; home=''; else envs="$envs $1"; fi
+        shift
+    done
     shift
     rc=0
     # shellcheck disable=SC2086
     env -u HXPROBE_BIN -u HXPROBE_RELEASE_BASE -u HXPROBE_SUMS -u CLAUDE_PLUGIN_DATA \
-        -u HXPROBE_INSTALL_DIR \
-        HOME="$root/home" HXPROBE_INSTALL_DIR="$r/inst" CLAUDE_PLUGIN_DATA="$r/data" $envs \
+        -u HXPROBE_INSTALL_DIR $nohome \
+        ${home:+HOME="$home"} HXPROBE_INSTALL_DIR="$r/inst" CLAUDE_PLUGIN_DATA="$r/data" $envs \
         bash "$r/scripts/run-mcp.sh" "$@" > "$root/out" 2> "$root/err" 9> "$root/fd9" || rc=$?
     out=$(cat "$root/out")
     err=$(cat "$root/err")
@@ -678,6 +682,26 @@ else fail "$t" "rc=$rc took=${took}s waiters='$waiters' alive='$alive' err='$(ca
 for p in $waiters; do kill -KILL "$p" 2>/dev/null || true; done
 kill -KILL "$holder" 2>/dev/null || true
 wait "$holder" 2>/dev/null || true
+
+# (x) HOME unset or empty. With an install directory given the launcher
+# needs no HOME (the plugin data directory then has no default, so no legacy
+# programs are looked for); without one it says what to set.
+for how in unset empty; do
+    t="HOME $how"
+    if [ "$how" = unset ]; then nohome=NOHOME; else nohome='HOME='; fi
+    r=$(make_repo)
+    make_asset "$r"
+    run "$r" "$nohome" CLAUDE_PLUGIN_DATA= HXPROBE_RELEASE_BASE="file://$r/rel" PATH="$nocargo_path" -- a
+    rc1=$rc; out1=$out; err1=$err
+    r2=$(make_repo)
+    make_asset "$r2"
+    run "$r2" "$nohome" HXPROBE_INSTALL_DIR= HXPROBE_RELEASE_BASE="file://$r2/rel" PATH="$nocargo_path" --
+    if [ "$rc1" = 0 ] && [ "$out1" = 'FAKE mcp a' ] && [ "$(cat "$r/ran.path")" = "$r/inst/bin/hxprobe" ] \
+        && [[ "$err1" != *'unbound variable'* ]] \
+        && [ "$rc" = 1 ] && [ -z "$out" ] && [ ! -e "$r2/ran" ] \
+        && [[ "$err" == *'HOME is not set; set HXPROBE_INSTALL_DIR'* ]]; then pass "$t"
+    else fail "$t" "rc=$rc1/$rc out='$out1' err='$err1' / '$err'"; fi
+done
 
 if [ "$failures" -ne 0 ]; then
     printf '%d case(s) failed\n' "$failures"

@@ -17,7 +17,8 @@
 # Environment:
 #   HXPROBE_BIN           run this program instead of installing one
 #   HXPROBE_INSTALL_DIR   install directory (default:
-#                         $HOME/Library/Application Support/hxprobe)
+#                         $HOME/Library/Application Support/hxprobe; required
+#                         when HOME is not set)
 #   CLAUDE_PLUGIN_DATA    plugin data directory (set by Claude Code); only
 #                         legacy programs bin/hxprobe-<version> are removed
 #                         from it after an install
@@ -67,11 +68,22 @@ case "$version" in
     *[!0-9A-Za-z.+-]* ) die "unexpected version '$version' in $manifest" ;;
 esac
 
-inst=${HXPROBE_INSTALL_DIR:-$HOME/Library/Application Support/hxprobe}
+# HOME is only needed for the defaults; it may be unset or empty.
+home=${HOME:-}
+inst=${HXPROBE_INSTALL_DIR:-}
+if [ -z "$inst" ]; then
+    [ -n "$home" ] || die "HOME is not set; set HXPROBE_INSTALL_DIR"
+    inst="$home/Library/Application Support/hxprobe"
+fi
 bindir="$inst/bin"
 bin="$bindir/hxprobe"
-# Earlier launchers installed <plugin data>/bin/hxprobe-<version>.
-legacy=${CLAUDE_PLUGIN_DATA:-$HOME/Library/Application Support/hxprobe-plugin}/bin
+# Earlier launchers installed <plugin data>/bin/hxprobe-<version>. Empty when
+# the plugin data directory is not known.
+legacy=${CLAUDE_PLUGIN_DATA:-}
+if [ -z "$legacy" ] && [ -n "$home" ]; then
+    legacy="$home/Library/Application Support/hxprobe-plugin"
+fi
+if [ -n "$legacy" ]; then legacy="$legacy/bin"; fi
 (umask 077 && mkdir -p "$bindir") || die "cannot create $bindir"
 chmod 700 "$inst" "$bindir" 2>/dev/null || true
 
@@ -284,10 +296,12 @@ install_and_run() {
     chmod 700 "$src" || die "cannot make $src executable"
     mv -f "$src" "$bin" || die "cannot move $src to $bin"
     tmp_file=''
-    for f in "$legacy"/hxprobe-*; do
-        [ -f "$f" ] || continue
-        rm -f "$f" || true
-    done
+    if [ -n "$legacy" ]; then
+        for f in "$legacy"/hxprobe-*; do
+            [ -f "$f" ] || continue
+            rm -f "$f" || true
+        done
+    fi
     release_lock
     log "installed hxprobe $version at $bin"
     run_server "$bin" ${1+"$@"}
