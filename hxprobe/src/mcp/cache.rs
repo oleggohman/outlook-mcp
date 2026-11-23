@@ -11,6 +11,7 @@
 //! Every file is mode 0600. A failed build removes its temporary files and
 //! leaves an existing `mail.db` untouched.
 
+use std::collections::BTreeMap;
 use std::fs::{DirBuilder, File, OpenOptions};
 use std::io::ErrorKind;
 use std::os::fd::AsRawFd;
@@ -19,7 +20,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use memmap2::Mmap;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OpenFlags};
 
 use crate::export::{self, ExportStats};
 use crate::header;
@@ -33,6 +34,19 @@ pub const DB_NAME: &str = "mail.db";
 const LOCK_NAME: &str = "lock";
 const COPY_PREFIX: &str = "store.copy-";
 const TMP_PREFIX: &str = "mail.db.tmp-";
+
+/// Version of what [`prepare`] adds to the export; bump it whenever that
+/// changes, so databases of an older version are rebuilt.
+pub const FORMAT_VERSION: &str = "1";
+
+/// Default shortest time between two builds of a changed store, in seconds.
+pub const DEFAULT_REFRESH_SECS: u64 = 900;
+
+/// Name of the store file in a profile directory.
+const STORE_NAME: &str = "HxStore.hxd";
+
+/// Outlook's profiles directory, relative to `$HOME`.
+const PROFILES_DIR: &str = "Library/Group Containers/UBF8T346G9.Office/Outlook/Outlook 15 Profiles";
 
 /// Attempts at copying a store that changes while it is copied.
 const COPY_ATTEMPTS: usize = 3;
@@ -67,25 +81,165 @@ pub struct BuildInfo {
     pub prepare_ms: u64,
 }
 
-/// The cache directory of one store.
+/// The `mcp_meta` rows of a database, by key.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Meta(BTreeMap<String, String>);
+
+impl Meta {
+    /// The value of `key`.
+    pub fn get(&self, key: &str) -> Option<&str> {
+        self.0.get(key).map(String::as_str)
+    }
+
+    /// The value of `key` as an integer.
+    pub fn int(&self, key: &str) -> Option<i64> {
+        self.get(key)?.parse().ok()
+    }
+
+    /// `(store_len, store_mtime_ns)` of the store the database was built from.
+    fn stamp(&self) -> Option<(u64, i64)> {
+        Some((
+            self.get("store_len")?.parse().ok()?,
+            self.int("store_mtime_ns")?,
+        ))
+    }
+}
+
+/// The state of a [`Cache`], for the `store_status` tool.
+#[derive(Debug)]
+pub struct Status<'a> {
+    pub store_path: &'a Path,
+    /// `mcp_meta` of the database in use; `None` when there is none.
+    pub meta: Option<&'a Meta>,
+    /// Whether the live store differs from the one the database in use was
+    /// built from; `None` when there is no database.
+    pub store_changed: Option<bool>,
+    /// Error of the last build attempt, if it failed.
+    pub last_error: Option<&'a str>,
+    pub last_attempt_unix: Option<i64>,
+}
+
+/// The cache directory of one store, and the database in use.
+///
+/// Refresh policy (see [`Cache::connection_at`]): the database is rebuilt
+/// lazily, when the live store changed and the last build (or attempt) is at
+/// least `refresh_secs` old. A failed build keeps the previous database in
+/// use.
 #[derive(Debug)]
 pub struct Cache {
     dir: PathBuf,
     store: PathBuf,
-    /// Number of [`Cache::build`] calls, failed ones included.
+    refresh_secs: i64,
+    /// Read-only connection to `mail.db`, with its `mcp_meta`.
+    db: Option<(Connection, Meta)>,
+    last_attempt_unix: Option<i64>,
+    last_error: Option<String>,
+    /// Number of builds this value started, failed ones included. A build
+    /// call that finds an up-to-date `mail.db` after taking the lock (made
+    /// by another process sharing the directory) and reuses it builds
+    /// nothing and is not counted.
     pub builds: u64,
 }
 
 impl Cache {
     /// The cache for `store` in `dir`. Creates `dir` if needed and checks it
-    /// (see [`ensure_dir`]); builds nothing.
+    /// (see [`ensure_dir`]); builds nothing. The refresh interval is
+    /// [`DEFAULT_REFRESH_SECS`].
     pub fn new(dir: &Path, store: &Path) -> Result<Cache, String> {
         ensure_dir(dir)?;
         Ok(Cache {
             dir: dir.to_path_buf(),
             store: store.to_path_buf(),
+            refresh_secs: DEFAULT_REFRESH_SECS as i64,
+            db: None,
+            last_attempt_unix: None,
+            last_error: None,
             builds: 0,
         })
+    }
+
+    /// Set the shortest time between two builds of a changed store; 0
+    /// rebuilds whenever the store changed.
+    pub fn with_refresh_secs(mut self, secs: u64) -> Cache {
+        self.refresh_secs = i64::try_from(secs).unwrap_or(i64::MAX);
+        self
+    }
+
+    /// The database to query at `now` (unix seconds), built or rebuilt
+    /// first when needed:
+    /// - no usable `mail.db` (missing, not a database, no readable
+    ///   `mcp_meta`, another `format_version` or another store path) ->
+    ///   build, unless a build failed less than `refresh_secs` ago, in which
+    ///   case that error is returned;
+    /// - the live store differs from the one `mail.db` was built from and
+    ///   the last build or attempt is at least `refresh_secs` old ->
+    ///   rebuild; if that fails the old database stays in use;
+    /// - otherwise the open database is used.
+    pub fn connection_at(&mut self, now: i64) -> Result<&Connection, String> {
+        if self.db.is_none() {
+            self.db = open_db(&self.db_path(), &self.store).ok();
+        }
+        match &self.db {
+            None => {
+                if let (Some(at), Some(e)) = (self.last_attempt_unix, &self.last_error) {
+                    if now.saturating_sub(at) < self.refresh_secs {
+                        return Err(e.clone());
+                    }
+                }
+                self.attempt(now, true)?;
+            }
+            Some((_, meta)) => {
+                let changed = stamp(&self.store).ok() != meta.stamp();
+                let built = meta.int("built_unix").unwrap_or(i64::MIN);
+                let since = built.max(self.last_attempt_unix.unwrap_or(i64::MIN));
+                if changed && now.saturating_sub(since) >= self.refresh_secs {
+                    // On failure the old database stays in use; the error
+                    // is kept in `last_error`.
+                    let _ = self.attempt(now, true);
+                }
+            }
+        }
+        self.db
+            .as_ref()
+            .map(|(c, _)| c)
+            .ok_or_else(|| "no database".to_string())
+    }
+
+    /// Rebuild now, whatever the interval and even when the store did not
+    /// change (the `refresh` tool). On failure the old database stays in
+    /// use.
+    pub fn force_refresh_at(&mut self, now: i64) -> Result<(), String> {
+        self.attempt(now, false)
+    }
+
+    /// The state of the cache; checks the live store's size and time.
+    pub fn status(&self) -> Status<'_> {
+        let meta = self.db.as_ref().map(|(_, m)| m);
+        Status {
+            store_path: &self.store,
+            meta,
+            store_changed: meta.map(|m| stamp(&self.store).ok() != m.stamp()),
+            last_error: self.last_error.as_deref(),
+            last_attempt_unix: self.last_attempt_unix,
+        }
+    }
+
+    /// One build attempt at `now`, recorded in `last_attempt_unix` and
+    /// `last_error`. `reuse`: accept an up-to-date `mail.db` found after
+    /// taking the lock instead of building.
+    fn attempt(&mut self, now: i64, reuse: bool) -> Result<(), String> {
+        self.last_attempt_unix = Some(now);
+        match self.build_locked(now, reuse) {
+            Ok(_) => {
+                self.last_error = None;
+                Ok(())
+            }
+            Err(e) => {
+                eprintln!("hxprobe mcp: cache build failed: {e}");
+                self.last_error = Some(e.clone());
+                Err(e)
+            }
+        }
     }
 
     /// Path of the prepared database.
@@ -103,11 +257,33 @@ impl Cache {
     /// window and `built_unix`.
     ///
     /// Holds the directory's lock throughout. Any error removes the
-    /// temporary files and leaves an existing `mail.db` as it was.
+    /// temporary files and leaves an existing `mail.db` as it was. On
+    /// success the new database is the one in use. Always builds; the
+    /// lazy path of [`Cache::connection_at`] may reuse a database another
+    /// process just built instead.
     pub fn build(&mut self, now: i64) -> Result<BuildInfo, String> {
-        self.builds += 1;
+        self.build_locked(now, false)
+            .map(|info| info.expect("a build without reuse always builds"))
+    }
+
+    /// [`Cache::build`]; with `reuse`, first (holding the lock) check
+    /// whether `mail.db` is usable and was built from the store as it is
+    /// now, and if so open it and return `None` without building.
+    fn build_locked(&mut self, now: i64, reuse: bool) -> Result<Option<BuildInfo>, String> {
         ensure_dir(&self.dir)?;
         let _lock = lock(&self.dir)?;
+        if reuse {
+            if let Ok((conn, meta)) = open_db(&self.db_path(), &self.store) {
+                if stamp(&self.store)
+                    .ok()
+                    .is_some_and(|s| meta.stamp() == Some(s))
+                {
+                    self.db = Some((conn, meta));
+                    return Ok(None);
+                }
+            }
+        }
+        self.builds += 1;
         remove_leftovers(&self.dir);
 
         let pid = std::process::id();
@@ -164,6 +340,7 @@ impl Cache {
             .map_err(|(_, e)| format!("close the database: {e}"))?;
         std::fs::rename(&tmp_path, self.db_path())
             .map_err(|e| format!("replace {}: {e}", self.db_path().display()))?;
+        self.db = Some(open_db(&self.db_path(), &self.store)?);
 
         eprintln!(
             "hxprobe mcp: cache built in {} ms (copy {copy_ms}, export {export_ms}, prepare \
@@ -173,8 +350,60 @@ impl Cache {
             counts.messages,
             counts.events
         );
-        Ok(info)
+        Ok(Some(info))
     }
+}
+
+/// `HxStore.hxd` of the default Outlook profile: under the profiles
+/// directory of `$HOME` (see [`default_store_path_in`]).
+pub fn default_store_path() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    default_store_path_in(&Path::new(&home).join(PROFILES_DIR))
+}
+
+/// `HxStore.hxd` of the profile to use in the profiles directory `base`:
+/// `Main Profile`, else `Main Identity`, else the only profile directory
+/// that holds a store. `None` when there is no store or several candidates.
+pub fn default_store_path_in(base: &Path) -> Option<PathBuf> {
+    for name in ["Main Profile", "Main Identity"] {
+        let p = base.join(name).join(STORE_NAME);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    let mut found = std::fs::read_dir(base)
+        .ok()?
+        .flatten()
+        .map(|e| e.path().join(STORE_NAME))
+        .filter(|p| p.is_file());
+    let first = found.next()?;
+    found.next().is_none().then_some(first)
+}
+
+/// Open `path` read-only and read its `mcp_meta`. Fails unless the database
+/// is usable for `store`: readable `mcp_meta`, [`FORMAT_VERSION`] and the
+/// same store path.
+fn open_db(path: &Path, store: &Path) -> Result<(Connection, Meta), String> {
+    let conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|e| format!("open {}: {e}", path.display()))?;
+    let meta = read_meta(&conn).map_err(|e| format!("read {}: {e}", path.display()))?;
+    if meta.get("format_version") != Some(FORMAT_VERSION) {
+        return Err(format!("{} has another format version", path.display()));
+    }
+    if meta.get("store_path") != Some(&*store.to_string_lossy()) {
+        return Err(format!("{} was built from another store", path.display()));
+    }
+    Ok((conn, meta))
+}
+
+/// All rows of `mcp_meta`.
+fn read_meta(conn: &Connection) -> rusqlite::Result<Meta> {
+    let mut st = conn.prepare("SELECT key, value FROM mcp_meta")?;
+    let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    Ok(Meta(rows.collect::<rusqlite::Result<_>>()?))
 }
 
 /// Milliseconds since `t`.
@@ -442,6 +671,7 @@ fn fill_fts(conn: &Connection) -> rusqlite::Result<usize> {
 fn meta_entries(now: i64, store: &Path, info: &BuildInfo) -> Vec<(&'static str, String)> {
     let s = &info.stats;
     vec![
+        ("format_version", FORMAT_VERSION.to_string()),
         ("built_unix", now.to_string()),
         ("store_len", info.store_len.to_string()),
         ("store_mtime_ns", info.store_mtime_ns.to_string()),
@@ -616,6 +846,7 @@ mod tests {
             })
             .unwrap_or_else(|_| panic!("no meta key {k}"))
         };
+        assert_eq!(meta("format_version"), FORMAT_VERSION);
         assert_eq!(meta("built_unix"), NOW_I.to_string());
         assert_eq!(meta("store_len"), info.store_len.to_string());
         assert_eq!(meta("store_mtime_ns"), info.store_mtime_ns.to_string());
@@ -837,6 +1068,268 @@ mod tests {
             .map(Result::unwrap)
             .collect();
         assert_eq!(got, ["aa", "gg"]);
+    }
+
+    // --- store discovery ---
+
+    /// A profile directory `name` under `base`, with a store file if
+    /// `with_store`.
+    fn profile(base: &Path, name: &str, with_store: bool) {
+        let d = base.join(name);
+        std::fs::create_dir_all(&d).unwrap();
+        if with_store {
+            std::fs::write(d.join("HxStore.hxd"), b"x").unwrap();
+        }
+    }
+
+    #[test]
+    fn default_store_prefers_main_profile_then_main_identity() {
+        let t = TestDir::new("profiles");
+        let base = t.0.join("profiles");
+        profile(&base, "Other", true);
+        profile(&base, "Main Identity", true);
+        profile(&base, "Main Profile", true);
+        assert_eq!(
+            default_store_path_in(&base),
+            Some(base.join("Main Profile").join("HxStore.hxd"))
+        );
+        std::fs::remove_file(base.join("Main Profile").join("HxStore.hxd")).unwrap();
+        assert_eq!(
+            default_store_path_in(&base),
+            Some(base.join("Main Identity").join("HxStore.hxd"))
+        );
+    }
+
+    #[test]
+    fn default_store_takes_the_only_other_profile() {
+        let t = TestDir::new("profiles1");
+        let base = t.0.join("profiles");
+        profile(&base, "Empty", false);
+        profile(&base, "Work", true);
+        assert_eq!(
+            default_store_path_in(&base),
+            Some(base.join("Work").join("HxStore.hxd"))
+        );
+        profile(&base, "Home", true);
+        assert_eq!(default_store_path_in(&base), None);
+    }
+
+    #[test]
+    fn default_store_none_without_profiles() {
+        let t = TestDir::new("profiles0");
+        assert_eq!(default_store_path_in(&t.0.join("missing")), None);
+        let base = t.0.join("profiles");
+        profile(&base, "Empty", false);
+        assert_eq!(default_store_path_in(&base), None);
+    }
+
+    // --- refresh policy ---
+
+    /// Set the store's modification time to `secs` after the epoch, so it
+    /// looks changed without waiting.
+    fn touch(p: &Path, secs: u64) {
+        let f = OpenOptions::new().write(true).open(p).unwrap();
+        f.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs))
+            .unwrap();
+    }
+
+    /// A cache in `t` over a [`mail_store`] file, nothing built yet.
+    fn lazy(t: &TestDir, refresh_secs: u64) -> Cache {
+        Cache::new(&t.cache_dir(), &t.store(&mail_store()))
+            .unwrap()
+            .with_refresh_secs(refresh_secs)
+    }
+
+    fn messages(c: &mut Cache, now: i64) -> i64 {
+        count(
+            c.connection_at(now).unwrap(),
+            "SELECT COUNT(*) FROM messages",
+        )
+    }
+
+    fn built_unix(c: &Cache) -> Option<i64> {
+        c.status().meta.and_then(|m| m.int("built_unix"))
+    }
+
+    #[test]
+    fn first_call_builds_and_unchanged_store_never_rebuilds() {
+        let t = TestDir::new("first");
+        let mut c = lazy(&t, 900);
+        assert_eq!(messages(&mut c, NOW_I), 4);
+        assert_eq!(c.builds, 1);
+        for dt in [1, 900, 100_000] {
+            messages(&mut c, NOW_I + dt);
+        }
+        assert_eq!(c.builds, 1);
+        assert_eq!(built_unix(&c), Some(NOW_I));
+        assert!(c.status().last_error.is_none());
+        assert_eq!(c.status().store_changed, Some(false));
+    }
+
+    #[test]
+    fn changed_store_rebuilds_only_after_the_interval() {
+        let t = TestDir::new("interval");
+        let mut c = lazy(&t, 900);
+        messages(&mut c, NOW_I);
+        touch(c.store_path(), 1_000_000);
+        assert_eq!(c.status().store_changed, Some(true));
+        messages(&mut c, NOW_I + 899);
+        assert_eq!(c.builds, 1);
+        messages(&mut c, NOW_I + 900);
+        assert_eq!(c.builds, 2);
+        assert_eq!(built_unix(&c), Some(NOW_I + 900));
+        assert_eq!(c.status().store_changed, Some(false));
+    }
+
+    #[test]
+    fn zero_interval_rebuilds_whenever_the_store_changed() {
+        let t = TestDir::new("zero");
+        let mut c = lazy(&t, 0);
+        messages(&mut c, NOW_I);
+        messages(&mut c, NOW_I);
+        assert_eq!(c.builds, 1);
+        touch(c.store_path(), 1_000_000);
+        messages(&mut c, NOW_I);
+        assert_eq!(c.builds, 2);
+        messages(&mut c, NOW_I);
+        assert_eq!(c.builds, 2);
+    }
+
+    #[test]
+    fn second_cache_reuses_the_database() {
+        let t = TestDir::new("reuse");
+        let mut a = lazy(&t, 900);
+        messages(&mut a, NOW_I);
+        let mut b = Cache::new(&t.cache_dir(), a.store_path()).unwrap();
+        assert_eq!(messages(&mut b, NOW_I + 5), 4);
+        assert_eq!(b.builds, 0);
+        assert_eq!(built_unix(&b), Some(NOW_I));
+    }
+
+    #[test]
+    fn failed_rebuild_keeps_serving_and_waits_for_the_interval() {
+        let t = TestDir::new("failkeep");
+        let mut c = lazy(&t, 900);
+        messages(&mut c, NOW_I);
+        t.store(b"this is not a store file, only some text that is long enough");
+        assert_eq!(messages(&mut c, NOW_I + 1000), 4);
+        assert_eq!(c.builds, 2);
+        let e = c.status().last_error.expect("last_error is set");
+        assert!(e.contains("store"), "{e}");
+        assert_eq!(messages(&mut c, NOW_I + 1010), 4);
+        assert_eq!(c.builds, 2);
+        assert_eq!(messages(&mut c, NOW_I + 1900), 4);
+        assert_eq!(c.builds, 3);
+        assert_eq!(files(&t.cache_dir()), ["lock", "mail.db"]);
+    }
+
+    #[test]
+    fn failed_first_build_returns_the_error() {
+        let t = TestDir::new("failfirst");
+        let store = t.store(b"this is not a store file, only some text that is long enough");
+        let mut c = Cache::new(&t.cache_dir(), &store).unwrap();
+        let e = c.connection_at(NOW_I).unwrap_err();
+        assert!(e.contains("store"), "{e}");
+        assert_eq!(c.status().last_error, Some(e.as_str()));
+        assert!(c.status().meta.is_none());
+        assert_eq!(c.status().store_changed, None);
+        // No retry inside the interval.
+        assert!(c.connection_at(NOW_I + 10).is_err());
+        assert_eq!(c.builds, 1);
+        // Fixed store, interval passed: builds.
+        t.store(&mail_store());
+        assert_eq!(messages(&mut c, NOW_I + 900), 4);
+        assert_eq!(c.builds, 2);
+        assert!(c.status().last_error.is_none());
+    }
+
+    #[test]
+    fn force_refresh_ignores_the_interval() {
+        let t = TestDir::new("force");
+        let mut c = lazy(&t, 900);
+        messages(&mut c, NOW_I);
+        c.force_refresh_at(NOW_I + 1).unwrap();
+        assert_eq!(c.builds, 2);
+        assert_eq!(built_unix(&c), Some(NOW_I + 1));
+        assert_eq!(messages(&mut c, NOW_I + 2), 4);
+        assert_eq!(c.builds, 2);
+    }
+
+    /// Build in `t`, then change `mail.db` with `sql` (read-write).
+    fn built_then(t: &TestDir, sql: &str) -> PathBuf {
+        let mut a = lazy(t, 900);
+        messages(&mut a, NOW_I);
+        let db = Connection::open(a.db_path()).unwrap();
+        db.execute_batch(sql).unwrap();
+        a.store_path().to_path_buf()
+    }
+
+    #[test]
+    fn other_format_version_is_rebuilt_at_once() {
+        let t = TestDir::new("format");
+        let store = built_then(
+            &t,
+            "UPDATE mcp_meta SET value = '0' WHERE key = 'format_version'",
+        );
+        let mut b = Cache::new(&t.cache_dir(), &store).unwrap();
+        assert_eq!(messages(&mut b, NOW_I + 1), 4);
+        assert_eq!(b.builds, 1);
+        let meta = b.status().meta.unwrap();
+        assert_eq!(meta.get("format_version"), Some(FORMAT_VERSION));
+    }
+
+    #[test]
+    fn database_of_another_store_is_rebuilt_at_once() {
+        let t = TestDir::new("otherstore");
+        built_then(&t, "SELECT 1");
+        let other = t.0.join("Other.hxd");
+        std::fs::write(&other, mail_store()).unwrap();
+        let mut b = Cache::new(&t.cache_dir(), &other).unwrap();
+        assert_eq!(messages(&mut b, NOW_I + 1), 4);
+        assert_eq!(b.builds, 1);
+        let meta = b.status().meta.unwrap();
+        assert_eq!(meta.get("store_path"), Some(&*other.to_string_lossy()));
+    }
+
+    #[test]
+    fn corrupt_database_is_rebuilt() {
+        let t = TestDir::new("corrupt");
+        let store = t.store(&mail_store());
+        std::fs::create_dir(t.cache_dir()).unwrap();
+        std::fs::write(t.cache_dir().join(DB_NAME), [0xa5u8; 8192]).unwrap();
+        let mut c = Cache::new(&t.cache_dir(), &store).unwrap();
+        assert_eq!(messages(&mut c, NOW_I), 4);
+        assert_eq!(c.builds, 1);
+    }
+
+    #[test]
+    fn database_without_meta_is_rebuilt() {
+        let t = TestDir::new("nometa");
+        let store = t.store(&mail_store());
+        std::fs::create_dir(t.cache_dir()).unwrap();
+        Connection::open(t.cache_dir().join(DB_NAME))
+            .unwrap()
+            .execute_batch("CREATE TABLE x(a)")
+            .unwrap();
+        let mut c = Cache::new(&t.cache_dir(), &store).unwrap();
+        assert_eq!(messages(&mut c, NOW_I), 4);
+        assert_eq!(c.builds, 1);
+    }
+
+    #[test]
+    fn second_cache_picks_up_a_rebuild_of_the_first() {
+        let t = TestDir::new("twocaches");
+        let mut a = lazy(&t, 900);
+        messages(&mut a, NOW_I);
+        let mut b = Cache::new(&t.cache_dir(), a.store_path()).unwrap();
+        messages(&mut b, NOW_I);
+        touch(a.store_path(), 1_000_000);
+        messages(&mut a, NOW_I + 1000);
+        assert_eq!(a.builds, 2);
+        assert_eq!(messages(&mut b, NOW_I + 1000), 4);
+        assert_eq!(b.builds, 0);
+        assert_eq!(built_unix(&b), Some(NOW_I + 1000));
+        assert_eq!(b.status().store_changed, Some(false));
     }
 
     /// Create the optional type tables the way [`prepare`] does, so a test
