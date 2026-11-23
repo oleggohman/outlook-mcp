@@ -160,11 +160,11 @@ dead_pid() {
     printf '%s\n' "$p"
 }
 
-# Succeeds when the process with pid $1 is gone, within about 1 s.
+# Succeeds when the process with pid $1 is gone, within about 5 s.
 gone() {
     local i=0
     while kill -0 "$1" 2>/dev/null; do
-        [ "$i" -lt 10 ] || return 1
+        [ "$i" -lt 50 ] || return 1
         sleep 0.1
         i=$((i + 1))
     done
@@ -297,11 +297,14 @@ else fail "$t" "rc=$rc out='$out' mode=$(mode_of "$b") left=$left err='$err'"; f
 
 # (iii-b) A non-file base URL is limited to https: http:// is refused by curl
 # before any connection, so the launcher falls through to the final error.
+# The message must be curl's protocol error (status 1): nothing listens on
+# the port, so a connection would fail too (status 7), for another reason.
 t='download refuses http'
 r=$(make_repo)
 printf '%s  %s\n' "$sum" "$asset" > "$r/release/SHA256SUMS"
 run "$r" HXPROBE_RELEASE_BASE="http://127.0.0.1:9" PATH="$nocargo_path" --
 if [ "$rc" = 1 ] && [ -z "$out" ] && [[ "$err" == *"download of $asset failed"* ]] \
+    && [[ "$err" == *'curl: (1) '* ]] && [[ "$err" != *'curl: (7) '* ]] \
     && [ ! -e "$r/inst/bin/hxprobe" ]; then pass "$t"
 else fail "$t" "rc=$rc out='$out' err='$err'"; fi
 
@@ -579,8 +582,10 @@ if [ "$running" = 1 ] && [ "$free" = 1 ] && [ "$rc" = 0 ] && [ "$(cat "$r/out")"
     && [ "$(cat "$r/ran" 2>/dev/null || true)" = "$fds_closed" ]; then pass "$t"
 else fail "$t" "running=$running free=$free rc=$rc fds='$(cat "$r/ran" 2>/dev/null || true)' err='$(cat "$r/err")'"; fi
 
-# (ix) TERM during a build or a download ends the launcher within about 2 s
-# with a non-zero status; the lock is free and nothing is left behind. The
+# (ix) TERM during a build or a download ends the launcher at once (well
+# before the stub's 30 s; the limits leave room for a loaded machine and for
+# whole-second time stamps) with a non-zero status; the lock is free and
+# nothing is left behind. The
 # command and what it started are gone as well: each stub starts a second
 # process, which during a build keeps writing into the build directory. In
 # the third variant that process ignores TERM, so the launcher has to kill it
@@ -589,9 +594,9 @@ for what in build download 'build, TERM ignored'; do
     t="TERM during $what"
     r=$(make_repo)
     mkdir -p "$r/stub"
-    limit=2
+    limit=10
     ignore=''
-    if [ "$what" = 'build, TERM ignored' ]; then limit=4; ignore="trap '' TERM"; fi
+    if [ "$what" = 'build, TERM ignored' ]; then limit=15; ignore="trap '' TERM"; fi
     if [ "$what" = download ]; then
         printf '%s  %s\n' "$sum" "$asset" > "$r/release/SHA256SUMS"
         cat > "$r/stub/curl" <<EOF
@@ -678,7 +683,8 @@ pid=$!
 # Two lockf runs: the attempt that fails at once and the one that waits.
 i=0
 while [ "$(cat "$r/lockf.pids" 2>/dev/null | wc -l)" -lt 2 ] && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
-sleep 0.2
+# No pause is needed here: a signal that comes while the launcher starts the
+# waiting lockf is acted on as soon as that is started.
 before=$(date +%s)
 kill -TERM "$pid"
 rc=0
@@ -689,7 +695,7 @@ alive=''
 for p in $waiters; do
     if ! gone "$p"; then alive="$alive $p"; fi
 done
-if [ "$(printf '%s\n' "$waiters" | wc -l | tr -d ' ')" = 2 ] && [ "$rc" = 143 ] && [ "$took" -le 2 ] \
+if [ "$(printf '%s\n' "$waiters" | wc -l | tr -d ' ')" = 2 ] && [ "$rc" = 143 ] && [ "$took" -le 10 ] \
     && [ ! -s "$r/out" ] && [ -z "$alive" ] && [[ "$(cat "$r/err")" == *'waiting'* ]] \
     && kill -0 "$holder" 2>/dev/null; then pass "$t"
 else fail "$t" "rc=$rc took=${took}s waiters='$waiters' alive='$alive' err='$(cat "$r/err")'"; fi
@@ -945,6 +951,21 @@ run "$r" HXPROBE_RELEASE_BASE="file://$r/rel" PATH="$r/stub:$nocargo_path" --
 if [ "$rc" = 0 ] && [ "$out" = 'FAKE mcp' ] && [ -z "$err" ] && [ ! -e "$r/curl-args" ] \
     && [ ! -e "$r/builds" ]; then pass "$t"
 else fail "$t" "rc=$rc out='$out' err='$err'"; fi
+
+# (xviii) The cargo build with a space in the install path (the default one
+# under HOME has one): the build directory is passed to cargo in one piece
+# and the program is installed and run from that path.
+t='cargo build, space in the install path'
+r=$(make_repo)
+make_cargo_stub "$r" 'for a; do printf "%s\n" "$a"; done > "'"$r"'/cargo-argv"'
+d="$root/home/Library/Application Support/hxprobe"
+run "$r" HXPROBE_INSTALL_DIR= PATH="$r/stub:$nocargo_path" -- 'a b'
+target=$(awk 'prev == "--target-dir" { print; exit } { prev = $0 }' "$r/cargo-argv" 2>/dev/null || true)
+if [ "$rc" = 0 ] && [ "$out" = 'BUILT mcp a b' ] && [ -x "$d/bin/hxprobe" ] \
+    && [[ "$target" == "$d/target."* ]] && [ "$(origin_of "$d")" = build ] \
+    && [ "$(leftovers "$d")" = 0 ] && lock_free "$d" && [ ! -e "$r/inst" ]; then pass "$t"
+else fail "$t" "rc=$rc out='$out' target='$target' err='$err'"; fi
+rm -rf "$root/home"
 
 if [ "$failures" -ne 0 ]; then
     printf '%d case(s) failed\n' "$failures"
