@@ -49,6 +49,8 @@ pub trait Backend {
 pub struct CacheBackend {
     dir: PathBuf,
     store: PathBuf,
+    /// See [`cache::Cache::with_build_delay`].
+    build_delay: Option<Duration>,
 }
 
 impl CacheBackend {
@@ -57,7 +59,15 @@ impl CacheBackend {
         CacheBackend {
             dir: dir.to_path_buf(),
             store: store.to_path_buf(),
+            build_delay: None,
         }
+    }
+
+    /// Pause every build for `delay` after the store copy (a test aid, see
+    /// [`cache::Cache::with_build_delay`]).
+    pub fn with_build_delay(mut self, delay: Duration) -> CacheBackend {
+        self.build_delay = Some(delay);
+        self
     }
 }
 
@@ -84,9 +94,11 @@ impl Backend for CacheBackend {
     }
 
     fn build(&self, now: i64) -> Result<(), String> {
-        cache::Cache::new(&self.dir, &self.store)?
-            .build(now)
-            .map(drop)
+        let mut c = cache::Cache::new(&self.dir, &self.store)?;
+        if let Some(delay) = self.build_delay {
+            c = c.with_build_delay(delay);
+        }
+        c.build(now).map(drop)
     }
 
     fn store_denied(&self) -> bool {

@@ -19,7 +19,7 @@ use std::io::ErrorKind;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use memmap2::Mmap;
 use rusqlite::{params, Connection, OpenFlags};
@@ -53,6 +53,12 @@ const PROFILES_DIR: &str = "Library/Group Containers/UBF8T346G9.Office/Outlook/O
 
 /// Attempts at copying a store that changes while it is copied.
 const COPY_ATTEMPTS: usize = 3;
+
+/// How long [`remove_dead_leftovers`] tries a held build lock before it
+/// gives up, and how often: a process that just exited may still hold it
+/// for a moment.
+const LEFTOVER_LOCK_RETRY: Duration = Duration::from_millis(250);
+const LEFTOVER_LOCK_POLL: Duration = Duration::from_millis(10);
 
 /// `last_error` while a build runs; it stays when the build panics.
 pub(crate) const BUILD_UNFINISHED: &str = "the last cache build did not finish (internal error)";
@@ -150,6 +156,9 @@ pub struct Cache {
     /// Identity of a `mail.db` that [`open_db`] refused, so the same file
     /// is not tried again on every call.
     rejected_id: Option<FileId>,
+    /// Pause after the store copy of every build (see
+    /// [`Cache::with_build_delay`]).
+    build_delay: Option<Duration>,
     /// Called at the start of every build, with the lock held.
     #[cfg(test)]
     pub(crate) build_hook: Option<fn()>,
@@ -232,6 +241,7 @@ impl Cache {
             builds: 0,
             db_id: None,
             rejected_id: None,
+            build_delay: None,
             #[cfg(test)]
             build_hook: None,
             #[cfg(test)]
@@ -243,6 +253,14 @@ impl Cache {
     /// rebuilds whenever the store changed.
     pub fn with_refresh_secs(mut self, secs: u64) -> Cache {
         self.refresh_secs = i64::try_from(secs).unwrap_or(i64::MAX);
+        self
+    }
+
+    /// Pause for `delay` in every build right after the store copy, with
+    /// the lock held and the temporary files present. A test aid: it lets
+    /// a test stop a process in the middle of a build.
+    pub fn with_build_delay(mut self, delay: Duration) -> Cache {
+        self.build_delay = Some(delay);
         self
     }
 
@@ -454,6 +472,9 @@ impl Cache {
         let started = Instant::now();
         let (store_len, store_mtime_ns) = copy_store(&self.store, &copy_path)?;
         let copy_ms = ms_since(started);
+        if let Some(delay) = self.build_delay {
+            std::thread::sleep(delay);
+        }
 
         let at = Instant::now();
         let file = File::open(&copy_path).map_err(|e| format!("open the store copy: {e}"))?;
@@ -658,6 +679,23 @@ pub(crate) fn check_private(m: &std::fs::Metadata) -> Result<(), &'static str> {
 /// regular file (see [`check_private`]) is removed and created again; a
 /// symbolic link is never followed.
 fn lock(dir: &Path) -> Result<File, String> {
+    let (f, path) = open_lock(dir)?;
+    loop {
+        // SAFETY: flock() on a descriptor owned by `f` for the whole call.
+        if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } == 0 {
+            return Ok(f);
+        }
+        let e = std::io::Error::last_os_error();
+        if e.kind() != ErrorKind::Interrupted {
+            return Err(format!("lock {}: {e}", path.display()));
+        }
+    }
+}
+
+/// The `lock` file of `dir`, open and not locked, and its path. An existing
+/// one that is not a private regular file is removed and created again; a
+/// symbolic link is never followed.
+fn open_lock(dir: &Path) -> Result<(File, PathBuf), String> {
     let path = dir.join(LOCK_NAME);
     if std::fs::symlink_metadata(&path).is_ok_and(|m| check_private(&m).is_err()) {
         std::fs::remove_file(&path).map_err(|e| format!("remove {}: {e}", path.display()))?;
@@ -671,16 +709,43 @@ fn lock(dir: &Path) -> Result<File, String> {
         .custom_flags(libc::O_NOFOLLOW)
         .open(&path)
         .map_err(|e| format!("open {}: {e}", path.display()))?;
+    Ok((f, path))
+}
+
+/// Remove the temporary files that builds of dead processes left in `dir`
+/// (a process killed during a build), when no build runs: only when the
+/// build lock can be taken within [`LEFTOVER_LOCK_RETRY`]. Whether it did.
+pub fn remove_dead_leftovers(dir: &Path) -> bool {
+    let Ok((f, _)) = open_lock(dir) else {
+        return false;
+    };
+    let deadline = Instant::now() + LEFTOVER_LOCK_RETRY;
     loop {
         // SAFETY: flock() on a descriptor owned by `f` for the whole call.
-        if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } == 0 {
-            return Ok(f);
+        if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            remove_leftovers(dir);
+            // Closing `f` releases the lock.
+            return true;
         }
-        let e = std::io::Error::last_os_error();
-        if e.kind() != ErrorKind::Interrupted {
-            return Err(format!("lock {}: {e}", path.display()));
+        match std::io::Error::last_os_error().kind() {
+            ErrorKind::Interrupted => {}
+            ErrorKind::WouldBlock if Instant::now() < deadline => {
+                std::thread::sleep(LEFTOVER_LOCK_POLL)
+            }
+            _ => return false,
         }
     }
+}
+
+/// Remove the temporary files of this process's builds in `dir` (and their
+/// SQLite side files), for a process that ends while a build of its own may
+/// still run. Files of other processes are left alone.
+pub fn remove_own_temps(dir: &Path) {
+    let pid = std::process::id();
+    drop(TempFiles(vec![
+        dir.join(format!("{COPY_PREFIX}{pid}")),
+        dir.join(format!("{TMP_PREFIX}{pid}")),
+    ]));
 }
 
 /// Remove the temporary files of earlier builds (and their SQLite side
@@ -2060,6 +2125,103 @@ mod tests {
         let other = t.0.join("Other.hxd");
         std::fs::write(&other, mail_store()).unwrap();
         assert_eq!(db_info(&dir, &other), None);
+    }
+
+    /// Temporary files of a build of process `pid` in `dir`, SQLite side
+    /// files included.
+    fn temps_of(dir: &Path, pid: &str) {
+        for f in ["store.copy-", "mail.db.tmp-"] {
+            std::fs::write(dir.join(format!("{f}{pid}")), b"stale").unwrap();
+        }
+        std::fs::write(dir.join(format!("mail.db.tmp-{pid}-journal")), b"stale").unwrap();
+    }
+
+    #[test]
+    fn dead_leftovers_are_removed_while_the_build_lock_is_free() {
+        let t = TestDir::new("dead");
+        let dir = t.cache_dir();
+        ensure_dir(&dir).unwrap();
+        temps_of(&dir, "999");
+        std::fs::write(dir.join("notes.txt"), b"keep").unwrap();
+        assert!(remove_dead_leftovers(&dir));
+        assert_eq!(files(&dir), ["lock", "notes.txt"]);
+    }
+
+    #[test]
+    fn dead_leftovers_are_kept_while_another_holds_the_build_lock() {
+        let t = TestDir::new("busy");
+        let dir = t.cache_dir();
+        ensure_dir(&dir).unwrap();
+        temps_of(&dir, "999");
+        let held = lock(&dir).unwrap();
+        let started = Instant::now();
+        assert!(!remove_dead_leftovers(&dir));
+        // Tried for a moment before giving up.
+        assert!(started.elapsed() >= LEFTOVER_LOCK_RETRY);
+        assert_eq!(
+            files(&dir),
+            [
+                "lock",
+                "mail.db.tmp-999",
+                "mail.db.tmp-999-journal",
+                "store.copy-999"
+            ]
+        );
+        // Released shortly after the first attempt: taken, removed.
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            drop(held);
+        });
+        assert!(remove_dead_leftovers(&dir));
+        release.join().unwrap();
+        assert_eq!(files(&dir), ["lock"]);
+    }
+
+    #[test]
+    fn own_temps_only_are_removed() {
+        let t = TestDir::new("own");
+        let dir = t.cache_dir();
+        ensure_dir(&dir).unwrap();
+        let pid = std::process::id().to_string();
+        temps_of(&dir, &pid);
+        temps_of(&dir, "999");
+        // Another process whose pid starts with ours.
+        temps_of(&dir, &format!("{pid}0"));
+        remove_own_temps(&dir);
+        let mut want = vec![
+            format!("mail.db.tmp-{pid}0"),
+            format!("mail.db.tmp-{pid}0-journal"),
+            "mail.db.tmp-999".to_string(),
+            "mail.db.tmp-999-journal".to_string(),
+            format!("store.copy-{pid}0"),
+            "store.copy-999".to_string(),
+        ];
+        want.sort();
+        assert_eq!(files(&dir), want);
+    }
+
+    #[test]
+    fn build_delay_pauses_after_the_store_copy() {
+        let t = TestDir::new("delay");
+        let dir = t.cache_dir();
+        let delay = std::time::Duration::from_millis(300);
+        let mut c = Cache::new(&dir, &t.store(&mail_store()))
+            .unwrap()
+            .with_build_delay(delay);
+        let started = Instant::now();
+        let build = std::thread::spawn(move || c.build(NOW_I).map(drop));
+        let copy = dir.join(format!("store.copy-{}", std::process::id()));
+        while !copy.exists() {
+            assert!(started.elapsed() < std::time::Duration::from_secs(5));
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        // The copy exists during the pause, and the build is not over.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(copy.exists());
+        assert!(!build.is_finished());
+        build.join().unwrap().unwrap();
+        assert!(started.elapsed() >= delay);
+        assert_eq!(files(&dir), ["lock", "mail.db"]);
     }
 
     /// Create the optional type tables the way [`prepare`] does, so a test

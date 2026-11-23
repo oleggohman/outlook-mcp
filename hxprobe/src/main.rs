@@ -1113,13 +1113,25 @@ fn cmd_service(args: &[String]) {
         }
         Err(LockError::Failed(e)) => fail(e),
     };
-    let backend = CacheBackend::new(&dir, &store);
+    let mut backend = CacheBackend::new(&dir, &store);
+    // A test aid: pause every build after the store copy, so a test can
+    // stop the service in the middle of a build.
+    if let Some(ms) = env::var("HXPROBE_TEST_BUILD_DELAY_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        log(&format!("test build delay {ms} ms"));
+        backend = backend.with_build_delay(std::time::Duration::from_millis(ms));
+    }
     if service::Backend::store_denied(&backend) {
         log(&format!(
             "{} cannot be read: permission denied; exiting",
             store.display()
         ));
         std::process::exit(service::EXIT_PERMISSION);
+    }
+    if !cache::remove_dead_leftovers(&dir) {
+        log("another process is building; temporary build files kept");
     }
     let refresh_secs = opts.refresh_secs.unwrap_or(cache::DEFAULT_REFRESH_SECS);
     let idle_secs = opts.idle_secs.unwrap_or(proto::DEFAULT_IDLE_SECS);
@@ -1151,8 +1163,10 @@ fn cmd_service(args: &[String]) {
     );
     let exit = service::serve(core, listener, clock, proto::TICK, stop);
     // The socket goes first; `service.lock` is released when the process
-    // ends.
+    // ends. A build still running is abandoned: its temporary files go
+    // (the build lock it holds is released with the process).
     socket.remove_if_ours();
+    cache::remove_own_temps(&dir);
     log(&format!("exiting: {}", exit.as_str()));
     std::process::exit(exit.code());
 }

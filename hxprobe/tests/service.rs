@@ -619,3 +619,147 @@ fn stop_of_a_service_that_does_not_answer_exits_1_naming_its_pid() {
     );
     assert!(!proto::pid_gone(pid.pid()));
 }
+
+// --- builds: kill during a build, leftovers, stale socket ---
+
+/// `(dev, ino)` and content of `<cache>/mail.db`.
+fn db_file(d: &Dir) -> ((u64, u64), Vec<u8>) {
+    use std::os::unix::fs::MetadataExt;
+    let p = d.cache().join("mail.db");
+    let m = std::fs::symlink_metadata(&p).unwrap();
+    ((m.dev(), m.ino()), std::fs::read(&p).unwrap())
+}
+
+/// Names of the temporary build files in the cache directory.
+fn temps(d: &Dir) -> Vec<String> {
+    let mut v: Vec<String> = std::fs::read_dir(d.cache())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("store.copy-") || n.starts_with("mail.db.tmp-"))
+        .collect();
+    v.sort();
+    v
+}
+
+/// Build `mail.db` with a service that is stopped again, then give the
+/// store another modification time, so the next touch rebuilds. The
+/// database's `built_unix`.
+fn old_database(d: &Dir) -> i64 {
+    let mut svc = spawn_service(d, &[], &[]);
+    let mut built = None;
+    wait_until("the first build", Duration::from_secs(10), || {
+        built = request(d, &Request::Status)
+            .ok()
+            .filter(|v| v["db_usable"] == true)
+            .and_then(|v| v["built_unix"].as_i64());
+        built.is_some()
+    });
+    let (st, _, err, _) = client(d, "--stop");
+    assert_eq!(st.code(), Some(0), "{err}");
+    assert_eq!(svc.exit(Duration::from_secs(5)).code(), Some(0));
+    let t = std::time::UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+    std::fs::File::options()
+        .write(true)
+        .open(d.store())
+        .unwrap()
+        .set_modified(t)
+        .unwrap();
+    built.unwrap()
+}
+
+/// A service whose builds pause 5 s after the store copy, in the middle of
+/// a build started by a touch on the changed store.
+fn delayed_build(d: &Dir) -> Service {
+    let svc = spawn_service(
+        d,
+        &["--refresh-secs", "0"],
+        &[("HXPROBE_TEST_BUILD_DELAY_MS", "5000")],
+    );
+    answering(d);
+    let v = request(d, &Request::Touch).unwrap();
+    assert_eq!(v["building"], true, "{v}");
+    let copy = d.cache().join(format!("store.copy-{}", svc.pid()));
+    wait_until("the store copy", Duration::from_secs(5), || copy.exists());
+    let v = request(d, &Request::Status).unwrap();
+    assert_eq!(v["building"], true, "{v}");
+    svc
+}
+
+#[test]
+fn killed_during_a_build_keeps_the_database_and_the_next_start_cleans_up() {
+    let _s = serial();
+    let d = Dir::new();
+    let built = old_database(&d);
+    let before = db_file(&d);
+    let mut svc = delayed_build(&d);
+    let pid = svc.pid();
+    // SAFETY: plain system call on the pid of our own child.
+    assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) }, 0);
+    assert_eq!(
+        svc.exit(Duration::from_secs(5)).signal(),
+        Some(libc::SIGKILL)
+    );
+    assert!(db_file(&d) == before, "mail.db was replaced or changed");
+    assert_eq!(temps(&d), [format!("store.copy-{pid}")]);
+
+    let next = spawn_service(&d, &[], &[]);
+    let v = answering(&d);
+    assert_eq!(v["pid"], next.pid());
+    assert!(temps(&d).is_empty(), "{:?}", temps(&d));
+    assert_eq!(v["db_usable"], true, "{v}");
+    assert_eq!(v["built_unix"], built, "{v}");
+    assert_eq!(v["builds"], 0, "{v}");
+    assert!(db_file(&d) == before, "mail.db was replaced or changed");
+}
+
+#[test]
+fn shutdown_or_sigterm_during_a_build_exits_at_once_and_cleans_up() {
+    let _s = serial();
+    for by_signal in [false, true] {
+        let d = Dir::new();
+        old_database(&d);
+        let before = db_file(&d);
+        let mut svc = delayed_build(&d);
+        let started = Instant::now();
+        if by_signal {
+            // SAFETY: plain system call on the pid of our own child.
+            assert_eq!(
+                unsafe { libc::kill(svc.pid() as libc::pid_t, libc::SIGTERM) },
+                0
+            );
+        } else {
+            let shutdown = Request::Shutdown {
+                version: VERSION.into(),
+            };
+            let v = request(&d, &shutdown).unwrap();
+            assert_eq!(v["stopping"], true, "{v}");
+        }
+        let st = svc.exit(Duration::from_secs(2));
+        assert_eq!(st.code(), Some(0), "signal {by_signal}: {st:?}");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(temps(&d).is_empty(), "{:?}", temps(&d));
+        assert!(db_file(&d) == before, "mail.db was replaced or changed");
+        assert!(!d.sock().exists());
+    }
+}
+
+#[test]
+fn stale_socket_does_not_prevent_a_start() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let _s = serial();
+    let d = Dir::new();
+    std::fs::create_dir(d.cache()).unwrap();
+    std::fs::set_permissions(d.cache(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    // Bound and closed: the file stays, nobody listens, nobody holds the
+    // lock.
+    drop(std::os::unix::net::UnixListener::bind(d.sock()).unwrap());
+    let stale = std::fs::symlink_metadata(d.sock()).unwrap().ino();
+    assert_eq!(
+        request(&d, &Request::Status),
+        Err(ExchangeError::NotRunning)
+    );
+    let svc = spawn_service(&d, &[], &[]);
+    let v = answering(&d);
+    assert_eq!(v["pid"], svc.pid());
+    assert_ne!(std::fs::symlink_metadata(d.sock()).unwrap().ino(), stale);
+}
