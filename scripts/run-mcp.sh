@@ -412,9 +412,11 @@ install_and_run() {
             rm -f "$f" || true
         done
         # They also built and locked in the plugin data directory. Not when
-        # that is the install directory: its lock is the one held here.
+        # that is the install directory, under whatever spelling (-ef
+        # compares the directories, not the text): its lock is the one held
+        # here.
         d=${legacy%/bin}
-        if [ "$d" != "$inst" ]; then
+        if ! [ "$d" -ef "$inst" ]; then
             for f in "$d/target" "$d"/target.*; do
                 [ -d "$f" ] || continue
                 rm -rf "$f" 2>/dev/null || true

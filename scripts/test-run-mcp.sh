@@ -816,15 +816,23 @@ if [ "$rc" = 0 ] && [ "$out" = 'FAKE mcp' ] && [ -d "$r/inst/target/keep" ] \
     && [ -e "$r/data/notes" ]; then pass "$t"
 else fail "$t" "rc=$rc out='$out' data='$(ls -A "$r/data")' inst='$(ls -A "$r/inst")' err='$err'"; fi
 
-# The plugin data directory may be the install directory itself: then its
-# lock is the one in use and stays.
-t='plugin data directory is the install directory'
-r=$(make_repo)
-make_asset "$r"
-run "$r" CLAUDE_PLUGIN_DATA="$r/inst" HXPROBE_RELEASE_BASE="file://$r/rel" PATH="$nocargo_path" --
-if [ "$rc" = 0 ] && [ "$out" = 'FAKE mcp' ] && [ -f "$r/inst/install.lock" ] \
-    && lock_free "$r/inst"; then pass "$t"
-else fail "$t" "rc=$rc out='$out' err='$err'"; fi
+# The plugin data directory may be the install directory itself, also under
+# another spelling (a trailing slash, a link to it): then its lock is the one
+# in use and stays.
+for how in 'the same path' 'a trailing slash' 'a link'; do
+    t="plugin data directory is the install directory ($how)"
+    r=$(make_repo)
+    make_asset "$r"
+    case "$how" in
+        'the same path' ) data="$r/inst" ;;
+        'a trailing slash' ) data="$r/inst/" ;;
+        * ) mkdir -p "$r/inst"; ln -s "$r/inst" "$r/link"; data="$r/link" ;;
+    esac
+    run "$r" CLAUDE_PLUGIN_DATA="$data" HXPROBE_RELEASE_BASE="file://$r/rel" PATH="$nocargo_path" --
+    if [ "$rc" = 0 ] && [ "$out" = 'FAKE mcp' ] && [ -f "$r/inst/install.lock" ] \
+        && lock_free "$r/inst"; then pass "$t"
+    else fail "$t" "rc=$rc out='$out' err='$err'"; fi
+done
 
 # (xvi) A release file that matches its checksum but is not the program of
 # the wanted version (an older one under the new name, or one that gives no
