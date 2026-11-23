@@ -310,6 +310,8 @@ install_and_run() {
     local src=$1 f
     shift
     chmod 700 "$src" || die "cannot make $src executable"
+    # mv would put the file into a directory (or a link to one) of that name.
+    [ ! -d "$bin" ] || die "$bin is a directory; remove it and start again"
     mv -f "$src" "$bin" || die "cannot move $src to $bin"
     tmp_file=''
     if [ -n "$legacy" ]; then

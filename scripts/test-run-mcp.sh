@@ -748,6 +748,22 @@ for have in 9.8.7-rc1 9.8.7+b5 9.8.8-rc1; do
     else fail "$t" "rc=$rc out='$out' err='$err'"; fi
 done
 
+# (xiii) A directory where the program belongs (or a link to one): the
+# install stops instead of moving the program into it.
+for kind in directory 'link to a directory'; do
+    t="program path is a $kind"
+    r=$(make_repo)
+    make_asset "$r"
+    mkdir -p "$r/inst/bin" "$r/elsewhere"
+    if [ "$kind" = directory ]; then mkdir "$r/inst/bin/hxprobe"; else ln -s "$r/elsewhere" "$r/inst/bin/hxprobe"; fi
+    run "$r" HXPROBE_RELEASE_BASE="file://$r/rel" PATH="$nocargo_path" --
+    inside=$(find "$r/inst/bin/hxprobe/" "$r/elsewhere" -mindepth 1 2>/dev/null | wc -l | tr -d ' ')
+    if [ "$rc" = 1 ] && [ -z "$out" ] && [ ! -e "$r/ran" ] && [ "$inside" = 0 ] \
+        && [[ "$err" == *'is a directory'* ]] && [[ "$err" != *'installed hxprobe'* ]] \
+        && [ "$(leftovers "$r/inst")" = 0 ] && lock_free "$r/inst"; then pass "$t"
+    else fail "$t" "rc=$rc out='$out' inside=$inside err='$err'"; fi
+done
+
 if [ "$failures" -ne 0 ]; then
     printf '%d case(s) failed\n' "$failures"
     exit 1
