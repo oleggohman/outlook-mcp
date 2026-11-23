@@ -216,9 +216,30 @@ fn answering(d: &Dir) -> Value {
 
 /// Run the program with `args` (nothing else), within 10 s.
 fn run(args: &[&str]) -> (ExitStatus, String, String) {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_hxprobe"))
-        .args(args)
-        .env_remove("HXPROBE_SERVICE")
+    run_with(args, |_| {})
+}
+
+/// Run `hxprobe service <flag> --cache-dir <cache>` with `HOME` in `d`
+/// (no `--store`), within 10 s; also how long it took.
+fn client(d: &Dir, flag: &str) -> (ExitStatus, String, String, Duration) {
+    let cache = d.cache();
+    let started = Instant::now();
+    let (st, out, err) = run_with(
+        &["service", flag, "--cache-dir", cache.to_str().unwrap()],
+        |cmd| {
+            cmd.env_remove("HXPROBE_TEST_BUILD_DELAY_MS")
+                .env("HOME", &d.0);
+        },
+    );
+    (st, out, err, started.elapsed())
+}
+
+/// [`run`], with `configure` applied to the command.
+fn run_with(args: &[&str], configure: impl FnOnce(&mut Command)) -> (ExitStatus, String, String) {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_hxprobe"));
+    cmd.args(args).env_remove("HXPROBE_SERVICE");
+    configure(&mut cmd);
+    let mut child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -375,7 +396,15 @@ fn start_errors_exit_1() {
 #[test]
 fn usage_errors_exit_2() {
     let _s = serial();
-    for args in [&["--bogus"][..], &["--idle-secs", "soon"], &["--idle-secs"]] {
+    // `spawn_service` always passes `--store`, which `--status` and
+    // `--stop` do not take.
+    for args in [
+        &["--bogus"][..],
+        &["--idle-secs", "soon"],
+        &["--idle-secs"],
+        &["--status"],
+        &["--stop"],
+    ] {
         let d = Dir::new();
         let mut svc = spawn_service(&d, args, &[]);
         assert_eq!(svc.exit(Duration::from_secs(5)).code(), Some(2), "{args:?}");
@@ -420,4 +449,173 @@ fn sigterm_ends_the_service_also_when_started_ignored() {
             });
         }
     });
+}
+
+// --- `--status` and `--stop` ---
+
+#[test]
+fn status_prints_the_reply_as_one_line() {
+    let _s = serial();
+    let d = Dir::new();
+    let svc = spawn_service(&d, &[], &[]);
+    answering(&d);
+    let (st, out, err, _) = client(&d, "--status");
+    assert_eq!(st.code(), Some(0), "{err}");
+    assert!(out.ends_with('\n'), "{out:?}");
+    assert_eq!(out.lines().count(), 1, "{out:?}");
+    let v: Value = serde_json::from_str(out.trim_end()).unwrap();
+    assert_eq!(v["ok"], true);
+    assert_eq!(v["version"], VERSION);
+    assert_eq!(v["pid"], svc.pid());
+}
+
+#[test]
+fn status_without_a_service_exits_1() {
+    let _s = serial();
+    let d = Dir::new();
+    let (st, out, err, _) = client(&d, "--status");
+    assert_eq!(st.code(), Some(1), "{err}");
+    assert_eq!(out, "");
+    assert!(err.contains("not running"), "{err}");
+    // A client creates nothing.
+    assert!(!d.cache().exists());
+}
+
+#[test]
+fn stop_ends_a_service_nobody_waited_for_at_once() {
+    let _s = serial();
+    let d = Dir::new();
+    // Not waited for until the stop is over, as under a server that stays
+    // open: the stopped service is a zombie meanwhile.
+    let mut svc = spawn_service(&d, &[], &[]);
+    answering(&d);
+    let (st, _, err, took) = client(&d, "--stop");
+    assert_eq!(st.code(), Some(0), "{err}");
+    assert!(took < Duration::from_secs(2), "took {took:?}");
+    assert_eq!(
+        request(&d, &Request::Status),
+        Err(ExchangeError::NotRunning)
+    );
+    // Left in place: only the service touches it.
+    assert!(d.cache().join(LOCK_NAME).is_file());
+    assert_eq!(svc.exit(Duration::from_secs(5)).code(), Some(0));
+    assert!(d
+        .log()
+        .contains(&format!("shutdown requested by version {VERSION}")));
+}
+
+#[test]
+fn stop_without_a_service_exits_0_and_creates_nothing() {
+    let _s = serial();
+    let d = Dir::new();
+    let (st, _, err, _) = client(&d, "--stop");
+    assert_eq!(st.code(), Some(0), "{err}");
+    assert!(err.contains("not running"), "{err}");
+    assert!(!d.cache().exists());
+
+    // A cache directory without a service: `service.lock` is not created.
+    std::fs::create_dir(d.cache()).unwrap();
+    let (st, _, err, _) = client(&d, "--stop");
+    assert_eq!(st.code(), Some(0), "{err}");
+    assert!(!d.cache().join(LOCK_NAME).exists());
+}
+
+/// A service played by the test: holds `service.lock` (naming `pid`),
+/// accepts connections and never replies.
+struct SilentService {
+    /// Held for the life of the played service.
+    _lock: std::fs::File,
+    done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl SilentService {
+    fn start(d: &Dir, pid: u32) -> SilentService {
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        std::fs::create_dir(d.cache()).unwrap();
+        std::fs::set_permissions(d.cache(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(d.cache().join(LOCK_NAME))
+            .unwrap();
+        // SAFETY: flock() on a descriptor owned by `lock`.
+        assert_eq!(
+            unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        writeln!(lock, "{pid} {VERSION}").unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(d.sock()).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop = std::sync::Arc::clone(&done);
+        let thread = std::thread::spawn(move || {
+            let mut held = Vec::new();
+            while !stop.load(Ordering::SeqCst) {
+                if let Ok((s, _)) = listener.accept() {
+                    held.push(s);
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        });
+        SilentService {
+            _lock: lock,
+            done,
+            thread: Some(thread),
+        }
+    }
+
+    /// Whether `service.lock` is still held by this test.
+    fn lock_held(&self, d: &Dir) -> bool {
+        let f = std::fs::File::open(d.cache().join(LOCK_NAME)).unwrap();
+        // SAFETY: flock() on a descriptor owned by `f`.
+        let free = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } == 0;
+        !free
+    }
+}
+
+impl Drop for SilentService {
+    fn drop(&mut self) {
+        self.done.store(true, Ordering::SeqCst);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+/// A stand-in process (`sleep 60`) whose pid a played service reports;
+/// killed and waited for on drop.
+fn stand_in() -> Service {
+    Service(
+        Command::new("sleep")
+            .arg("60")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    )
+}
+
+#[test]
+fn stop_of_a_service_that_does_not_answer_exits_1_naming_its_pid() {
+    let _s = serial();
+    let d = Dir::new();
+    let pid = stand_in();
+    let played = SilentService::start(&d, pid.pid());
+    let (st, _, err, took) = client(&d, "--stop");
+    assert_eq!(st.code(), Some(1), "{err}");
+    assert!(took < Duration::from_secs(5), "took {took:?}");
+    assert!(err.contains(&pid.pid().to_string()), "{err}");
+    // Neither taken nor removed nor rewritten.
+    assert!(played.lock_held(&d));
+    assert_eq!(
+        std::fs::read_to_string(d.cache().join(LOCK_NAME)).unwrap(),
+        format!("{} {VERSION}\n", pid.pid())
+    );
+    assert!(!proto::pid_gone(pid.pid()));
 }

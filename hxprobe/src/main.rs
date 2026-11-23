@@ -20,6 +20,8 @@
 //!   hxprobe service [--store <file>] [--cache-dir <dir>] [--refresh-secs <n>]
 //!                   [--idle-secs <n>]
 //!                                    background builder of the MCP cache
+//!   hxprobe service --status|--stop [--cache-dir <dir>]
+//!                                    show or stop that builder
 //!   hxprobe --version                print the version
 //! ```
 //!
@@ -805,6 +807,12 @@ usage:
                                      builds the MCP cache; runs without a
                                      terminal and exits after --idle-secs
                                      (default 1800, 0 = never) without requests
+  hxprobe service --status [--cache-dir <dir>]
+                                     print the status of the running service as
+                                     one JSON line; exit 1 when none answers
+  hxprobe service --stop [--cache-dir <dir>]
+                                     stop the running service (any version) and
+                                     wait until it is gone
   hxprobe --version                  print the version
 
 Work on a snapshot, not the live store: Outlook holds HxStore.lock and
@@ -907,9 +915,22 @@ fn cmd_mcp(args: &[String]) {
     }
 }
 
+/// What `hxprobe service` does.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum ServiceAction {
+    /// Be the service.
+    #[default]
+    Run,
+    /// `--status`: print the running service's status.
+    Status,
+    /// `--stop`: stop the running service.
+    Stop,
+}
+
 /// Options of `hxprobe service`; `None` where not given.
 #[derive(Debug, Default)]
 struct ServiceOptions {
+    action: ServiceAction,
     store: Option<PathBuf>,
     cache_dir: Option<PathBuf>,
     refresh_secs: Option<u64>,
@@ -936,10 +957,63 @@ fn parse_service_options(args: &[String]) -> Result<ServiceOptions, String> {
                     o.idle_secs = Some(n);
                 }
             }
+            "--status" | "--stop" => {
+                if o.action != ServiceAction::Run {
+                    return Err("--status and --stop exclude each other".into());
+                }
+                o.action = if a == "--status" {
+                    ServiceAction::Status
+                } else {
+                    ServiceAction::Stop
+                };
+            }
             other => return Err(format!("unknown service option {other:?}")),
         }
     }
+    if o.action != ServiceAction::Run
+        && (o.store.is_some() || o.refresh_secs.is_some() || o.idle_secs.is_some())
+    {
+        return Err("--status and --stop take only --cache-dir".into());
+    }
     Ok(o)
+}
+
+/// The cache directory of `hxprobe mcp` and `hxprobe service`: `given`,
+/// else `~/Library/Caches/hxprobe-mcp`; `None` without `HOME`.
+fn cache_dir_or_default(given: Option<PathBuf>) -> Option<PathBuf> {
+    given.or_else(|| env::var_os("HOME").map(|h| Path::new(&h).join("Library/Caches/hxprobe-mcp")))
+}
+
+/// `hxprobe service --status` and `--stop`: messages on stderr, the
+/// status on stdout; exit 0 on success, 1 otherwise.
+fn cmd_service_client(action: ServiceAction, cache_dir: Option<PathBuf>) -> ! {
+    use hxprobe::mcp::service;
+    use std::io::Write;
+    let fail = |msg: &str| -> ! {
+        let _ = writeln!(std::io::stderr(), "hxprobe service: {msg}");
+        std::process::exit(1);
+    };
+    let Some(dir) = cache_dir_or_default(cache_dir) else {
+        fail("HOME is not set; pass --cache-dir")
+    };
+    match action {
+        ServiceAction::Status => match service::status_command(&dir) {
+            Ok(line) => {
+                if writeln!(std::io::stdout(), "{line}").is_err() {
+                    std::process::exit(1);
+                }
+            }
+            Err(e) => fail(&e),
+        },
+        ServiceAction::Stop => match service::stop_command(&dir) {
+            Ok(msg) => {
+                let _ = writeln!(std::io::stderr(), "hxprobe service: {msg}");
+            }
+            Err(e) => fail(&e),
+        },
+        ServiceAction::Run => unreachable!("not a client command"),
+    }
+    std::process::exit(0);
 }
 
 /// Block `SIGTERM` and `SIGINT` (with their default action restored, as an
@@ -987,13 +1061,20 @@ fn spawn_signal_thread(set: libc::sigset_t, stop: hxprobe::mcp::service::Stop) {
 /// or the removal of its socket. Exit status 0 then; 1 when it cannot
 /// start, 2 on a usage error, 75 when another service holds the
 /// directory's `service.lock`, 77 when the store cannot be read for lack
-/// of permission.
+/// of permission. With `--status` or `--stop`, see [`cmd_service_client`].
 fn cmd_service(args: &[String]) {
     use hxprobe::mcp::service::{self, CacheBackend, Core, InstanceLock, LockError, Stop};
     use hxprobe::mcp::{self, cache, log, proto};
     use std::io::Write;
     use std::sync::Arc;
 
+    let opts = parse_service_options(args).unwrap_or_else(|e| {
+        let _ = writeln!(std::io::stderr(), "{e}\n\n{USAGE}");
+        std::process::exit(2);
+    });
+    if opts.action != ServiceAction::Run {
+        cmd_service_client(opts.action, opts.cache_dir);
+    }
     mcp::set_log_style(mcp::LogStyle::Service);
     // A panic message could hold mail content: print only where it happened.
     std::panic::set_hook(Box::new(|info| match info.location() {
@@ -1007,10 +1088,6 @@ fn cmd_service(args: &[String]) {
         log(&msg);
         std::process::exit(1);
     };
-    let opts = parse_service_options(args).unwrap_or_else(|e| {
-        let _ = writeln!(std::io::stderr(), "{e}\n\n{USAGE}");
-        std::process::exit(2);
-    });
     let store = opts
         .store
         .or_else(cache::default_store_path)
@@ -1022,9 +1099,7 @@ fn cmd_service(args: &[String]) {
     }
     let store =
         std::fs::canonicalize(&store).unwrap_or_else(|e| fail(format!("{}: {e}", store.display())));
-    let dir = opts
-        .cache_dir
-        .or_else(|| env::var_os("HOME").map(|h| Path::new(&h).join("Library/Caches/hxprobe-mcp")))
+    let dir = cache_dir_or_default(opts.cache_dir)
         .unwrap_or_else(|| fail("HOME is not set; pass --cache-dir".into()));
     let dir = std::path::absolute(&dir).unwrap_or_else(|e| fail(format!("{}: {e}", dir.display())));
     cache::ensure_dir(&dir).unwrap_or_else(|e| fail(e));

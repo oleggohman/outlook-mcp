@@ -938,6 +938,101 @@ where
     }
 }
 
+// --- client commands ---
+
+/// `hxprobe service --status`: the status reply of the service of `dir`
+/// as one JSON line (without its newline); an error when no service
+/// answers.
+pub fn status_command(dir: &Path) -> Result<String, String> {
+    let sock = proto::socket_path(dir)?;
+    match proto::exchange(&sock, &Request::Status, proto::REQUEST_TIMEOUT) {
+        Ok(v) => Ok(v.to_string()),
+        Err(e) => Err(format!("{e} ({})", dir.display())),
+    }
+}
+
+/// `hxprobe service --stop`: ask the service of `dir` to stop, whatever
+/// its version, and wait until its process is gone. `Ok` with a message
+/// when it stopped or none runs; an error naming the pid in
+/// `service.lock` when it does not answer or does not stop in time.
+/// Never takes, creates or removes `service.lock`.
+pub fn stop_command(dir: &Path) -> Result<String, String> {
+    let sock = proto::socket_path(dir)?;
+    let st = match proto::exchange(&sock, &Request::Status, proto::REQUEST_TIMEOUT) {
+        Err(proto::ExchangeError::NotRunning) => {
+            return Ok(format!(
+                "the refresh service is not running ({})",
+                dir.display()
+            ))
+        }
+        Err(e) => return Err(not_stopped(dir, &e.to_string())),
+        Ok(v) => ServiceStatus::from_json(&v).map_err(|e| not_stopped(dir, &e))?,
+    };
+    let shutdown = Request::Shutdown {
+        version: st.version.clone(),
+    };
+    match proto::exchange(&sock, &shutdown, proto::REQUEST_TIMEOUT) {
+        Ok(v) => match proto::ShutdownReply::from_json(&v) {
+            proto::ShutdownReply::Stopping => {}
+            proto::ShutdownReply::VersionMismatch { version } => {
+                return Err(not_stopped(
+                    dir,
+                    &format!("it refused to stop (version {version})"),
+                ))
+            }
+            proto::ShutdownReply::Refused(e) => {
+                return Err(not_stopped(dir, &format!("it refused to stop: {e}")))
+            }
+        },
+        // Gone between the two requests: checked below.
+        Err(proto::ExchangeError::NotRunning) => {}
+        Err(e) => return Err(not_stopped(dir, &e.to_string())),
+    }
+    let deadline = Instant::now() + proto::GONE_WAIT;
+    while !proto::pid_gone(st.pid) {
+        if Instant::now() >= deadline {
+            return Err(not_stopped(
+                dir,
+                &format!("it did not stop within {} s", proto::GONE_WAIT.as_secs()),
+            ));
+        }
+        thread::sleep(proto::GONE_POLL);
+    }
+    Ok(format!(
+        "stopped the refresh service {} (pid {})",
+        st.version, st.pid
+    ))
+}
+
+/// The error of [`stop_command`]: `why`, the pid written in
+/// `service.lock` and how to end that process.
+fn not_stopped(dir: &Path, why: &str) -> String {
+    let path = dir.join(proto::LOCK_NAME);
+    match lock_pid(&path) {
+        Some(pid) => format!(
+            "the refresh service (pid {pid}, from {}) did not stop: {why}; end it with `kill {pid}`",
+            path.display()
+        ),
+        None => format!(
+            "the refresh service did not stop: {why}; no pid in {}",
+            path.display()
+        ),
+    }
+}
+
+/// The pid written in `service.lock` at `path`; read only, never locked.
+fn lock_pid(path: &Path) -> Option<u32> {
+    if !std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file()) {
+        return None;
+    }
+    std::fs::read_to_string(path)
+        .ok()?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
