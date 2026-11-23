@@ -397,8 +397,14 @@ install_and_run() {
     esac
     # mv would put the file into a directory (or a link to one) of that name.
     [ ! -d "$bin" ] || die "$bin is a directory; remove it and start again"
-    # Written first: a record without its program only costs one more
-    # download, a program with the record of another could stay for good.
+    # Written before the move. A launcher killed between the two commands
+    # leaves the new record next to the old program. For most pairs that
+    # costs one more download or nothing (an older program is replaced at
+    # the next start anyway). The accepted exception: a release program that
+    # was to replace a build of the same version leaves `release` next to
+    # the built program, which is then run as it is until the next version.
+    # Written after the move, the same would hold for a build that replaces
+    # an older release program.
     printf '%s\n' "$origin" > "$origin_file" || die "cannot write $origin_file"
     if ! mv -f "$src" "$bin"; then
         rm -f "$origin_file" 2>/dev/null || true
