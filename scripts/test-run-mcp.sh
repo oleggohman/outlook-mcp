@@ -504,7 +504,9 @@ for variant in 'fresh' 'leftover lock of a dead process'; do
         make_cargo_stub "$r" 'sleep 0.3'
         if [ "$variant" != fresh ]; then
             mkdir -p "$r/inst/bin" "$r/inst/target/release" "$r/inst/target.$(dead_pid)/release"
-            ( exec 9>> "$r/inst/install.lock"; lockf -s -t 0 9; exec sleep 30 ) &
+            # The holder waits for the lock: lock_free below holds it for
+            # a moment, and a holder that tried only once could miss it.
+            ( exec 9>> "$r/inst/install.lock"; lockf -s -t 10 9; exec sleep 30 ) &
             holder=$!
             i=0
             while lock_free "$r/inst" && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
@@ -645,7 +647,8 @@ echo \$\$ >> "$r/lockf.pids"
 exec /usr/bin/lockf "\$@"
 EOF
 chmod 755 "$r/stub/lockf"
-( exec 9>> "$r/inst/install.lock"; lockf -s -t 0 9; exec sleep 30 ) &
+# The holder waits for the lock (see above).
+( exec 9>> "$r/inst/install.lock"; lockf -s -t 10 9; exec sleep 30 ) &
 holder=$!
 i=0
 while lock_free "$r/inst" && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
