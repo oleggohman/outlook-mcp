@@ -34,8 +34,9 @@ usage() {
 }
 
 # The text $1 without what tells who signs: the identity, a certificate name
-# (`Developer ID Application: ...` up to a quote or the end of the line), a
-# team in brackets and the home directory.
+# of any kind (`<kind>: <name> (<team>)`, and `Developer ID Application: ...`
+# up to a quote or the end of the line), a team in brackets, the home
+# directory and the user name in any other /Users/<name> path.
 redact() {
     printf '%s\n' "$1" | HXPROBE_REDACT="$HXPROBE_SIGN_IDENTITY" HXPROBE_REDACT_HOME="${HOME:-}" awk '
         function cut(line, what, with,    out, i) {
@@ -52,11 +53,15 @@ redact() {
             if (home == "/") home = ""
             c = "[A-Z0-9]"
             team = "\\(" c c c c c c c c c c "\\)"
+            signer = "[A-Za-z][A-Za-z0-9 ]*: [^\"():]* " team
+            user = "/Users/[^/ \"\047:)]+"
         }
         {
             line = cut(cut($0, id, "<identity>"), home, "<home>")
+            gsub(signer, "<signer>", line)
             gsub(/Developer ID Application:[^"]*/, "<signer>", line)
             gsub(team, "(<team>)", line)
+            gsub(user, "/Users/<user>", line)
             print line
         }'
 }
@@ -66,7 +71,7 @@ redact() {
 # shown only with HXPROBE_SIGN_DEBUG=1, and then through `redact`.
 codesign_failed() {
     if [ "${HXPROBE_SIGN_DEBUG:-}" = 1 ]; then
-        log "what codesign printed (signer, team and home directory removed):"
+        log "what codesign printed (signer, team, home directory and user names removed):"
         redact "$3" >&2
         die "$1 (status $2)"
     fi

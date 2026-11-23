@@ -138,7 +138,7 @@ run_signed() {
 # signer (name, team, a path under HOME) appears in the script's output of
 # case $1.
 no_identity() {
-    ! grep -qF -e "$identity" -e "$identity_hash" -e 'Stub Person' -e 'STUBTEAM' \
+    ! grep -qF -e "$identity" -e "$identity_hash" -e 'Stub Person' -e 'STUBTEAM' -e stubperson \
         -e "$1/home" "$1/out" "$1/err"
 }
 
@@ -294,7 +294,8 @@ else fail "$t" "err='$err'"; fi
 
 # (v-b) With the identity given as a hash, codesign names the signer, the
 # team and a keychain under HOME by itself. None of it is shown, and with
-# HXPROBE_SIGN_DEBUG=1 the output is shown without them.
+# HXPROBE_SIGN_DEBUG=1 the output is shown without them. The same for a
+# certificate of another kind and for a home directory that is not HOME.
 for sign_debug in 0 1; do
     t="signer, team and keychain path hidden (debug $sign_debug)"
     c=$(make_case)
@@ -304,11 +305,13 @@ for sign_debug in 0 1; do
             "$identity_hash" "$c/home"
         printf 'Developer ID Application: Stub Person (STUBTEAM01): no identity found\n'
         printf 'team (STUBTEAM03) has no such certificate\n'
+        printf 'also found "Apple Development: Stub Person (STUBTEAM01)" in /Users/stubperson/Library/Keychains/x\n'
     } > "$c/sign-err"
     run "$c" hash "$c/prog" 9.8.7 arm64
     shown=0
     if [[ "$err" == *'ambiguous (matches "<signer>" and "<signer>" in <home>/Library'* ]] \
-        && [[ "$err" == *'team (<team>) has no such certificate'* ]]; then shown=1; fi
+        && [[ "$err" == *'team (<team>) has no such certificate'* ]] \
+        && [[ "$err" == *'also found "<signer>" in /Users/<user>/Library/Keychains/x'* ]]; then shown=1; fi
     if [ "$rc" = 1 ] && [ -z "$out" ] && [[ "$err" == *'codesign failed (status 1)'* ]] \
         && [ "$shown" = "$sign_debug" ] && no_identity "$c" \
         && [ "$(work_files "$c")" = 0 ]; then pass "$t"
