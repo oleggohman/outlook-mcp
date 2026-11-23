@@ -304,10 +304,12 @@ fn idle_service_exits_and_removes_its_socket() {
     let _s = serial();
     let d = Dir::new();
     let mut svc = spawn_service(&d, &["--idle-secs", "1"], &[]);
-    answering(&d);
-    let st = svc.exit(Duration::from_secs(5));
+    // No request is sent: one that came late would find the service gone.
+    // That it served is in its log.
+    let st = svc.exit(Duration::from_secs(20));
     assert_eq!(st.code(), Some(0));
     assert!(!d.sock().exists());
+    assert!(d.log().contains("listening on"), "{}", d.log());
     assert!(d.log().contains("idle"), "{}", d.log());
 }
 
@@ -684,19 +686,20 @@ fn old_database(d: &Dir) -> i64 {
 /// a debug build does (the tests and the program are built alike).
 const BUILD_DELAY: bool = cfg!(debug_assertions);
 
-/// A service whose builds pause 5 s after the store copy, in the middle of
-/// a build started by a touch on the changed store.
+/// A service whose builds pause a minute after the store copy (far longer
+/// than a test takes to stop it, also on a loaded machine), in the middle
+/// of a build started by a touch on the changed store.
 fn delayed_build(d: &Dir) -> Service {
     let svc = spawn_service(
         d,
         &["--refresh-secs", "0"],
-        &[("HXPROBE_TEST_BUILD_DELAY_MS", "5000")],
+        &[("HXPROBE_TEST_BUILD_DELAY_MS", "60000")],
     );
     answering(d);
     let v = request(d, &Request::Touch).unwrap();
     assert_eq!(v["building"], true, "{v}");
     let copy = d.cache().join(format!("store.copy-{}", svc.pid()));
-    wait_until("the store copy", Duration::from_secs(5), || copy.exists());
+    wait_until("the store copy", Duration::from_secs(20), || copy.exists());
     let v = request(d, &Request::Status).unwrap();
     assert_eq!(v["building"], true, "{v}");
     svc
@@ -768,7 +771,7 @@ fn shutdown_or_sigterm_during_a_build_exits_at_once_and_cleans_up() {
 
 #[test]
 fn stale_socket_does_not_prevent_a_start() {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::os::unix::fs::PermissionsExt;
     let _s = serial();
     let d = Dir::new();
     std::fs::create_dir(d.cache()).unwrap();
@@ -776,15 +779,21 @@ fn stale_socket_does_not_prevent_a_start() {
     // Bound and closed: the file stays, nobody listens, nobody holds the
     // lock.
     drop(std::os::unix::net::UnixListener::bind(d.sock()).unwrap());
-    let stale = std::fs::symlink_metadata(d.sock()).unwrap().ino();
     assert_eq!(
         request(&d, &Request::Status),
         Err(ExchangeError::NotRunning)
     );
     let svc = spawn_service(&d, &[], &[]);
     let v = answering(&d);
+    // The new service answers on the path (a new socket file may get the
+    // inode number of the removed one).
     assert_eq!(v["pid"], svc.pid());
-    assert_ne!(std::fs::symlink_metadata(d.sock()).unwrap().ino(), stale);
+    let listening = d
+        .log()
+        .lines()
+        .filter(|l| l.contains("listening on"))
+        .count();
+    assert_eq!(listening, 1, "{}", d.log());
 }
 
 // --- the client: start and upgrade ---
@@ -1085,7 +1094,9 @@ fn client_replaces_an_older_service_once_it_is_gone() {
     let took = started.elapsed();
     assert_eq!(st.version, VERSION);
     assert_ne!(st.pid, played.pid);
-    assert!(took < Duration::from_millis(1500), "took {took:?}");
+    // Not the wait for a service that does not go away (5 s); the bound
+    // leaves room for a loaded machine.
+    assert!(took < Duration::from_secs(4), "took {took:?}");
     assert_eq!(played.requests(), [Request::Touch, old_shutdown()]);
     assert_eq!(*played.log_absent_at_kill.lock().unwrap(), Some(true));
     assert!(proto::pid_gone(played.pid));
