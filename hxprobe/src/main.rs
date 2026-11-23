@@ -1210,7 +1210,7 @@ fn cmd_service(args: &[String]) {
         idle_secs,
         clock(),
     );
-    let exit = service::serve(core, listener, clock, proto::TICK, stop);
+    let exit = service::serve(core, listener, &socket, clock, proto::TICK, stop);
     // The socket goes first; `service.lock` is released when the process
     // ends. A build still running is abandoned: its temporary files go
     // (the build lock it holds is released with the process).

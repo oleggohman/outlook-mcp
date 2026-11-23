@@ -660,9 +660,11 @@ struct Shared<B> {
 /// Serve requests on `listener` and run the policy of `core` until it, a
 /// `shutdown` request or `stop` ends it; the reason.
 ///
-/// The calling thread runs the policy: it polls `core` after every request,
-/// after every build and every `tick`, starts builds, and checks every
-/// tick that the socket file is still the one bound (removed or replaced:
+/// `socket` is the socket file `listener` was bound to, taken right after
+/// the bind ([`SocketFile::of`]): the path may be replaced before `serve`
+/// runs. The calling thread runs the policy: it polls `core` after every
+/// request, after every build and every `tick`, starts builds, and checks
+/// every tick that `socket` is still there (removed or replaced:
 /// [`Exit::SocketGone`]). An accept thread serves each connection on a
 /// thread of its own (at most [`proto::MAX_CONNECTIONS`] at once, each with
 /// [`proto::CONNECTION_TIMEOUT`]); each build runs on a thread of its own.
@@ -673,6 +675,7 @@ struct Shared<B> {
 pub fn serve<B>(
     core: Core<B>,
     listener: UnixListener,
+    socket: &SocketFile,
     clock: Clock,
     tick: Duration,
     stop: Stop,
@@ -680,7 +683,6 @@ pub fn serve<B>(
 where
     B: Backend + Send + Sync + 'static,
 {
-    let socket = SocketFile::of(&listener).ok();
     let shared = Arc::new(Shared {
         core: Mutex::new(core),
         built: Condvar::new(),
@@ -707,7 +709,7 @@ where
             log(&format!("cannot start the accept thread: {e}"));
             Exit::SocketGone
         }
-        Ok(_) => policy_loop(&shared, socket.as_ref()),
+        Ok(_) => policy_loop(&shared, socket),
     };
     shared.closing.store(true, AtomicOrdering::SeqCst);
     {
@@ -725,7 +727,7 @@ where
 }
 
 /// The policy thread of [`serve`]; returns the end.
-fn policy_loop<B>(shared: &Arc<Shared<B>>, socket: Option<&SocketFile>) -> Exit
+fn policy_loop<B>(shared: &Arc<Shared<B>>, socket: &SocketFile) -> Exit
 where
     B: Backend + Send + Sync + 'static,
 {
@@ -745,7 +747,7 @@ where
                 Action::Wait => {}
             }
         }
-        if !socket.is_some_and(SocketFile::is_present) {
+        if !socket.is_present() {
             return Exit::SocketGone;
         }
         if let Some(e) = shared.stop.wait(shared.tick) {
@@ -1702,6 +1704,7 @@ pub(crate) mod tests {
                 tx
             });
             let listener = bind_socket(&dir.sock()).unwrap();
+            let socket = SocketFile::of(&listener).unwrap();
             let clock = Arc::new(AtomicI64::new(NOW));
             let c = Arc::clone(&clock);
             let stop = Stop::new();
@@ -1710,6 +1713,7 @@ pub(crate) mod tests {
                 let exit = serve(
                     core,
                     listener,
+                    &socket,
                     Arc::new(move || c.load(Ordering::SeqCst)),
                     TEST_TICK,
                     s,
@@ -1990,6 +1994,39 @@ pub(crate) mod tests {
         // The other listener is not serve's to close.
         drop(other);
         assert_eq!(r.exit(REQ), Exit::SocketGone);
+    }
+
+    #[test]
+    fn socket_replaced_before_serve_runs_ends_serve() {
+        let _p = process_lock();
+        let t = TestDir::new();
+        let listener = bind_socket(&t.sock()).unwrap();
+        let socket = SocketFile::of(&listener).unwrap();
+        // Replaced after the bind, before serve runs.
+        std::fs::remove_file(t.sock()).unwrap();
+        let other = UnixListener::bind(t.sock()).unwrap();
+        let stop = Stop::new();
+        let s = stop.clone();
+        let h = thread::spawn(move || {
+            serve(
+                fresh(900, 0),
+                listener,
+                &socket,
+                Arc::new(|| NOW),
+                TEST_TICK,
+                s,
+            )
+        });
+        let started = Instant::now();
+        while !h.is_finished() && started.elapsed() < REQ {
+            thread::sleep(Duration::from_millis(5));
+        }
+        // Ends a serve that missed it, so the test does not hang.
+        stop.request(Exit::Signal);
+        assert_eq!(h.join().unwrap(), Exit::SocketGone);
+        // The other listener is not serve's to close.
+        assert!(UnixStream::connect(t.sock()).is_ok());
+        drop(other);
     }
 
     // --- robustness ---
