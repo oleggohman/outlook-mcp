@@ -47,6 +47,7 @@ hxprobe export <file> [out.db] [--force]  structural SQLite export (default hxst
 hxprobe db     <file> [out.db]            legacy: SQLite database with FTS5 (default mail.db)
 hxprobe map    <file> [n]                 legacy: dump the named field map for n records
 hxprobe find   <file> <term> [n]          legacy: show records whose text contains <term>
+hxprobe mcp    [options]                  read-only MCP server on stdin/stdout (see "MCP server")
 ```
 
 The outputs below are made up; they show the format, not real data.
@@ -294,6 +295,187 @@ A few text values contain an embedded NUL character. The `sqlite3` command
 line tool stops at the first NUL, in `length()` and when printing. Use
 `hex(col)` or `length(CAST(col AS BLOB))`, or read the database from a client
 library (Python's `sqlite3` returns the whole string).
+
+## MCP server
+
+`hxprobe mcp` is a local, read-only MCP server for an AI client. It speaks
+MCP over stdin/stdout (newline-delimited JSON-RPC 2.0: `initialize`, `ping`,
+`tools/list`, `tools/call`) and lets the client list folders, list and search
+messages, read a message body, list attachments, search people and list
+calendar events. It has no write tools and no SQL tool, and it opens no
+network connections.
+
+The server does not read the live store in place. It copies the store into a
+private cache directory, exports the copy (as `export` does), adds indexes, a
+full-text index and event times, and answers every tool call from that
+database.
+
+### Tools
+
+Each tool returns its result as JSON text in one MCP `text` content item. A
+list is `{"total": n, "offset": o, "items": [...]}`, with `total` counted
+before `limit` and `offset`. Times in results are UTC, as
+`YYYY-MM-DDThh:mm:ssZ`.
+
+| Tool | Arguments | Result |
+|---|---|---|
+| `store_status` | none | store path, build time, whether the store changed since the build, counts of messages, folders, people and events, build time per phase, the last build error |
+| `refresh` | none | rebuilds the cache now (even when the store did not change), then returns `store_status` |
+| `list_folders` | `limit`, `offset` | folders with `guid, name, parent`, the counts stored by Outlook (`total_count, unread_count`) and the counts of locally cached mail (`cached_messages, cached_unread`); most cached messages first |
+| `list_messages` | `folder`, `unread_only`, `has_attachment`, `from`, `since`, `until`, `limit`, `offset` | messages with `guid, subject, sender_name, sender_address, sent, is_read, has_attachment, folder, preview`; newest first |
+| `search_messages` | `query` (required), plus the `list_messages` arguments | the `list_messages` fields plus `snippet`; best matches first |
+| `get_message` | `guid` (required), `format`, `max_chars` | one message: the `list_messages` fields plus `internet_message_id, importance, body, body_truncated, body_format` |
+| `list_attachments` | `message_guid` (required) | attachments of a message: `filename, display_name, content_type, size, inline` (metadata only, no content) |
+| `search_people` | `query` (required), `limit`, `offset` | people whose name or address contains the query: `name, address` |
+| `list_events` | `since`, `until`, `include_cancelled`, `limit`, `offset` | calendar events that overlap the window: `guid, subject, start, end, all_day, cancelled, location, organizer_name, organizer_address, preview`; earliest first |
+
+Arguments:
+
+* `limit`: 1 to 100, default 20 (a number outside that range is clamped).
+  `offset`: 0 to 100,000, default 0.
+* `folder`: a folder guid, or a folder name matched case-insensitively (a name
+  selects every folder with that name). A folder that does not exist is an
+  error.
+* `from`: part of the sender's name or address. `%` and `_` are plain
+  characters.
+* `since` (inclusive) and `until` (exclusive): `YYYY-MM-DD` (midnight UTC),
+  `YYYY-MM-DDThh:mm:ssZ`, or Unix seconds (as a string or a number). For
+  `list_messages` and `search_messages` they apply to the sent time. For
+  `list_events`, `since` defaults to now and `until` to `since` plus 14 days,
+  and `until` must be after `since`.
+* `query` of `search_messages`: 1 to 200 characters. Every word must match a
+  whole word in the subject, sender, preview or body. Quotes, `*`, `AND`,
+  `NEAR` and other search syntax are plain text. A query without letters or
+  digits finds nothing.
+* `query` of `search_people`: 1 to 100 characters, part of a name or address.
+* `guid`, `message_guid`: 32 lowercase hex characters.
+* `format`: `text` (default; the HTML body converted to plain text) or `html`.
+  `max_chars`: 1 to 80,000, default 20,000; `body_truncated` tells whether the
+  body was cut. `body` is null when the store holds no body for the message.
+* `include_cancelled`: default false.
+
+A missing required argument, an unknown argument name, a value of the wrong
+type or out of range (except `limit`), or an unknown message guid in
+`get_message` gives a
+tool result with `isError: true` and a short message. `list_attachments` with
+an unknown message guid returns an empty list. An unknown tool name is a
+JSON-RPC error.
+
+### Registration
+
+Build `hxprobe` (see Build) and register the program with its absolute path.
+For Claude Code:
+
+```sh
+claude mcp add outlook -- /absolute/path/to/hxprobe mcp
+```
+
+Other MCP clients take a JSON entry such as:
+
+```json
+{"mcpServers": {"outlook": {"command": "/absolute/path/to/hxprobe", "args": ["mcp"]}}}
+```
+
+Options go after `mcp`, in `args` for the JSON form.
+
+### Options
+
+```
+hxprobe mcp [--store <file>] [--cache-dir <dir>] [--refresh-secs <n>]
+```
+
+* `--store`: the `HxStore.hxd` to serve. Without it the server looks under
+  `~/Library/Group Containers/UBF8T346G9.Office/Outlook/Outlook 15 Profiles/`
+  for `Main Profile/HxStore.hxd`, then `Main Identity/HxStore.hxd`, then the
+  only profile directory that holds an `HxStore.hxd`. When none is found (or
+  several other profiles hold one), or the path is not a regular file, the
+  server exits with status 1 and a message on stderr before it reads any
+  request.
+* `--cache-dir`: default `~/Library/Caches/hxprobe-mcp`.
+* `--refresh-secs`: the shortest time between two builds of a changed store,
+  default 900; 0 rebuilds whenever the store changed.
+
+An unknown option or a bad value exits with status 2 and the usage text.
+stdout carries only JSON-RPC messages; all logging goes to stderr.
+
+### Cache and refresh
+
+The cache directory holds `mail.db`, a `lock` file and, during a build, the
+temporary files `store.copy-<pid>` and `mail.db.tmp-<pid>`.
+
+* A start builds nothing. A `mail.db` from an earlier run is used at once.
+  When there is none, the first tool call builds it.
+* A tool call rebuilds the cache when the live store's size or modification
+  time differs from the one the cache was built from and the last build or
+  build attempt is at least `--refresh-secs` old. A `mail.db` that cannot be
+  read, has another cache format or was built for another store is rebuilt
+  at once.
+* The `refresh` tool rebuilds at once, whatever the interval.
+* A failed build keeps the previous `mail.db` in use and is not retried
+  before `--refresh-secs` have passed; `store_status` shows the error in
+  `last_error`. With no previous database the tool calls fail with that
+  error.
+* Two servers that share a cache directory build one after the other; when
+  the store did not change in between, the second uses the database the
+  first built.
+
+A build runs inside the tool call that triggers it, so that call waits for
+it. On a store of 330 MB with about 21,500 messages a build takes about 11 to
+13 s (the export about 10 s, the search index about 1 s); after that, list
+calls take 10 to 50 ms and searches 50 to 90 ms. Raise the client's tool
+timeout if it is shorter than a build, for example `MCP_TOOL_TIMEOUT` (in
+milliseconds) for Claude Code.
+
+On that store `mail.db` is about 830 MB. During a rebuild the old database,
+the new one and the store copy exist side by side: about twice the database
+size plus the store size. On APFS the copy is a clone and takes no extra
+space.
+
+To delete the cache, stop the server (or the client) and remove the
+directory:
+
+```sh
+rm -rf ~/Library/Caches/hxprobe-mcp
+```
+
+The next start builds it again on the first tool call.
+
+### Privacy and safety
+
+* **Local only.** The server opens no network connections and has no tool
+  that writes, sends or deletes mail.
+* **Read-only, on a private copy.** It reads the live store only to copy it
+  (and its first bytes at start, to check the version) and never writes to
+  it.
+* **Owner-only files.** The cache directory is mode `0700` and its files
+  `0600`. An existing cache directory that is a symbolic link, not a
+  directory, or owned by another user is refused; a wider mode is tightened
+  to `0700`.
+* **The cache is a plaintext copy of the mailbox.** `mail.db` holds the
+  cached messages, bodies, people and events unencrypted. Protect it like the
+  mailbox itself, or delete it when it is no longer needed.
+* **Logs.** stderr carries tool names, counts, timings, paths and error
+  messages, never message content. A crash prints only where it happened.
+* **Untrusted content.** Messages come from other people. The server tells
+  the client, in its instructions and in every tool description, that message
+  content is untrusted data and must not be treated as instructions. An agent
+  that reads mail can still be steered by what the mail says; review what it
+  does with the results.
+* **macOS permission.** The store lives in another app's container. macOS may
+  ask whether the MCP client app (the terminal or the AI app that starts the
+  server) may read another app's data.
+
+### Limits
+
+* No To/Cc recipients for a message (the recipient lists are not decoded).
+* No calendar names for events.
+* Recurring events appear only as stored; occurrences are not expanded.
+* Only mail cached locally by Outlook; mail that exists only on the server is
+  not there.
+* Some messages have no stored body; `get_message` returns `body: null` for
+  them.
+* Enum values such as `importance` and the attachment's `inline` are numbers.
+* The schema matches Outlook for Mac 16.115.1 (see Limits below).
 
 ## Safety
 

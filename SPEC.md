@@ -449,6 +449,13 @@ after the current date (system clock), and reports it as Unix seconds; a value
 outside that window is exported as NULL. **Verified**: `SentTime` is set in
 every `MessageHeader` object.
 
+`AppointmentHeader.TimeRangeUtc` is a 16-byte property, so `export` writes it
+like a GUID, as 32 hex characters (§7.2, §9). Its bytes are two little-endian
+`u64` tick values: the start of the appointment, then its end. `hxprobe mcp`
+reads event times from it. **Verified**: 1,233 of 1,233 `AppointmentHeader`
+objects on the reference store give a start between 2021 and 2027 and an end
+at or after the start.
+
 `dump` of an item without a usable schema checks every offset from 16 to
 `fixed_len - 8` against the window, which can produce false hits
 (**Inferred**). The generic rows of `export` hold no times.
