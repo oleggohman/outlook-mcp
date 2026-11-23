@@ -44,6 +44,56 @@ pub trait Backend {
     fn store_denied(&self) -> bool;
 }
 
+/// The real [`Backend`]: the store and `mail.db` in the cache directory.
+#[derive(Debug)]
+pub struct CacheBackend {
+    dir: PathBuf,
+    store: PathBuf,
+}
+
+impl CacheBackend {
+    /// The backend for `store` with the cache directory `dir`.
+    pub fn new(dir: &Path, store: &Path) -> CacheBackend {
+        CacheBackend {
+            dir: dir.to_path_buf(),
+            store: store.to_path_buf(),
+        }
+    }
+}
+
+impl Backend for CacheBackend {
+    fn store_stamp(&self) -> io::Result<(u64, i64)> {
+        cache::stamp(&self.store)
+    }
+
+    fn db_id(&self) -> Option<FileId> {
+        cache::file_id(&self.dir.join(cache::DB_NAME))
+    }
+
+    fn db(&self) -> Option<(FileId, DbInfo)> {
+        // Accepted only when the file was the same before and after it was
+        // read; one more try when it was replaced meanwhile.
+        for _ in 0..2 {
+            let before = self.db_id()?;
+            let info = cache::db_info(&self.dir, &self.store);
+            if self.db_id() == Some(before) {
+                return info.map(|i| (before, i));
+            }
+        }
+        None
+    }
+
+    fn build(&self, now: i64) -> Result<(), String> {
+        cache::Cache::new(&self.dir, &self.store)?
+            .build(now)
+            .map(drop)
+    }
+
+    fn store_denied(&self) -> bool {
+        File::open(&self.store).is_err_and(|e| e.kind() == io::ErrorKind::PermissionDenied)
+    }
+}
+
 /// Why the service ends.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Exit {
@@ -57,6 +107,34 @@ pub enum Exit {
     SocketGone,
     /// The store cannot be read for lack of permission.
     Permission,
+}
+
+/// Exit status of `hxprobe service` when another service holds
+/// `service.lock`.
+pub const EXIT_BUSY: i32 = 75;
+/// Exit status of `hxprobe service` when the store cannot be read for lack
+/// of permission.
+pub const EXIT_PERMISSION: i32 = 77;
+
+impl Exit {
+    /// The exit status of the process.
+    pub fn code(self) -> i32 {
+        match self {
+            Exit::Permission => EXIT_PERMISSION,
+            Exit::Idle | Exit::Shutdown | Exit::Signal | Exit::SocketGone => 0,
+        }
+    }
+
+    /// The reason, for the log.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Exit::Idle => "idle",
+            Exit::Shutdown => "shutdown requested",
+            Exit::Signal => "signal",
+            Exit::SocketGone => "socket removed",
+            Exit::Permission => "the store cannot be read: permission denied",
+        }
+    }
 }
 
 /// Why a build starts.

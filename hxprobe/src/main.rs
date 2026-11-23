@@ -17,6 +17,10 @@
 //!   hxprobe find   <file> <term>     show records whose text contains <term>
 //!   hxprobe mcp [--store <file>] [--cache-dir <dir>] [--refresh-secs <n>]
 //!                                    MCP server over stdin/stdout
+//!   hxprobe service [--store <file>] [--cache-dir <dir>] [--refresh-secs <n>]
+//!                   [--idle-secs <n>]
+//!                                    background builder of the MCP cache
+//!   hxprobe --version                print the version
 //! ```
 //!
 //! The file is memory-mapped throughout and never read into an owned buffer, so
@@ -795,6 +799,13 @@ usage:
                                      --cache-dir to ~/Library/Caches/hxprobe-mcp,
                                      --refresh-secs (shortest time between two
                                      rebuilds of a changed store) to 900
+  hxprobe service [--store <file>] [--cache-dir <dir>] [--refresh-secs <n>]
+                  [--idle-secs <n>]
+                                     the one process per cache directory that
+                                     builds the MCP cache; runs without a
+                                     terminal and exits after --idle-secs
+                                     (default 1800, 0 = never) without requests
+  hxprobe --version                  print the version
 
 Work on a snapshot, not the live store: Outlook holds HxStore.lock and
 rewrites the file while it runs.";
@@ -896,8 +907,192 @@ fn cmd_mcp(args: &[String]) {
     }
 }
 
+/// Options of `hxprobe service`; `None` where not given.
+#[derive(Debug, Default)]
+struct ServiceOptions {
+    store: Option<PathBuf>,
+    cache_dir: Option<PathBuf>,
+    refresh_secs: Option<u64>,
+    idle_secs: Option<u64>,
+}
+
+/// Parse the options after `service`; a usage error message on failure.
+fn parse_service_options(args: &[String]) -> Result<ServiceOptions, String> {
+    let mut o = ServiceOptions::default();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        let mut value = || it.next().ok_or_else(|| format!("{a} needs a value"));
+        match a.as_str() {
+            "--store" => o.store = Some(PathBuf::from(value()?)),
+            "--cache-dir" => o.cache_dir = Some(PathBuf::from(value()?)),
+            "--refresh-secs" | "--idle-secs" => {
+                let v = value()?;
+                let n = v
+                    .parse()
+                    .map_err(|_| format!("{a}: {v:?} is not a number"))?;
+                if a == "--refresh-secs" {
+                    o.refresh_secs = Some(n);
+                } else {
+                    o.idle_secs = Some(n);
+                }
+            }
+            other => return Err(format!("unknown service option {other:?}")),
+        }
+    }
+    Ok(o)
+}
+
+/// Block `SIGTERM` and `SIGINT` (with their default action restored, as an
+/// inherited "ignore" would discard them) and ignore `SIGHUP`. Called
+/// before any thread exists, so every thread inherits the mask and only
+/// [`spawn_signal_thread`] receives the two signals.
+fn block_stop_signals() -> libc::sigset_t {
+    // SAFETY: plain system calls on a local signal set; no thread exists
+    // yet whose signal handling could change meanwhile.
+    unsafe {
+        libc::signal(libc::SIGTERM, libc::SIG_DFL);
+        libc::signal(libc::SIGINT, libc::SIG_DFL);
+        libc::signal(libc::SIGHUP, libc::SIG_IGN);
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGTERM);
+        libc::sigaddset(&mut set, libc::SIGINT);
+        libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
+        set
+    }
+}
+
+/// Wait for one of the signals in `set` on a thread of its own, then ask
+/// the service to stop.
+fn spawn_signal_thread(set: libc::sigset_t, stop: hxprobe::mcp::service::Stop) {
+    use hxprobe::mcp::{log, service::Exit};
+    let started = std::thread::Builder::new()
+        .name("signals".into())
+        .spawn(move || loop {
+            let mut sig: libc::c_int = 0;
+            // SAFETY: `set` and `sig` are valid for the call.
+            if unsafe { libc::sigwait(&set, &mut sig) } == 0 {
+                log(&format!("signal {sig} received"));
+                stop.request(Exit::Signal);
+                return;
+            }
+        });
+    if let Err(e) = started {
+        log(&format!("cannot wait for signals: {e}"));
+    }
+}
+
+/// `hxprobe service`: build and refresh the MCP cache of one directory for
+/// the MCP servers that use it, until idle, a `shutdown` request, a signal,
+/// or the removal of its socket. Exit status 0 then; 1 when it cannot
+/// start, 2 on a usage error, 75 when another service holds the
+/// directory's `service.lock`, 77 when the store cannot be read for lack
+/// of permission.
+fn cmd_service(args: &[String]) {
+    use hxprobe::mcp::service::{self, CacheBackend, Core, InstanceLock, LockError, Stop};
+    use hxprobe::mcp::{self, cache, log, proto};
+    use std::io::Write;
+    use std::sync::Arc;
+
+    mcp::set_log_style(mcp::LogStyle::Service);
+    // A panic message could hold mail content: print only where it happened.
+    std::panic::set_hook(Box::new(|info| match info.location() {
+        Some(l) => log(&format!("internal error at {}:{}", l.file(), l.line())),
+        None => log("internal error"),
+    }));
+    // SAFETY: umask() has no preconditions and cannot fail.
+    unsafe { libc::umask(0o077) };
+    let signals = block_stop_signals();
+    let fail = |msg: String| -> ! {
+        log(&msg);
+        std::process::exit(1);
+    };
+    let opts = parse_service_options(args).unwrap_or_else(|e| {
+        let _ = writeln!(std::io::stderr(), "{e}\n\n{USAGE}");
+        std::process::exit(2);
+    });
+    let store = opts
+        .store
+        .or_else(cache::default_store_path)
+        .unwrap_or_else(|| {
+            fail("no Outlook store found under the default profile directory; pass --store".into())
+        });
+    if !std::fs::metadata(&store).is_ok_and(|m| m.is_file()) {
+        fail(format!("{} is not a store file", store.display()));
+    }
+    let store =
+        std::fs::canonicalize(&store).unwrap_or_else(|e| fail(format!("{}: {e}", store.display())));
+    let dir = opts
+        .cache_dir
+        .or_else(|| env::var_os("HOME").map(|h| Path::new(&h).join("Library/Caches/hxprobe-mcp")))
+        .unwrap_or_else(|| fail("HOME is not set; pass --cache-dir".into()));
+    let dir = std::path::absolute(&dir).unwrap_or_else(|e| fail(format!("{}: {e}", dir.display())));
+    cache::ensure_dir(&dir).unwrap_or_else(|e| fail(e));
+    let sock = proto::socket_path(&dir).unwrap_or_else(|e| fail(e));
+
+    let _lock = match InstanceLock::acquire(&dir) {
+        Ok(l) => l,
+        Err(LockError::Busy) => {
+            log("another service holds the lock; exiting");
+            std::process::exit(service::EXIT_BUSY);
+        }
+        Err(LockError::Failed(e)) => fail(e),
+    };
+    let backend = CacheBackend::new(&dir, &store);
+    if service::Backend::store_denied(&backend) {
+        log(&format!(
+            "{} cannot be read: permission denied; exiting",
+            store.display()
+        ));
+        std::process::exit(service::EXIT_PERMISSION);
+    }
+    let refresh_secs = opts.refresh_secs.unwrap_or(cache::DEFAULT_REFRESH_SECS);
+    let idle_secs = opts.idle_secs.unwrap_or(proto::DEFAULT_IDLE_SECS);
+    log(&format!(
+        "version {}, store {}, cache {}, refresh {refresh_secs} s, idle {idle_secs} s",
+        proto::VERSION,
+        store.display(),
+        dir.display()
+    ));
+    let listener = service::bind_socket(&sock)
+        .unwrap_or_else(|e| fail(format!("bind {}: {e}", sock.display())));
+    let socket = service::SocketFile::of(&listener)
+        .unwrap_or_else(|e| fail(format!("{}: {e}", sock.display())));
+    log(&format!("listening on {}", sock.display()));
+
+    let stop = Stop::new();
+    spawn_signal_thread(signals, stop.clone());
+    let clock: service::Clock = Arc::new(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs() as i64)
+    });
+    let core = Core::new(
+        backend,
+        store.to_string_lossy().into_owned(),
+        refresh_secs,
+        idle_secs,
+        clock(),
+    );
+    let exit = service::serve(core, listener, clock, proto::TICK, stop);
+    // The socket goes first; `service.lock` is released when the process
+    // ends.
+    socket.remove_if_ours();
+    log(&format!("exiting: {}", exit.as_str()));
+    std::process::exit(exit.code());
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
+    if args.get(1).map(String::as_str) == Some("--version") {
+        println!("hxprobe {}", hxprobe::mcp::proto::VERSION);
+        return;
+    }
+    // `service` takes only options, all optional.
+    if args.get(1).map(String::as_str) == Some("service") {
+        cmd_service(&args[2..]);
+        return;
+    }
     // `mcp` takes only options, all optional.
     if args.get(1).map(String::as_str) == Some("mcp") {
         cmd_mcp(&args[2..]);
