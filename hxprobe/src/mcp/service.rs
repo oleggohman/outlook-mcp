@@ -917,6 +917,29 @@ fn read_line(mut s: &UnixStream, timeout: Duration) -> Line {
     }
 }
 
+/// Most characters of a text from a client written to the log.
+const LOG_TEXT_CHARS: usize = 64;
+
+/// `text` from a client for one log line: every character that is not
+/// printable ASCII replaced by `?`, cut after [`LOG_TEXT_CHARS`].
+fn for_log(text: &str) -> String {
+    let mut out: String = text
+        .chars()
+        .take(LOG_TEXT_CHARS)
+        .map(|c| {
+            if c.is_ascii_graphic() || c == ' ' {
+                c
+            } else {
+                '?'
+            }
+        })
+        .collect();
+    if text.chars().nth(LOG_TEXT_CHARS).is_some() {
+        out.push_str("...");
+    }
+    out
+}
+
 /// Write `v` as one line; errors are ignored (the client went away).
 fn reply(mut s: &UnixStream, v: &Value) {
     let _ = s.write_all(format!("{v}\n").as_bytes());
@@ -946,7 +969,10 @@ where
     let now = (shared.clock)();
     let mut core = relock(&shared.core);
     if let Request::Shutdown { version } = &req {
-        log(&format!("shutdown requested by version {version}"));
+        log(&format!(
+            "shutdown requested by version {}",
+            for_log(version)
+        ));
     }
     let handled = core.handle(&req, now);
     if let Some(reason) = handled.build {
@@ -2186,6 +2212,17 @@ pub(crate) mod tests {
         let mut fits = vec![b'x'; proto::MAX_REQUEST_BYTES];
         fits.push(b'\n');
         assert!(matches!(line(&fits), Line::Text(t) if t.len() == proto::MAX_REQUEST_BYTES + 1));
+    }
+
+    #[test]
+    fn client_text_is_short_and_printable_in_the_log() {
+        assert_eq!(for_log("0.2.0-rc1+b"), "0.2.0-rc1+b");
+        assert_eq!(
+            for_log("1.0\n2026 forged line\r\x1b[31m\u{2028}\u{e9}"),
+            "1.0?2026 forged line??[31m??"
+        );
+        let long = for_log(&"9".repeat(4000));
+        assert_eq!(long, format!("{}...", "9".repeat(LOG_TEXT_CHARS)));
     }
 
     #[test]
