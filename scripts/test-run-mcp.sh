@@ -142,6 +142,17 @@ leftovers() {
     find "$1" -mindepth 1 \( -name '.download.*' -o -name '.build.*' -o -name 'target' -o -name 'target.*' \) | wc -l | tr -d ' '
 }
 
+# The recorded origin of the program in install directory $1, or `none`.
+origin_of() { cat "$1/bin/.origin" 2>/dev/null || echo none; }
+
+# A curl stub in $1/stub that records its arguments in $1/curl-args and
+# fails as curl does for a download that cannot be made.
+make_curl_fail() {
+    mkdir -p "$1/stub"
+    printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "%s/curl-args"\nexit 22\n' "$1" > "$1/stub/curl"
+    chmod 755 "$1/stub/curl"
+}
+
 # The pid of a process that has ended.
 dead_pid() {
     sh -c 'exit 0' & local p=$!
@@ -226,15 +237,16 @@ run "$r" HXPROBE_BIN="$r/missing" --
 if [ "$rc" = 1 ] && [ -z "$out" ] && [[ "$err" == 'hxprobe plugin: HXPROBE_BIN is set'* ]]; then pass "$t"
 else fail "$t" "rc=$rc out='$out' err='$err'"; fi
 
-# (ii) An installed program that reports the wanted version is run from the
-# stable path without a download, without arguments too (bash 3.2 with set -u
-# and an empty "$@"). Legacy programs stay: nothing was installed.
+# (ii) An installed release program that reports the wanted version is run
+# from the stable path without a download, without arguments too (bash 3.2
+# with set -u and an empty "$@"). Legacy programs stay: nothing was installed.
 t='installed program of the version'
 r=$(make_repo)
 make_asset "$r"
 make_curl_probe "$r"
 mkdir -p "$r/inst/bin" "$r/data/bin"
 make_fake "$r/inst/bin/hxprobe" "$r/inst-ran" '' "$version"
+echo "release $(printf '0%.0s' $(seq 64))" > "$r/inst/bin/.origin"
 make_fake "$r/data/bin/hxprobe-0.1.0" "$r/old-ran"
 run "$r" HXPROBE_RELEASE_BASE="file://$r/rel" PATH="$r/stub:$nocargo_path" --
 if [ "$rc" = 0 ] && [ "$out" = 'FAKE mcp' ] && [ -z "$err" ] \
@@ -279,6 +291,7 @@ if [ "$rc" = 0 ] && [ "$out" = 'FAKE mcp --refresh-secs 0' ] && [ "$(mode_of "$b
     && [ "$(mode_of "$r/inst")" = 700 ] && [ "$(mode_of "$r/inst/bin")" = 700 ] \
     && [ "$(cat "$r/ran.path")" = "$b" ] && cmp -s "$b" "$r/rel/v$version/$asset" \
     && [ "$left" = 0 ] && [ -e "$r/data/bin/notes" ] && lock_free "$r/inst" \
+    && [ "$(origin_of "$r/inst")" = "release $sum" ] \
     && [[ "$err" == *'checksum of '"$asset"' verified'* ]]; then pass "$t"
 else fail "$t" "rc=$rc out='$out' mode=$(mode_of "$b") left=$left err='$err'"; fi
 
@@ -390,7 +403,8 @@ for kind in older 'without --version'; do
         && [ "$(cat "$r/ran.path")" = "$b" ] && [ "$(inode "$b")" != "$ino" ] \
         && cmp -s "$b" "$r/rel/v$version/$asset" && [ "$(mode_of "$b")" = 700 ] \
         && [ "$(cat "$r/curl-lock")" = held ] && [ "$(leftovers "$r/inst")" = 0 ] \
-        && [ "$(find "$r/inst/bin" -mindepth 1 | wc -l | tr -d ' ')" = 1 ] \
+        && [ "$(find "$r/inst/bin" -mindepth 1 | wc -l | tr -d ' ')" = 2 ] \
+        && [[ "$(origin_of "$r/inst")" == 'release '* ]] \
         && lock_free "$r/inst"; then pass "$t"
     else fail "$t" "rc=$rc out='$out' lock='$(cat "$r/curl-lock" 2>/dev/null || true)' err='$err'"; fi
 done
@@ -463,7 +477,7 @@ if [ "$rc" = 0 ] && [ "$out" = 'BUILT mcp' ] && [ "$(mode_of "$b")" = 700 ] \
     && [ "$(inode "$b")" != "$ino" ] && [ ! -e "$r/old-ran" ] \
     && [ ! -e "$r/data/bin/hxprobe-0.1.0" ] && [ "$(leftovers "$r/inst")" = 0 ] \
     && [ "$(printf '%s\n' "$err" | grep -c 'Full Disk Access')" = 1 ] \
-    && lock_free "$r/inst"; then pass "$t"
+    && [ "$(origin_of "$r/inst")" = build ] && lock_free "$r/inst"; then pass "$t"
 else fail "$t" "rc=$rc out='$out' err='$err'"; fi
 
 # (vii) The install lock. A lock directory left by an earlier launcher is
@@ -737,6 +751,7 @@ for have in 9.8.7-rc1 9.8.7+b5 9.8.8-rc1; do
     make_curl_probe "$r"
     mkdir -p "$r/inst/bin"
     make_fake "$r/inst/bin/hxprobe" "$r/old-ran" '' "$have"
+    echo "release $(printf '0%.0s' $(seq 64))" > "$r/inst/bin/.origin"
     run "$r" HXPROBE_RELEASE_BASE="file://$r/rel" PATH="$r/stub:$nocargo_path" --
     ok=0
     case "$have" in
@@ -826,6 +841,110 @@ for kind in older 'no version'; do
         && [ "$(leftovers "$r/inst")" = 0 ] && lock_free "$r/inst"; then pass "$t"
     else fail "$t" "rc=$rc out='$out' err='$err'"; fi
 done
+
+# (xvii) Where the installed program came from. A program built here (the
+# record says so, or there is none) is replaced by the release program of
+# the same version once the checksum file lists one; the release program is
+# then run without another download.
+for record in build none; do
+    t="built program replaced by the release (record: $record)"
+    r=$(make_repo)
+    make_asset "$r"
+    make_curl_probe "$r"
+    make_cargo_stub "$r" ''
+    mkdir -p "$r/inst/bin"
+    make_fake "$r/inst/bin/hxprobe" "$r/old-ran" '' "$version"
+    if [ "$record" = build ]; then echo build > "$r/inst/bin/.origin"; fi
+    ino=$(inode "$r/inst/bin/hxprobe")
+    want=$(awk '{ print $1 }' "$r/release/SHA256SUMS")
+    run "$r" HXPROBE_RELEASE_BASE="file://$r/rel" PATH="$r/stub:$nocargo_path" --
+    rc1=$rc; out1=$out; err1=$err
+    ino1=$(inode "$r/inst/bin/hxprobe")
+    rm -f "$r/ran"
+    run "$r" HXPROBE_RELEASE_BASE="file://$r/rel" PATH="$r/stub:$nocargo_path" --
+    if [ "$rc1" = 0 ] && [ "$out1" = 'FAKE mcp' ] && [ ! -e "$r/old-ran" ] \
+        && [ "$ino1" != "$ino" ] && cmp -s "$r/inst/bin/hxprobe" "$r/rel/v$version/$asset" \
+        && [ "$(origin_of "$r/inst")" = "release $want" ] && [ "$(cat "$r/curl-lock")" = held ] \
+        && [ "$rc" = 0 ] && [ "$out" = 'FAKE mcp' ] && [ -e "$r/ran" ] && [ -z "$err" ] \
+        && [ "$(inode "$r/inst/bin/hxprobe")" = "$ino1" ] \
+        && [ "$(wc -l < "$r/curl-args" | tr -d ' ')" = 1 ] && [ ! -e "$r/builds" ] \
+        && [ "$(leftovers "$r/inst")" = 0 ] && lock_free "$r/inst"; then pass "$t"
+    else fail "$t" "rc=$rc1/$rc out='$out1'/'$out' origin='$(origin_of "$r/inst")' err='$err1' / '$err'"; fi
+done
+
+# (xvii-b) A download that fails is no reason to build while a program that
+# answers is installed: that one is run, with a log line, and stays as it is.
+# This holds for a built program of the wanted version and for an older one.
+for have in "$version" 9.8.6; do
+    t="download fails, installed $have is run"
+    r=$(make_repo)
+    make_asset "$r"
+    make_curl_fail "$r"
+    make_cargo_stub "$r" ''
+    mkdir -p "$r/inst/bin"
+    make_fake "$r/inst/bin/hxprobe" "$r/old-ran" '' "$have"
+    echo build > "$r/inst/bin/.origin"
+    ino=$(inode "$r/inst/bin/hxprobe")
+    run "$r" HXPROBE_RELEASE_BASE="file://$r/rel" PATH="$r/stub:$nocargo_path" -- x
+    if [ "$rc" = 0 ] && [ "$out" = 'FAKE mcp x' ] && [ -e "$r/old-ran" ] && [ ! -e "$r/ran" ] \
+        && [ ! -e "$r/builds" ] && [ "$(inode "$r/inst/bin/hxprobe")" = "$ino" ] \
+        && [ "$(origin_of "$r/inst")" = build ] && [ "$(cat "$r/old-ran")" = "$fds_closed" ] \
+        && [[ "$err" == *"download of $asset failed"* ]] \
+        && [[ "$err" == *"running the installed hxprobe $have"* ]] \
+        && [ "$(leftovers "$r/inst")" = 0 ] && lock_free "$r/inst"; then pass "$t"
+    else fail "$t" "rc=$rc out='$out' builds='$(cat "$r/builds" 2>/dev/null || true)' err='$err'"; fi
+done
+
+# (xvii-c) With nothing usable installed, a failed download falls back to a
+# build; the record says that the program was built here.
+t='download fails, nothing installed: build'
+r=$(make_repo)
+make_asset "$r"
+make_curl_fail "$r"
+make_cargo_stub "$r" ''
+run "$r" HXPROBE_RELEASE_BASE="file://$r/rel" PATH="$r/stub:$nocargo_path" --
+if [ "$rc" = 0 ] && [ "$out" = 'BUILT mcp' ] && [ "$(origin_of "$r/inst")" = build ] \
+    && [[ "$err" == *"download of $asset failed"* ]] \
+    && [ "$(leftovers "$r/inst")" = 0 ] && lock_free "$r/inst"; then pass "$t"
+else fail "$t" "rc=$rc out='$out' err='$err'"; fi
+
+# (xvii-d) A checksum mismatch is never answered with a build, and never
+# with the program that is installed: the launcher stops. With cargo on PATH,
+# with nothing installed and with a built program of the wanted version.
+for installed in nothing built; do
+    t="checksum mismatch with cargo on PATH, $installed installed"
+    r=$(make_repo)
+    make_asset "$r"
+    printf '%s  %s\n' "$(printf '0%.0s' $(seq 64))" "$asset" > "$r/release/SHA256SUMS"
+    make_cargo_stub "$r" ''
+    mkdir -p "$r/inst/bin"
+    ino=none
+    if [ "$installed" = built ]; then
+        make_fake "$r/inst/bin/hxprobe" "$r/old-ran" '' "$version"
+        echo build > "$r/inst/bin/.origin"
+        ino=$(inode "$r/inst/bin/hxprobe")
+    fi
+    run "$r" HXPROBE_RELEASE_BASE="file://$r/rel" PATH="$r/stub:$nocargo_path" --
+    if [ "$rc" = 1 ] && [ -z "$out" ] && [ ! -e "$r/ran" ] && [ ! -e "$r/old-ran" ] \
+        && [ ! -e "$r/builds" ] && [ "$(inode "$r/inst/bin/hxprobe")" = "$ino" ] \
+        && [[ "$err" == *'checksum mismatch'* ]] && [[ "$err" != *'building hxprobe'* ]] \
+        && [ "$(leftovers "$r/inst")" = 0 ] && lock_free "$r/inst"; then pass "$t"
+    else fail "$t" "rc=$rc out='$out' err='$err'"; fi
+done
+
+# (xvii-e) Without a checksum line for the version, a built program of that
+# version is all there is: it is run without a download.
+t='built program without a release is run'
+r=$(make_repo)
+make_curl_fail "$r"
+make_cargo_stub "$r" ''
+mkdir -p "$r/inst/bin"
+make_fake "$r/inst/bin/hxprobe" "$r/old-ran" '' "$version"
+echo build > "$r/inst/bin/.origin"
+run "$r" HXPROBE_RELEASE_BASE="file://$r/rel" PATH="$r/stub:$nocargo_path" --
+if [ "$rc" = 0 ] && [ "$out" = 'FAKE mcp' ] && [ -z "$err" ] && [ ! -e "$r/curl-args" ] \
+    && [ ! -e "$r/builds" ]; then pass "$t"
+else fail "$t" "rc=$rc out='$out' err='$err'"; fi
 
 if [ "$failures" -ne 0 ]; then
     printf '%d case(s) failed\n' "$failures"

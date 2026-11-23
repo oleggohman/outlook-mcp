@@ -11,6 +11,15 @@
 # lock. The server starts its refresh service from its own path, so it is
 # always started from the stable path.
 #
+# Where the installed program came from is recorded next to it in
+# bin/.origin: `release <sha256>` for a verified download, `build` for a
+# cargo build (no record counts as `build`). A built program of the wanted
+# version is replaced by the release program as soon as the checksum file
+# lists one. A release file that does not match its checksum stops the
+# launcher: nothing is built or run in its place. A download that fails is
+# followed by a build only when no program that answers is installed;
+# otherwise the installed one is run.
+#
 # stdout is the JSON-RPC channel of the server, so this script writes nothing
 # to it: stdout is parked on fd 3 and only handed back to the server at exec.
 #
@@ -143,15 +152,64 @@ program_version() {
 
 installed_version() { program_version "$bin"; }
 
+# Where the program at $bin came from: `release` or `build` (see the header).
+origin_file="$bindir/.origin"
+installed_origin() {
+    local o=''
+    if [ -f "$origin_file" ]; then read -r o _ < "$origin_file" || true; fi
+    if [ "$o" = release ]; then echo release; else echo build; fi
+}
+
+# Looks up the release program for this machine in the checksum file, once.
+# Succeeds when there is one; `asset` is then its name and `want` its SHA-256.
+asset=''
+want=''
+sum_known=''
+release_sum() {
+    local arch sums
+    if [ -n "$sum_known" ]; then [ "$sum_known" = yes ]; return; fi
+    sum_known=no
+    [ "$(uname -s)" = Darwin ] || return 1
+    case "$(uname -m)" in
+        arm64 | aarch64 ) arch=arm64 ;;
+        x86_64 ) arch=x86_64 ;;
+        * ) return 1 ;;
+    esac
+    asset="hxprobe-$version-macos-$arch"
+    sums=${HXPROBE_SUMS:-$repo/release/SHA256SUMS}
+    [ -f "$sums" ] || return 1
+    # Lines are `<sha256>  <asset>` (an optional `*` before the name is the
+    # binary-mode marker of shasum). Blank lines and `#` comments are skipped.
+    want=$(awk -v a="$asset" '
+        /^[[:space:]]*#/ || NF == 0 { next }
+        NF == 2 { n = $2; sub(/^\*/, "", n); if (n == a) { print tolower($1); exit } }
+    ' "$sums")
+    [ -n "$want" ] || return 1
+    case "$want" in
+        *[!0-9a-f]* ) log "bad checksum for $asset in $sums"; return 1 ;;
+    esac
+    [ "${#want}" = 64 ] || { log "bad checksum for $asset in $sums"; return 1; }
+    sum_known=yes
+}
+
 # Succeeds when the installed program is to be run: it reports the wanted
 # version or a newer one. A newer one is kept (never downgrade: clients with
-# different plugin versions would otherwise reinstall on every start).
+# different plugin versions would otherwise reinstall on every start). A
+# program of the wanted version that was built here is not run as it is while
+# a release program is listed for it: `upgrade` is then 1, and the release
+# program is tried first.
+upgrade=0
 installed_ok() {
     local have
+    upgrade=0
     have=$(installed_version)
     [ -n "$have" ] || return 1
     case "$(version_cmp "$have" "$version")" in
-        0 ) return 0 ;;
+        0 ) if [ "$(installed_origin)" = build ] && release_sum; then
+                upgrade=1
+                return 1
+            fi
+            return 0 ;;
         1 ) log "hxprobe $have at $bin is newer than $version of this plugin; running it"
             return 0 ;;
     esac
@@ -307,14 +365,14 @@ remove_old_build_dirs() {
     done
 }
 
-# Move a verified or freshly built file into place, remove the programs of
-# earlier launchers and start the server. The move is a rename in one
-# directory: atomic, and a new file, so running copies of the old program
-# keep their file (overwriting a signed program in place would invalidate
-# the signature of running copies).
+# Move a verified or freshly built file into place, record its origin $2,
+# remove the programs of earlier launchers and start the server. The move is
+# a rename in one directory: atomic, and a new file, so running copies of
+# the old program keep their file (overwriting a signed program in place
+# would invalidate the signature of running copies).
 install_and_run() {
-    local src=$1 f d have
-    shift
+    local src=$1 origin=$2 f d have
+    shift 2
     chmod 700 "$src" || die "cannot make $src executable"
     # The file must be the program it is named after: at least the wanted
     # version, by its own answer.
@@ -325,7 +383,13 @@ install_and_run() {
     esac
     # mv would put the file into a directory (or a link to one) of that name.
     [ ! -d "$bin" ] || die "$bin is a directory; remove it and start again"
-    mv -f "$src" "$bin" || die "cannot move $src to $bin"
+    # Written first: a record without its program only costs one more
+    # download, a program with the record of another could stay for good.
+    printf '%s\n' "$origin" > "$origin_file" || die "cannot write $origin_file"
+    if ! mv -f "$src" "$bin"; then
+        rm -f "$origin_file" 2>/dev/null || true
+        die "cannot move $src to $bin"
+    fi
     tmp_file=''
     if [ -n "$legacy" ]; then
         for f in "$legacy"/hxprobe-*; do
@@ -358,31 +422,14 @@ fi
 remove_old_build_dirs
 
 # d. Verified prebuilt program from the release. On success the file is at
-# $tmp_file.
+# $tmp_file. Returns 1 when no release program is listed for this machine and
+# 2 when it could not be downloaded; a file that does not match its checksum
+# ends the launcher.
 try_download() {
-    local arch asset sums want base url proto got
-    [ "$(uname -s)" = Darwin ] || return 1
-    case "$(uname -m)" in
-        arm64 | aarch64 ) arch=arm64 ;;
-        x86_64 ) arch=x86_64 ;;
-        * ) return 1 ;;
-    esac
-    asset="hxprobe-$version-macos-$arch"
-    sums=${HXPROBE_SUMS:-$repo/release/SHA256SUMS}
-    [ -f "$sums" ] || return 1
-    # Lines are `<sha256>  <asset>` (an optional `*` before the name is the
-    # binary-mode marker of shasum). Blank lines and `#` comments are skipped.
-    want=$(awk -v a="$asset" '
-        /^[[:space:]]*#/ || NF == 0 { next }
-        NF == 2 { n = $2; sub(/^\*/, "", n); if (n == a) { print tolower($1); exit } }
-    ' "$sums")
-    [ -n "$want" ] || return 1
-    case "$want" in
-        *[!0-9a-f]* ) log "bad checksum for $asset in $sums"; return 1 ;;
-    esac
-    [ "${#want}" = 64 ] || { log "bad checksum for $asset in $sums"; return 1; }
-    command -v curl >/dev/null 2>&1 || { log "curl not found; cannot download $asset"; return 1; }
-    command -v shasum >/dev/null 2>&1 || { log "shasum not found; cannot verify $asset"; return 1; }
+    local base url proto got
+    release_sum || return 1
+    command -v curl >/dev/null 2>&1 || { log "curl not found; cannot download $asset"; return 2; }
+    command -v shasum >/dev/null 2>&1 || { log "shasum not found; cannot verify $asset"; return 2; }
 
     base=${HXPROBE_RELEASE_BASE:-https://github.com/oleggohman/outlook-mcp/releases/download}
     base=${base%/}
@@ -391,26 +438,39 @@ try_download() {
         * ) proto='=https' ;;
     esac
     url="$base/v$version/$asset"
-    tmp_file=$(mktemp "$bindir/.download.XXXXXX") || return 1
+    tmp_file=$(mktemp "$bindir/.download.XXXXXX") || return 2
     log "downloading $url"
     if ! run_child curl -fsSL --proto "$proto" --proto-redir "$proto" --tlsv1.2 \
             --connect-timeout 15 --max-time 300 -o "$tmp_file" "$url"; then
         log "download of $asset failed"
         rm -f "$tmp_file"; tmp_file=''
-        return 1
+        return 2
     fi
     got=$(shasum -a 256 "$tmp_file" | awk '{ print tolower($1) }')
     if [ "$got" != "$want" ]; then
-        log "checksum mismatch for $asset (expected $want, got $got); the file was deleted and not run"
         rm -f "$tmp_file"; tmp_file=''
-        return 1
+        die "checksum mismatch for $asset (expected $want, got $got); the file was deleted and not run, and nothing is built or run in its place. Check release/SHA256SUMS and the release, or set HXPROBE_BIN."
     fi
     log "checksum of $asset verified"
 }
 
+if [ "$upgrade" = 1 ]; then
+    log "hxprobe $version at $bin was built here and a release program is listed; replacing it"
+fi
 # The install itself runs outside the `if` condition, where set -e applies.
-if try_download; then
-    install_and_run "$tmp_file" ${1+"$@"}
+downloaded=0
+try_download || downloaded=$?
+if [ "$downloaded" = 0 ]; then
+    install_and_run "$tmp_file" "release $want" ${1+"$@"}
+fi
+if [ "$downloaded" = 2 ] || [ "$upgrade" = 1 ]; then
+    # Not a reason to build while a program that answers is installed.
+    have=$(installed_version)
+    if [ -n "$have" ]; then
+        release_lock
+        log "running the installed hxprobe $have at $bin; the next start tries the download again"
+        run_server "$bin" ${1+"$@"}
+    fi
 fi
 
 # e. Build from source with cargo, in a directory of this process.
@@ -429,7 +489,7 @@ if command -v cargo >/dev/null 2>&1; then
     # The build tree is only needed for the build; it takes hundreds of MB.
     rm -rf "$build_dir"
     build_dir=''
-    install_and_run "$tmp_file" ${1+"$@"}
+    install_and_run "$tmp_file" build ${1+"$@"}
 fi
 
 # f. Nothing worked.
