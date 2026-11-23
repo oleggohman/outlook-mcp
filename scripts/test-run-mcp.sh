@@ -764,6 +764,20 @@ for kind in directory 'link to a directory'; do
     else fail "$t" "rc=$rc out='$out' inside=$inside err='$err'"; fi
 done
 
+# (xiv) Temp files that a killed launcher left in the bin directory are
+# removed by the next install, which holds the lock.
+t='temp files of a killed launcher'
+r=$(make_repo)
+make_asset "$r"
+mkdir -p "$r/inst/bin"
+: > "$r/inst/bin/.download.OLD001"
+: > "$r/inst/bin/.build.OLD002"
+: > "$r/inst/bin/notes"
+run "$r" HXPROBE_RELEASE_BASE="file://$r/rel" PATH="$nocargo_path" --
+if [ "$rc" = 0 ] && [ "$out" = 'FAKE mcp' ] && [ "$(leftovers "$r/inst")" = 0 ] \
+    && [ -e "$r/inst/bin/notes" ]; then pass "$t"
+else fail "$t" "rc=$rc out='$out' leftovers=$(leftovers "$r/inst") err='$err'"; fi
+
 if [ "$failures" -ne 0 ]; then
     printf '%d case(s) failed\n' "$failures"
     exit 1

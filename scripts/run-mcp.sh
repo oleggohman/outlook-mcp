@@ -291,9 +291,13 @@ pid_gone() {
 
 # Remove build directories that earlier starts left behind. With the lock
 # held nobody else is building, so every one of them is a leftover; without
-# it only those of processes that are gone.
+# it only those of processes that are gone. The same for the temp files of
+# a launcher that was killed, which carry no pid: only with the lock held.
 remove_old_build_dirs() {
     local d
+    if [ "$lock_held" = 1 ]; then
+        rm -f "$bindir"/.download.* "$bindir"/.build.* 2>/dev/null || true
+    fi
     if [ "$lock_held" = 1 ]; then rm -rf "$inst/target"; fi
     for d in "$inst"/target.*; do
         [ -d "$d" ] || continue
