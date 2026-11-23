@@ -334,10 +334,10 @@ Arguments:
 * `limit`: 1 to 100, default 20 (a number outside that range is clamped).
   `offset`: 0 to 100,000, default 0.
 * `folder`: a folder guid, or a folder name matched case-insensitively (a name
-  selects every folder with that name). A folder that does not exist is an
-  error.
-* `from`: part of the sender's name or address. `%` and `_` are plain
-  characters.
+  selects every folder with that name), at most 200 characters. A folder that
+  does not exist is an error.
+* `from`: part of the sender's name or address, at most 200 characters. `%`
+  and `_` are plain characters.
 * `since` (inclusive) and `until` (exclusive): `YYYY-MM-DD` (midnight UTC),
   `YYYY-MM-DDThh:mm:ssZ`, or Unix seconds (as a string or a number). For
   `list_messages` and `search_messages` they apply to the sent time. For
@@ -353,6 +353,8 @@ Arguments:
   `max_chars`: 1 to 80,000, default 20,000; `body_truncated` tells whether the
   body was cut. `body` is null when the store holds no body for the message.
 * `include_cancelled`: default false.
+* An integer may be written with a zero fraction (`20.0`). A string argument
+  must not contain control characters other than tab and line breaks.
 
 A missing required argument, an unknown argument name, a value of the wrong
 type or out of range (except `limit`), or an unknown message guid in
@@ -390,13 +392,16 @@ hxprobe mcp [--store <file>] [--cache-dir <dir>] [--refresh-secs <n>]
   only profile directory that holds an `HxStore.hxd`. When none is found (or
   several other profiles hold one), or the path is not a regular file, the
   server exits with status 1 and a message on stderr before it reads any
-  request.
+  request. The path is resolved at start to an absolute path without
+  symbolic links; `store_status` shows that path, and the cache is kept for
+  it.
 * `--cache-dir`: default `~/Library/Caches/hxprobe-mcp`.
 * `--refresh-secs`: the shortest time between two builds of a changed store,
   default 900; 0 rebuilds whenever the store changed.
 
 An unknown option or a bad value exits with status 2 and the usage text.
-stdout carries only JSON-RPC messages; all logging goes to stderr.
+stdout carries only JSON-RPC messages; all logging goes to stderr. A closed
+stderr does not stop the server.
 
 ### Cache and refresh
 
@@ -407,14 +412,16 @@ temporary files `store.copy-<pid>` and `mail.db.tmp-<pid>`.
   When there is none, the first tool call builds it.
 * A tool call rebuilds the cache when the live store's size or modification
   time differs from the one the cache was built from and the last build or
-  build attempt is at least `--refresh-secs` old. A `mail.db` that cannot be
-  read, has another cache format or was built for another store is rebuilt
-  at once.
+  build attempt is at least `--refresh-secs` old (a build time later than
+  the current time does not count). A `mail.db` that cannot be read, has
+  another cache format, was built for another store, or is not a regular
+  file owned by the user and closed to group and others is rebuilt at once.
+  A `lock` that is not such a file is removed and created again.
 * The `refresh` tool rebuilds at once, whatever the interval.
-* A failed build keeps the previous `mail.db` in use and is not retried
-  before `--refresh-secs` have passed; `store_status` shows the error in
-  `last_error`. With no previous database the tool calls fail with that
-  error.
+* A failed build (one stopped by an internal error included) keeps the
+  previous `mail.db` in use and is not retried before `--refresh-secs` have
+  passed; `store_status` shows the error in `last_error`. With no previous
+  database the tool calls fail with that error.
 * Two servers that share a cache directory build one after the other; when
   the store did not change in between, the second uses the database the
   first built.

@@ -30,6 +30,8 @@ const MAX_LIMIT: i64 = 100;
 const MAX_OFFSET: i64 = 100_000;
 const DEFAULT_MAX_CHARS: i64 = 20_000;
 const MAX_MAX_CHARS: i64 = 80_000;
+/// Longest `folder` or `from` argument, in chars.
+const MAX_FILTER_TEXT: usize = 200;
 
 /// JSON type of an argument.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,7 +74,8 @@ const P_OFFSET: Param = param(
 const P_FOLDER: Param = param(
     "folder",
     Kind::Str,
-    "Folder guid, or folder name (case-insensitive; selects every folder with that name).",
+    "Folder guid, or folder name (case-insensitive; selects every folder with that name); \
+     at most 200 chars.",
 );
 const P_UNREAD_ONLY: Param = param("unread_only", Kind::Bool, "Only unread messages.");
 const P_HAS_ATTACHMENT: Param = param(
@@ -80,7 +83,11 @@ const P_HAS_ATTACHMENT: Param = param(
     Kind::Bool,
     "Only messages with a file attachment.",
 );
-const P_FROM: Param = param("from", Kind::Str, "Part of the sender's name or address.");
+const P_FROM: Param = param(
+    "from",
+    Kind::Str,
+    "Part of the sender's name or address; at most 200 chars.",
+);
 const P_SINCE: Param = param(
     "since",
     Kind::Time,
@@ -308,8 +315,24 @@ fn sql_failed(e: rusqlite::Error) -> ToolError {
     failed(format!("database query failed: {e}"))
 }
 
-/// The checked arguments of a call: known names with the right JSON type;
-/// `null` values left out.
+/// A JSON number as an integer: an integer, or a number written with a
+/// fraction of zero (`20.0`) that fits in an `i64`.
+fn integer(v: &Value) -> Option<i64> {
+    const LIMIT: f64 = 9_223_372_036_854_775_808.0; // 2^63
+    v.as_i64().or_else(|| {
+        let f = v.as_f64().filter(|_| !v.is_u64())?;
+        (f.fract() == 0.0 && (-LIMIT..LIMIT).contains(&f)).then_some(f as i64)
+    })
+}
+
+/// True for a control character other than tab and line breaks.
+fn is_forbidden_control(c: char) -> bool {
+    c.is_control() && !matches!(c, '\t' | '\n' | '\r')
+}
+
+/// The checked arguments of a call: known names with the right JSON type,
+/// integers as JSON integers, no control characters in strings; `null`
+/// values left out.
 #[derive(Debug, Default)]
 pub struct Args(Map<String, Value>);
 
@@ -323,16 +346,21 @@ impl Args {
         };
         let mut out = Map::new();
         for (k, v) in obj {
+            let Some(p) = tool.params.iter().find(|p| p.name == k) else {
+                return Err(failed(format!("unknown argument {k:?}")));
+            };
             if v.is_null() {
                 continue;
             }
-            let Some(p) = tool.params.iter().find(|p| p.name == k) else {
-                return Err(failed(format!("unknown argument {k:?}")));
+            // `20.0` is an integer for JSON Schema: kept as `20`.
+            let as_int = match p.kind {
+                Kind::Int => integer(v),
+                _ => None,
             };
             let ok = match p.kind {
                 Kind::Str => v.is_string(),
                 Kind::Bool => v.is_boolean(),
-                Kind::Int => v.is_i64(),
+                Kind::Int => as_int.is_some(),
                 Kind::Time => v.is_i64() || v.is_string(),
             };
             if !ok {
@@ -344,7 +372,14 @@ impl Args {
                 };
                 return Err(failed(format!("argument {k} must be {want}")));
             }
-            out.insert(k.clone(), v.clone());
+            if v.as_str()
+                .is_some_and(|s| s.chars().any(is_forbidden_control))
+            {
+                return Err(failed(format!(
+                    "argument {k} must not contain control characters"
+                )));
+            }
+            out.insert(k.clone(), as_int.map_or_else(|| v.clone(), Value::from));
         }
         Args::checked_required(tool, out)
     }
@@ -627,11 +662,21 @@ fn folder_guids(conn: &Connection, folder: &str) -> Result<Vec<String>, ToolErro
     Ok(out)
 }
 
+/// The optional string argument `k`, of at most [`MAX_FILTER_TEXT`] chars.
+fn filter_text<'a>(args: &'a Args, k: &str) -> Result<Option<&'a str>, ToolError> {
+    match args.str(k) {
+        Some(s) if s.chars().count() > MAX_FILTER_TEXT => Err(failed(format!(
+            "argument {k} must be at most {MAX_FILTER_TEXT} characters"
+        ))),
+        s => Ok(s),
+    }
+}
+
 /// The message filters of `args` over the `messages` view aliased `m`:
 /// `folder`, `unread_only`, `has_attachment`, `from`, `since`, `until`.
 fn message_filter(conn: &Connection, args: &Args) -> Result<Filter, ToolError> {
     let mut f = Filter::default();
-    if let Some(folder) = args.str("folder") {
+    if let Some(folder) = filter_text(args, "folder")? {
         let guids = folder_guids(conn, folder)?;
         if guids.is_empty() {
             return Err(failed("no folder has that name or guid"));
@@ -648,7 +693,7 @@ fn message_filter(conn: &Connection, args: &Args) -> Result<Filter, ToolError> {
     if args.flag("has_attachment") {
         f.conds.push("COALESCE(m.HasFileAttachment, 0) <> 0".into());
     }
-    if let Some(from) = args.str("from") {
+    if let Some(from) = filter_text(args, "from")? {
         f.conds.push(
             r"(m.SenderDisplayName LIKE '%' || ? || '%' ESCAPE '\'
                OR m.SenderEmailAddress LIKE '%' || ? || '%' ESCAPE '\')"
@@ -718,7 +763,10 @@ fn get_message(conn: &Connection, _now: i64, args: &Args) -> Result<Value, ToolE
             let mut m = message_item(r)?;
             m.insert("internet_message_id".into(), field(r.get_ref(9)?));
             m.insert("importance".into(), number(r.get_ref(10)?));
-            let raw = lossy(r.get_ref(11)?).or(lossy(r.get_ref(12)?));
+            // The HTML body; when it is NULL or empty, the first body part
+            // (HTML as well).
+            let html_body = lossy(r.get_ref(11)?).filter(|b| !b.is_empty());
+            let raw = html_body.or(lossy(r.get_ref(12)?));
             let body = raw.map(|b| {
                 let b = if html { b } else { html_to_text(&b) };
                 cap(&b, max_chars as usize)
@@ -866,8 +914,9 @@ fn list_events(conn: &Connection, now: i64, args: &Args) -> Result<Value, ToolEr
     if until <= since {
         return Err(failed("argument until must be after since"));
     }
-    // Events that overlap the window [since, until).
-    let mut w = "WHERE e.start_unix < ?1 AND e.end_unix > ?2".to_string();
+    // Events that overlap the window [since, until); one without length
+    // (end = start) counts when it starts in the window.
+    let mut w = "WHERE e.start_unix < ?1 AND (e.end_unix > ?2 OR e.start_unix >= ?2)".to_string();
     if !args.flag("include_cancelled") {
         w.push_str(" AND COALESCE(a.IsCancelled, 0) = 0");
     }
@@ -1194,6 +1243,29 @@ mod tests {
     }
 
     #[test]
+    fn get_message_falls_back_to_the_first_body_part() {
+        let mut f = fixture();
+        let db = Connection::open(f.cache.db_path()).unwrap();
+        for (i, html) in [(0, Some("")), (1, None)] {
+            let n = db
+                .execute(
+                    "UPDATE \"MessageData\" SET HTMLBodyBytes = ?1,
+                            HTMLFirstBodyBytes = '<p>first <b>part</b></p>'
+                     WHERE guid = (SELECT MessageData FROM \"MessageHeader\" WHERE guid = ?2)",
+                    rusqlite::params![html, msg(i)],
+                )
+                .unwrap();
+            assert_eq!(n, 1);
+            let m = f.ok("get_message", json!({"guid": msg(i)}));
+            assert_eq!(m["body"], "first part", "{html:?}");
+            assert_eq!(m["body_format"], "text");
+            let m = f.ok("get_message", json!({"guid": msg(i), "format": "html"}));
+            assert_eq!(m["body"], "<p>first <b>part</b></p>", "{html:?}");
+            assert_eq!(m["body_format"], "html");
+        }
+    }
+
+    #[test]
     fn get_message_argument_errors() {
         let mut f = fixture();
         f.err("get_message", json!({"guid": msg(0), "format": "pdf"}));
@@ -1269,6 +1341,80 @@ mod tests {
             f.err("list_messages", args);
         }
         f.err("store_status", json!({"x": 1}));
+    }
+
+    #[test]
+    fn unknown_name_with_null_is_an_error() {
+        let mut f = fixture();
+        let e = f.err("list_messages", json!({"bogus": null}));
+        assert!(e.contains("bogus"), "{e}");
+        f.err("store_status", json!({"x": null}));
+        f.err("list_messages", json!({"limit": null, "color": null}));
+    }
+
+    #[test]
+    fn integers_written_with_a_zero_fraction_are_accepted() {
+        let mut f = fixture();
+        let v: Value = serde_json::from_str(r#"{"limit": 2.0, "offset": 1.0}"#).unwrap();
+        let v = f.ok("list_messages", v);
+        assert_eq!(v["offset"], 1);
+        assert_eq!(msg_indexes(&v), [1, 0]);
+        let args: Value = serde_json::from_str(r#"{"limit": 1e0}"#).unwrap();
+        assert_eq!(f.msgs("list_messages", args), [2]);
+        let m = f.ok("get_message", json!({"guid": msg(0), "max_chars": 10.0}));
+        assert_eq!(m["body"], "The budget");
+        // A fraction, or a value outside the integer range, is not one.
+        for bad in ["2.5", "1e30", "-1e30", "9223372036854775808", "1e-3"] {
+            let args: Value = serde_json::from_str(&format!("{{\"limit\": {bad}}}")).unwrap();
+            let e = f.err("list_messages", args);
+            assert!(e.contains("integer"), "{bad}: {e}");
+        }
+        // Range checks see the integer.
+        f.err("list_messages", json!({"offset": -1.0}));
+        f.err(
+            "get_message",
+            json!({"guid": msg(0), "max_chars": 80_001.0}),
+        );
+    }
+
+    #[test]
+    fn control_characters_in_text_arguments_are_errors() {
+        let mut f = fixture();
+        for (tool, args) in [
+            ("search_messages", json!({"query": "bud\u{0}get"})),
+            ("search_messages", json!({"query": "\u{0}"})),
+            ("search_messages", json!({"query": "x", "from": "a\u{1b}b"})),
+            ("search_people", json!({"query": "a\u{7}"})),
+            ("list_messages", json!({"folder": "In\u{0}box"})),
+            ("list_messages", json!({"from": "\u{9f}"})),
+            (
+                "get_message",
+                json!({"guid": msg(0), "format": "text\u{0}"}),
+            ),
+        ] {
+            let e = f.err(tool, args.clone());
+            assert!(e.contains("control characters"), "{tool} {args}: {e}");
+        }
+        // Tabs and line breaks separate words.
+        assert_eq!(
+            found(&mut f, json!({"query": "budget\tnumbers\r\nattached"})),
+            [0]
+        );
+    }
+
+    #[test]
+    fn folder_and_from_length_is_checked() {
+        let mut f = fixture();
+        for k in ["folder", "from"] {
+            let e = f.err("list_messages", json!({k: "a".repeat(201)}));
+            assert!(e.contains(k) && e.contains("200"), "{k}: {e}");
+            let e = f.err("search_messages", json!({"query": "x", k: "a".repeat(201)}));
+            assert!(e.contains(k) && e.contains("200"), "{k}: {e}");
+        }
+        let v = f.ok("list_messages", json!({"from": "א".repeat(200)}));
+        assert_eq!(v["total"], 0);
+        let e = f.err("list_messages", json!({"folder": "a".repeat(200)}));
+        assert!(e.contains("no folder"), "{e}");
     }
 
     #[test]
@@ -1648,5 +1794,31 @@ mod tests {
             json!({"since": "2026-01-10", "until": "2026-01-05"}),
         );
         f.err("list_events", json!({"since": "soon"}));
+    }
+
+    #[test]
+    fn list_events_includes_an_event_without_length_at_since() {
+        let mut f = fixture();
+        let t = MAIL_EVENT_TIMES[0].0;
+        // Make the first event end when it starts.
+        let db = Connection::open(f.cache.db_path()).unwrap();
+        let n = db
+            .execute(
+                "UPDATE mcp_events SET end_unix = start_unix WHERE guid = ?1",
+                [guid_hex(&MAIL_EVENTS[0])],
+            )
+            .unwrap();
+        assert_eq!(n, 1);
+        // `since` is inclusive, `until` exclusive.
+        assert_eq!(
+            events_at(&mut f, NOW_I, json!({"since": t, "until": t + 60})),
+            [0]
+        );
+        assert_eq!(
+            events_at(&mut f, NOW_I, json!({"since": t - 60, "until": t + 60})),
+            [0]
+        );
+        assert!(events_at(&mut f, NOW_I, json!({"since": t - 60, "until": t})).is_empty());
+        assert!(events_at(&mut f, NOW_I, json!({"since": t + 1, "until": t + 60})).is_empty());
     }
 }

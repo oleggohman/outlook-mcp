@@ -12,6 +12,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use serde_json::{json, Map, Value};
 
 use crate::mcp::cache::Cache;
+use crate::mcp::log;
 use crate::mcp::tools::{self, ToolError, TOOLS};
 
 /// Longest request line, in bytes (without the newline).
@@ -74,9 +75,16 @@ pub fn handle_line_at(server: &mut Server, now: i64, line: &str) -> Option<Strin
             "invalid request: empty batch",
         )),
         Value::Array(reqs) => {
+            // A panic in one request is answered for that request alone.
             let out: Vec<Value> = reqs
                 .iter()
-                .filter_map(|r| handle_request(server, now, r))
+                .filter_map(|r| {
+                    catch_unwind(AssertUnwindSafe(|| handle_request(server, now, r)))
+                        .unwrap_or_else(|_| {
+                            r.get("id")
+                                .map(|_| error(id_of_value(r), INTERNAL_ERROR, "internal error"))
+                        })
+                })
                 .collect();
             (!out.is_empty()).then(|| Value::Array(out).to_string())
         }
@@ -177,11 +185,11 @@ fn tools_call(server: &mut Server, now: i64, params: &Value) -> Result<Value, (i
         Err(ToolError::Unknown) => return Err((INVALID_PARAMS, "unknown tool".to_string())),
     };
     // Only names from the fixed tool list reach the log.
-    eprintln!(
-        "hxprobe mcp: {name} {} in {} ms",
+    log(&format!(
+        "{name} {} in {} ms",
         if is_error { "failed" } else { "ok" },
         started.elapsed().as_millis()
-    );
+    ));
     Ok(json!({
         "content": [{ "type": "text", "text": text }],
         "isError": is_error,
@@ -191,10 +199,15 @@ fn tools_call(server: &mut Server, now: i64, params: &Value) -> Result<Value, (i
 /// The `id` of a request line, if it is an object with one; for the error
 /// response of a request whose handling panicked.
 fn id_of(line: &str) -> Value {
-    serde_json::from_str::<Value>(line)
-        .ok()
-        .and_then(|v| v.get("id").cloned())
+    serde_json::from_str::<Value>(line).map_or(Value::Null, |v| id_of_value(&v))
+}
+
+/// The `id` of a request value, if it is an object with a number or string
+/// one; `null` otherwise.
+fn id_of_value(req: &Value) -> Value {
+    req.get("id")
         .filter(|i| matches!(i, Value::Number(_) | Value::String(_)))
+        .cloned()
         .unwrap_or(Value::Null)
 }
 
@@ -527,6 +540,55 @@ mod tests {
             let r = f.send(req.clone());
             assert_eq!(error_code(&r), -32600, "{req}");
         }
+    }
+
+    #[test]
+    fn object_and_array_ids_are_invalid_requests() {
+        let mut f = fixture();
+        for id in [
+            json!({}),
+            json!({"a": 1}),
+            json!([]),
+            json!([1]),
+            json!(true),
+        ] {
+            for method in [json!("ping"), json!("tools/list"), Value::Null] {
+                let r = f.send(json!({"jsonrpc": "2.0", "id": id, "method": method}));
+                assert_eq!(error_code(&r), -32600, "{id}");
+                assert_eq!(r["id"], Value::Null);
+            }
+        }
+        // In a batch too, without touching the other requests.
+        let r = f.send(json!([
+            {"jsonrpc": "2.0", "id": {"a": 1}, "method": "ping"},
+            {"jsonrpc": "2.0", "id": 2, "method": "ping"}
+        ]));
+        assert_eq!(error_code(&r[0]), -32600);
+        assert_eq!(r[1]["result"], json!({}));
+    }
+
+    #[test]
+    fn panic_in_a_batch_fails_only_its_request() {
+        let mut f = fixture();
+        f.server.cache.build_hook = Some(|| panic!("build hook"));
+        let call = json!({"name": "list_messages", "arguments": {}});
+        let r = f.send(json!([
+            {"jsonrpc": "2.0", "id": 1, "method": "ping"},
+            {"jsonrpc": "2.0", "id": "c", "method": "tools/call", "params": call},
+            {"jsonrpc": "2.0", "method": "notifications/initialized"},
+            {"jsonrpc": "2.0", "id": 3, "method": "ping"}
+        ]));
+        let a = r.as_array().expect("an array");
+        assert_eq!(a.len(), 3);
+        assert_eq!(a[0], json!({"jsonrpc": "2.0", "id": 1, "result": {}}));
+        assert_eq!(error_code(&a[1]), -32603);
+        assert_eq!(a[1]["id"], "c");
+        assert_eq!(a[2], json!({"jsonrpc": "2.0", "id": 3, "result": {}}));
+        // The failed build is not repeated at once: a tool failure now.
+        let (v, is_error) = f.call("list_messages", json!({}));
+        assert!(is_error);
+        assert!(v.as_str().unwrap().contains("did not finish"), "{v}");
+        assert_eq!(f.server.cache.builds, 1);
     }
 
     #[test]

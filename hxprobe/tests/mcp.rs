@@ -68,18 +68,38 @@ fn drain(mut r: impl Read + Send + 'static) -> JoinHandle<Vec<u8>> {
 /// Run `hxprobe mcp <args>` with `input` on stdin (then closed) and `env`
 /// set; exit status, stdout and stderr. Fails the test after [`TIMEOUT`].
 fn mcp(args: &[&Path], env: &[(&str, &Path)], input: &[u8]) -> (ExitStatus, String, String) {
+    mcp_with(args, input, true, |cmd| {
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+    })
+}
+
+/// [`mcp`] with the command changed by `configure` before it starts. With
+/// `read_stderr` false the read end of the child's stderr is closed at once
+/// (every later write to it fails) and the returned stderr is empty.
+fn mcp_with(
+    args: &[&Path],
+    input: &[u8],
+    read_stderr: bool,
+    configure: impl FnOnce(&mut Command),
+) -> (ExitStatus, String, String) {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_hxprobe"));
     cmd.arg("mcp")
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    for (k, v) in env {
-        cmd.env(k, v);
-    }
+    configure(&mut cmd);
     let mut child = Running(cmd.spawn().unwrap());
     let out = drain(child.0.stdout.take().unwrap());
-    let err = drain(child.0.stderr.take().unwrap());
+    let stderr = child.0.stderr.take().unwrap();
+    let err = if read_stderr {
+        Some(drain(stderr))
+    } else {
+        drop(stderr);
+        None
+    };
     {
         let mut stdin = child.0.stdin.take().unwrap();
         // The child may exit before reading (bad options): ignore EPIPE.
@@ -98,7 +118,9 @@ fn mcp(args: &[&Path], env: &[(&str, &Path)], input: &[u8]) -> (ExitStatus, Stri
         std::thread::sleep(Duration::from_millis(20));
     };
     let out = String::from_utf8(out.join().unwrap()).expect("stdout is UTF-8");
-    let err = String::from_utf8_lossy(&err.join().unwrap()).into_owned();
+    let err = err.map_or_else(String::new, |e| {
+        String::from_utf8_lossy(&e.join().unwrap()).into_owned()
+    });
     (status, out, err)
 }
 
@@ -249,4 +271,129 @@ fn mcp_with_bad_options_fails() {
         assert_eq!(status.code(), Some(2), "{args:?}: {err}");
         assert!(out.is_empty());
     }
+}
+
+#[test]
+fn mcp_without_home_and_cache_dir_fails() {
+    let d = Dir::new("nocachedir");
+    let store = d.path("HxStore.hxd");
+    std::fs::write(&store, empty_store()).unwrap();
+    let input = request(1, "ping", json!({}));
+    let (status, out, err) = mcp_with(
+        &[Path::new("--store"), &store],
+        input.as_bytes(),
+        true,
+        |cmd| {
+            cmd.env_remove("HOME");
+        },
+    );
+    assert_eq!(status.code(), Some(1), "stderr: {err}");
+    assert!(out.is_empty(), "stdout: {out}");
+    assert!(err.contains("--cache-dir"), "stderr: {err}");
+}
+
+/// The responses on `out`, one JSON value per line.
+fn responses(out: &str) -> Vec<Value> {
+    out.lines()
+        .map(|l| serde_json::from_str(l).unwrap_or_else(|_| panic!("not JSON: {l}")))
+        .collect()
+}
+
+#[test]
+fn mcp_serves_a_store_with_a_bad_header() {
+    let d = Dir::new("badheader");
+    let store = d.path("HxStore.hxd");
+    std::fs::write(&store, vec![b'x'; 512]).unwrap();
+    let cache = d.path("cache");
+    let mut input = request(1, "ping", json!({}));
+    input += &request(2, "tools/call", json!({"name": "store_status"}));
+    input += &request(3, "tools/call", json!({"name": "list_messages"}));
+    let (status, out, err) = mcp(
+        &[
+            Path::new("--store"),
+            &store,
+            Path::new("--cache-dir"),
+            &cache,
+        ],
+        &[],
+        input.as_bytes(),
+    );
+    assert_eq!(status.code(), Some(0), "stderr: {err}");
+    assert!(err.contains("warning"), "stderr: {err}");
+    let lines = responses(&out);
+    assert_eq!(lines.len(), 3);
+    assert_eq!(lines[0]["result"], json!({}));
+    let status_v = tool_result(&lines[1]);
+    assert_eq!(status_v["built"], Value::Null);
+    assert_eq!(status_v["messages"], 0);
+    assert!(status_v["last_error"].is_string(), "{status_v}");
+    assert_eq!(lines[2]["result"]["isError"], true);
+    assert!(!cache.join("mail.db").exists());
+}
+
+/// `store_path` reported by `store_status` of a server started in `cwd`
+/// with `--store <store>` and the cache directory `cache`.
+fn served_store_path(cwd: &Path, store: &Path, cache: &Path) -> String {
+    let input = request(1, "tools/call", json!({"name": "store_status"}));
+    let args = [Path::new("--store"), store, Path::new("--cache-dir"), cache];
+    let (status, out, err) = mcp_with(&args, input.as_bytes(), true, |cmd| {
+        cmd.current_dir(cwd);
+    });
+    assert_eq!(status.code(), Some(0), "stderr: {err}");
+    let v = tool_result(&responses(&out)[0]);
+    assert_eq!(v["last_error"], Value::Null);
+    assert!(v["built"].is_string());
+    v["store_path"].as_str().unwrap().to_string()
+}
+
+#[test]
+fn mcp_relative_store_paths_do_not_share_a_database() {
+    let d = Dir::new("relative");
+    let cache = d.path("cache");
+    let mut seen = Vec::new();
+    for name in ["a", "b"] {
+        let dir = d.path(name);
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("HxStore.hxd"), empty_store()).unwrap();
+        let got = served_store_path(&dir, Path::new("HxStore.hxd"), &cache);
+        let want = std::fs::canonicalize(dir.join("HxStore.hxd")).unwrap();
+        assert_eq!(Path::new(&got), want);
+        seen.push(got);
+    }
+    assert_ne!(seen[0], seen[1]);
+}
+
+#[test]
+fn mcp_symlinked_store_is_served_by_its_real_path() {
+    let d = Dir::new("symlink");
+    let store = d.path("HxStore.hxd");
+    std::fs::write(&store, empty_store()).unwrap();
+    let link = d.path("link.hxd");
+    std::os::unix::fs::symlink(&store, &link).unwrap();
+    let got = served_store_path(&d.0, &link, &d.path("cache"));
+    assert_eq!(Path::new(&got), std::fs::canonicalize(&store).unwrap());
+}
+
+#[test]
+fn mcp_keeps_serving_when_stderr_is_closed() {
+    let d = Dir::new("nostderr");
+    let store = d.path("HxStore.hxd");
+    std::fs::write(&store, empty_store()).unwrap();
+    let cache = d.path("cache");
+    let mut input = request(1, "tools/call", json!({"name": "store_status"}));
+    input += &request(2, "tools/call", json!({"name": "list_messages"}));
+    input += &request(3, "ping", json!({}));
+    let args = [
+        Path::new("--store"),
+        &store,
+        Path::new("--cache-dir"),
+        &cache,
+    ];
+    let (status, out, _) = mcp_with(&args, input.as_bytes(), false, |_| {});
+    assert_eq!(status.code(), Some(0));
+    let lines = responses(&out);
+    assert_eq!(lines.len(), 3);
+    assert_eq!(tool_result(&lines[0])["last_error"], Value::Null);
+    assert_eq!(tool_result(&lines[1])["total"], 0);
+    assert_eq!(lines[2]["result"], json!({}));
 }

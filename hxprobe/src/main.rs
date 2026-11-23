@@ -832,19 +832,21 @@ fn parse_mcp_options(args: &[String]) -> Result<McpOptions, String> {
 /// `hxprobe mcp`: serve the MCP tools on stdin/stdout until end of input.
 /// stdout carries only JSON-RPC messages; logs go to stderr.
 fn cmd_mcp(args: &[String]) {
-    use hxprobe::mcp::{cache, rpc};
+    use hxprobe::mcp::{cache, log, rpc};
+    use std::io::Write;
 
     // A panic message could hold mail content: print only where it happened.
+    // Nothing here uses `eprintln!`, which panics when stderr is closed.
     std::panic::set_hook(Box::new(|info| match info.location() {
-        Some(l) => eprintln!("hxprobe mcp: internal error at {}:{}", l.file(), l.line()),
-        None => eprintln!("hxprobe mcp: internal error"),
+        Some(l) => log(&format!("internal error at {}:{}", l.file(), l.line())),
+        None => log("internal error"),
     }));
     let fail = |msg: String| -> ! {
-        eprintln!("hxprobe mcp: {msg}");
+        log(&msg);
         std::process::exit(1);
     };
     let opts = parse_mcp_options(args).unwrap_or_else(|e| {
-        eprintln!("{e}\n\n{USAGE}");
+        let _ = writeln!(std::io::stderr(), "{e}\n\n{USAGE}");
         std::process::exit(2);
     });
     let store = opts
@@ -863,13 +865,13 @@ fn cmd_mcp(args: &[String]) {
         .map_err(|e| e.to_string())
         .and_then(|_| header::check(&head));
     match header {
-        Err(e) => eprintln!("hxprobe mcp: warning: {}: {e}", store.display()),
-        Ok(h) if !h.known => eprintln!(
-            "hxprobe mcp: warning: {}: store version {:?} (0x{:02x}) is untested",
+        Err(e) => log(&format!("warning: {}: {e}", store.display())),
+        Ok(h) if !h.known => log(&format!(
+            "warning: {}: store version {:?} (0x{:02x}) is untested",
             store.display(),
             h.version as char,
             h.version
-        ),
+        )),
         Ok(_) => {}
     }
     let cache_dir = opts
@@ -879,11 +881,11 @@ fn cmd_mcp(args: &[String]) {
     let cache = cache::Cache::new(&cache_dir, &store)
         .unwrap_or_else(|e| fail(format!("cache directory {}: {e}", cache_dir.display())))
         .with_refresh_secs(opts.refresh_secs.unwrap_or(cache::DEFAULT_REFRESH_SECS));
-    eprintln!(
-        "hxprobe mcp: serving {} with cache {}",
-        store.display(),
+    log(&format!(
+        "serving {} with cache {}",
+        cache.store_path().display(),
         cache_dir.display()
-    );
+    ));
     let mut server = rpc::Server::new(cache);
     if let Err(e) = rpc::run(
         &mut server,

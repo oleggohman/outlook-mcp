@@ -28,12 +28,60 @@ fn tag_text(name: &str, closing: bool) -> Option<char> {
     }
 }
 
-/// True when `b` holds something that starts a tag: `<` followed by a
-/// letter, `/`, `!` or `?`.
-fn looks_like_html(b: &[u8]) -> bool {
-    memchr::memchr_iter(b'<', b).any(|i| {
-        matches!(b.get(i + 1), Some(c) if c.is_ascii_alphabetic() || matches!(c, b'/' | b'!' | b'?'))
+/// A tag found by [`tag_at`].
+struct Tag {
+    /// Where the name starts and how long it is (ASCII letters and digits;
+    /// empty for `<!...>` and `<?...>`).
+    name_at: usize,
+    name_len: usize,
+    closing: bool,
+    /// Index after the closing `>`.
+    end: usize,
+}
+
+/// The tag that starts at the `<` at `b[i]`, or `None` when that `<` is
+/// plain text. A tag is `<` followed by a letter, `/` and a letter, `!` or
+/// `?`, and closed by a `>` that comes before the next `<`. `<` followed by
+/// an address (`<ann@example.org>`: an `@` before any space, quote, `=`, `/`
+/// or `>`) is not a tag.
+///
+/// Looks no further than the next `<` or `>`, so calling it for every `<`
+/// of a text is linear in the text.
+fn tag_at(b: &[u8], i: usize) -> Option<Tag> {
+    let after = b.get(i + 1).copied();
+    let closing = after == Some(b'/');
+    let name_at = i + 1 + usize::from(closing);
+    let starts_with_letter = b.get(name_at).is_some_and(u8::is_ascii_alphabetic);
+    if !starts_with_letter && (closing || !matches!(after, Some(b'!' | b'?'))) {
+        return None;
+    }
+    let close = i + 1 + memchr::memchr2(b'<', b'>', &b[i + 1..])?;
+    if b[close] == b'<' {
+        return None;
+    }
+    let is_address = starts_with_letter
+        && b[name_at..close]
+            .iter()
+            .take_while(|c| !c.is_ascii_whitespace() && !matches!(c, b'"' | b'\'' | b'=' | b'/'))
+            .any(|&c| c == b'@');
+    if is_address {
+        return None;
+    }
+    let name_len = b[name_at..close]
+        .iter()
+        .take_while(|c| c.is_ascii_alphanumeric())
+        .count();
+    Some(Tag {
+        name_at,
+        name_len,
+        closing,
+        end: close + 1,
     })
+}
+
+/// True when `b` holds a tag (see [`tag_at`]).
+fn looks_like_html(b: &[u8]) -> bool {
+    memchr::memchr_iter(b'<', b).any(|i| tag_at(b, i).is_some())
 }
 
 /// The character of the entity whose text between `&` and `;` is `name`.
@@ -71,11 +119,15 @@ fn entity(name: &str) -> Option<char> {
 /// numeric ones are decoded; anything else after `&` stays as it is. Runs of
 /// spaces become one space and more than two line breaks become two; lines
 /// are trimmed. In HTML, line breaks of the source are spaces; input that
-/// holds no tag keeps its line breaks. An unclosed tag, comment or dropped
+/// holds no tag keeps its line breaks. A `<` that does not start a tag (see
+/// [`tag_at`]: no `>` before the next `<`, or an address in angle brackets)
+/// stays in the text with what follows it. An unclosed comment or dropped
 /// element ends the text.
 ///
-/// Every search moves forward from the current position and the text after a
-/// failed search is dropped, so the run time is linear in the input.
+/// Every search moves forward from the current position; a tag search stops
+/// at the next `<` or `>`, and the text after a failed search for the end of
+/// a comment or dropped element is dropped, so the run time is linear in the
+/// input.
 pub fn html_to_text(html: &str) -> String {
     let b = html.as_bytes();
     let is_html = looks_like_html(b);
@@ -121,25 +173,14 @@ pub fn html_to_text(html: &str) -> String {
             }
             continue;
         }
-        let after = b.get(i + 1).copied();
-        let closing = after == Some(b'/');
-        let name_at = i + 1 + usize::from(closing);
-        let name_len = b[name_at..]
-            .iter()
-            .take_while(|c| c.is_ascii_alphanumeric())
-            .count();
-        let starts_with_letter = b.get(name_at).is_some_and(u8::is_ascii_alphabetic);
-        let is_tag = starts_with_letter || (!closing && matches!(after, Some(b'!' | b'?')));
-        if !is_tag {
+        let Some(tag) = tag_at(b, i) else {
             raw.push('<');
             i += 1;
             continue;
-        }
-        let Some(end) = memchr::memchr(b'>', &b[i..]).map(|n| i + n + 1) else {
-            break;
         };
-        let name = &lower[name_at..name_at + name_len];
-        i = end;
+        let closing = tag.closing;
+        let name = &lower[tag.name_at..tag.name_at + tag.name_len];
+        i = tag.end;
         if !closing && DROPPED_ELEMENTS.contains(&name) {
             let close = format!("</{name}");
             let Some(n) = lower[i..].find(&close) else {
@@ -404,8 +445,47 @@ mod tests {
     }
 
     #[test]
-    fn unclosed_tag_and_unclosed_script_end_the_text() {
-        assert_eq!(html_to_text("<p>before</p><a href=\"x"), "before");
+    fn less_than_signs_in_plain_text_are_kept() {
+        assert_eq!(
+            html_to_text("Budget: if x <y then stop.\nSecond line, the end."),
+            "Budget: if x <y then stop.\nSecond line, the end."
+        );
+        // No `>` before the next `<`: text, also next to real tags.
+        assert_eq!(
+            html_to_text("<p>if a <b and c <d then <b>stop</b></p>"),
+            "if a <b and c <d then stop"
+        );
+        assert_eq!(html_to_text("a <b <i>c</i>"), "a <b c");
+        assert_eq!(html_to_text("x </y z"), "x </y z");
+    }
+
+    #[test]
+    fn addresses_in_angle_brackets_are_kept() {
+        assert_eq!(
+            html_to_text("Contact John <john@example.com> or Ann <ann@example.com>"),
+            "Contact John <john@example.com> or Ann <ann@example.com>"
+        );
+        assert_eq!(
+            html_to_text("From: A <a.b-c@example.org>\nTo: B <b@example.org>"),
+            "From: A <a.b-c@example.org>\nTo: B <b@example.org>"
+        );
+        assert_eq!(
+            html_to_text("<p>Ann <ann@example.org></p><p>x</p>"),
+            "Ann <ann@example.org>\nx"
+        );
+        // An `@` in an attribute does not make a tag an address.
+        assert_eq!(
+            html_to_text("<a href=\"mailto:ann@example.org\">Ann</a> <img src=cid:1@x>"),
+            "Ann"
+        );
+    }
+
+    #[test]
+    fn unclosed_tag_stays_and_unclosed_script_ends_the_text() {
+        assert_eq!(
+            html_to_text("<p>before</p><a href=\"x"),
+            "before\n<a href=\"x"
+        );
         assert_eq!(html_to_text("<p>before</p><script>var a = 1;"), "before");
         assert_eq!(html_to_text("<p>before</p><!-- open"), "before");
         assert_eq!(html_to_text("<"), "<");
@@ -420,19 +500,81 @@ mod tests {
         );
     }
 
+    /// Inputs of `n` repeated units that would make a careless scanner
+    /// search to the end of the input once per unit.
+    fn hostile_inputs(n: usize) -> Vec<String> {
+        [
+            "<",
+            "<a",
+            "<a ",
+            "</a",
+            "<!",
+            "<a@",
+            "<a href=\"x\" ",
+            "&#",
+            "&",
+            "<a>",
+            "<!---->",
+            "<style></style>",
+        ]
+        .iter()
+        .map(|unit| unit.repeat(n))
+        // One opening that is never closed, after a long run of each kind.
+        .chain(
+            ["<a>", "x ", "<"]
+                .iter()
+                .map(|unit| unit.repeat(n) + "<!--"),
+        )
+        .chain(["<script>".repeat(n), "<!--".repeat(n), "<head>".repeat(n)])
+        .collect()
+    }
+
+    /// Shortest of three runs of `html_to_text` over `input`.
+    fn best_time(input: &str) -> Duration {
+        (0..3)
+            .map(|_| {
+                let t = Instant::now();
+                std::hint::black_box(html_to_text(std::hint::black_box(input)));
+                t.elapsed()
+            })
+            .min()
+            .unwrap()
+    }
+
     #[test]
-    fn pathological_input_is_linear() {
+    fn pathological_input_results() {
         let lt = "<".repeat(1 << 20);
-        let t = Instant::now();
-        let out = html_to_text(&lt);
-        assert_eq!(out.len(), 1 << 20);
+        assert_eq!(html_to_text(&lt), lt);
+        // Never closed: text.
         let open = "<a".repeat(1 << 19);
-        assert_eq!(html_to_text(&open), "");
+        assert_eq!(html_to_text(&open), open);
         let scripts = "<script>".repeat(1 << 17);
         assert_eq!(html_to_text(&scripts), "");
+        let comments = "<!--".repeat(1 << 18);
+        assert_eq!(html_to_text(&comments), "");
         let amps = "&#".repeat(1 << 19);
         assert_eq!(html_to_text(&amps), amps);
-        assert!(t.elapsed() < Duration::from_secs(5), "too slow");
+    }
+
+    #[test]
+    fn pathological_input_is_linear() {
+        // For every kind of input, eight times the length must not take
+        // much more than eight times as long. A scan that is quadratic in
+        // the input takes 64 times as long, whatever the machine's speed;
+        // the limit of 24 times (plus a little for timer noise) lies
+        // between the two.
+        const N: usize = 1 << 14;
+        let started = Instant::now();
+        for (small, large) in hostile_inputs(N).iter().zip(hostile_inputs(8 * N)) {
+            let (t_small, t_large) = (best_time(small), best_time(&large));
+            assert!(
+                t_large <= t_small * 24 + Duration::from_millis(20),
+                "not linear: {t_small:?} for n, {t_large:?} for 8 n, input starts {:?}",
+                &small[..16]
+            );
+        }
+        // And an absolute bound, far above what linear scans need.
+        assert!(started.elapsed() < Duration::from_secs(30), "too slow");
     }
 
     #[test]

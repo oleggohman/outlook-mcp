@@ -9,7 +9,9 @@
 //! - `mail.db`: the finished database.
 //!
 //! Every file is mode 0600. A failed build removes its temporary files and
-//! leaves an existing `mail.db` untouched.
+//! leaves an existing `mail.db` untouched. An existing `mail.db` or `lock`
+//! is used only when it is a regular file owned by the current user (see
+//! [`check_private`]).
 
 use std::collections::BTreeMap;
 use std::fs::{DirBuilder, File, OpenOptions};
@@ -26,6 +28,7 @@ use crate::export::{self, ExportStats};
 use crate::header;
 use crate::item;
 use crate::kv::Store;
+use crate::mcp::log;
 use crate::mcp::text::{cap, html_to_text, lossy};
 use crate::props_gen::TYPES;
 
@@ -37,7 +40,7 @@ const TMP_PREFIX: &str = "mail.db.tmp-";
 
 /// Version of what [`prepare`] adds to the export; bump it whenever that
 /// changes, so databases of an older version are rebuilt.
-pub const FORMAT_VERSION: &str = "1";
+pub const FORMAT_VERSION: &str = "2";
 
 /// Default shortest time between two builds of a changed store, in seconds.
 pub const DEFAULT_REFRESH_SECS: u64 = 900;
@@ -50,6 +53,9 @@ const PROFILES_DIR: &str = "Library/Group Containers/UBF8T346G9.Office/Outlook/O
 
 /// Attempts at copying a store that changes while it is copied.
 const COPY_ATTEMPTS: usize = 3;
+
+/// `last_error` while a build runs; it stays when the build panics.
+const BUILD_UNFINISHED: &str = "the last cache build did not finish (internal error)";
 
 /// Longest body text put in the search index, in chars.
 const MAX_FTS_BODY: usize = 200_000;
@@ -139,22 +145,35 @@ pub struct Cache {
     /// by another process sharing the directory) and reuses it builds
     /// nothing and is not counted.
     pub builds: u64,
+    /// Called at the start of every build, with the lock held.
+    #[cfg(test)]
+    pub(crate) build_hook: Option<fn()>,
 }
 
 impl Cache {
     /// The cache for `store` in `dir`. Creates `dir` if needed and checks it
     /// (see [`ensure_dir`]); builds nothing. The refresh interval is
     /// [`DEFAULT_REFRESH_SECS`].
+    ///
+    /// `store` is resolved once, here, to an absolute path without symbolic
+    /// links (only made absolute when it does not exist yet), so the
+    /// `store_path` a database is kept under names one file whatever the
+    /// working directory.
     pub fn new(dir: &Path, store: &Path) -> Result<Cache, String> {
         ensure_dir(dir)?;
+        let store = std::fs::canonicalize(store)
+            .or_else(|_| std::path::absolute(store))
+            .unwrap_or_else(|_| store.to_path_buf());
         Ok(Cache {
             dir: dir.to_path_buf(),
-            store: store.to_path_buf(),
+            store,
             refresh_secs: DEFAULT_REFRESH_SECS as i64,
             db: None,
             last_attempt_unix: None,
             last_error: None,
             builds: 0,
+            #[cfg(test)]
+            build_hook: None,
         })
     }
 
@@ -167,13 +186,14 @@ impl Cache {
 
     /// The database to query at `now` (unix seconds), built or rebuilt
     /// first when needed:
-    /// - no usable `mail.db` (missing, not a database, no readable
-    ///   `mcp_meta`, another `format_version` or another store path) ->
-    ///   build, unless a build failed less than `refresh_secs` ago, in which
-    ///   case that error is returned;
+    /// - no usable `mail.db` (missing, not a private regular file, not a
+    ///   database, no readable `mcp_meta`, another `format_version` or
+    ///   another store path) -> build, unless a build failed less than
+    ///   `refresh_secs` ago, in which case that error is returned;
     /// - the live store differs from the one `mail.db` was built from and
     ///   the last build or attempt is at least `refresh_secs` old ->
-    ///   rebuild; if that fails the old database stays in use;
+    ///   rebuild; if that fails the old database stays in use. A build or
+    ///   attempt time after `now` does not count;
     /// - otherwise the open database is used.
     pub fn connection_at(&mut self, now: i64) -> Result<&Connection, String> {
         if self.db.is_none() {
@@ -190,8 +210,9 @@ impl Cache {
             }
             Some((_, meta)) => {
                 let changed = stamp(&self.store).ok() != meta.stamp();
-                let built = meta.int("built_unix").unwrap_or(i64::MIN);
-                let since = built.max(self.last_attempt_unix.unwrap_or(i64::MIN));
+                // A time after `now` would put the rebuild off for good.
+                let past = |t: Option<i64>| t.filter(|t| *t <= now).unwrap_or(i64::MIN);
+                let since = past(meta.int("built_unix")).max(past(self.last_attempt_unix));
                 if changed && now.saturating_sub(since) >= self.refresh_secs {
                     // On failure the old database stays in use; the error
                     // is kept in `last_error`.
@@ -229,13 +250,16 @@ impl Cache {
     /// taking the lock instead of building.
     fn attempt(&mut self, now: i64, reuse: bool) -> Result<(), String> {
         self.last_attempt_unix = Some(now);
+        // Set first, so a build that panics is recorded as failed too and
+        // is not repeated before `refresh_secs` have passed.
+        self.last_error = Some(BUILD_UNFINISHED.to_string());
         match self.build_locked(now, reuse) {
             Ok(_) => {
                 self.last_error = None;
                 Ok(())
             }
             Err(e) => {
-                eprintln!("hxprobe mcp: cache build failed: {e}");
+                log(&format!("cache build failed: {e}"));
                 self.last_error = Some(e.clone());
                 Err(e)
             }
@@ -284,6 +308,10 @@ impl Cache {
             }
         }
         self.builds += 1;
+        #[cfg(test)]
+        if let Some(hook) = self.build_hook {
+            hook();
+        }
         remove_leftovers(&self.dir);
 
         let pid = std::process::id();
@@ -338,18 +366,29 @@ impl Cache {
             .map_err(|e| format!("write build info: {e}"))?;
         conn.close()
             .map_err(|(_, e)| format!("close the database: {e}"))?;
+        // Written with `synchronous=OFF`: flush it before it replaces the
+        // database in use.
+        File::open(&tmp_path)
+            .and_then(|f| f.sync_all())
+            .map_err(|e| format!("flush the database: {e}"))?;
         std::fs::rename(&tmp_path, self.db_path())
             .map_err(|e| format!("replace {}: {e}", self.db_path().display()))?;
-        self.db = Some(open_db(&self.db_path(), &self.store)?);
+        // The old database is gone from the directory: stop using it even
+        // if the new one cannot be opened now (the next call tries again).
+        self.db = None;
+        self.db = Some(
+            open_db(&self.db_path(), &self.store)
+                .map_err(|e| format!("the new database is in place, but: {e}"))?,
+        );
 
-        eprintln!(
-            "hxprobe mcp: cache built in {} ms (copy {copy_ms}, export {export_ms}, prepare \
-             {prepare_ms}); {} objects, {} messages indexed, {} events",
+        log(&format!(
+            "cache built in {} ms (copy {copy_ms}, export {export_ms}, prepare {prepare_ms}); \
+             {} objects, {} messages indexed, {} events",
             ms_since(started),
             info.stats.objects,
             counts.messages,
             counts.events
-        );
+        ));
         Ok(Some(info))
     }
 }
@@ -381,14 +420,19 @@ pub fn default_store_path_in(base: &Path) -> Option<PathBuf> {
 }
 
 /// Open `path` read-only and read its `mcp_meta`. Fails unless the database
-/// is usable for `store`: readable `mcp_meta`, [`FORMAT_VERSION`] and the
-/// same store path.
+/// is usable for `store`: a private regular file (see [`check_private`]),
+/// readable `mcp_meta`, [`FORMAT_VERSION`] and the same store path.
 fn open_db(path: &Path, store: &Path) -> Result<(Connection, Meta), String> {
+    let m = std::fs::symlink_metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    check_private(&m).map_err(|e| format!("{} {e}", path.display()))?;
     let conn = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .map_err(|e| format!("open {}: {e}", path.display()))?;
+    // Sorts of a query stay in memory instead of spilling to `$TMPDIR`.
+    conn.execute_batch("PRAGMA temp_store=MEMORY; PRAGMA query_only=ON;")
+        .map_err(|e| format!("configure {}: {e}", path.display()))?;
     let meta = read_meta(&conn).map_err(|e| format!("read {}: {e}", path.display()))?;
     if meta.get("format_version") != Some(FORMAT_VERSION) {
         return Err(format!("{} has another format version", path.display()));
@@ -455,16 +499,41 @@ pub fn ensure_dir(dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Accept the metadata (not following a symbolic link) of a file found in
+/// the cache directory only if it is a regular file owned by the current
+/// user that neither group nor others can access. The directory may have
+/// been open to others before [`ensure_dir`] tightened it, so a file in it
+/// is not trusted for being there.
+fn check_private(m: &std::fs::Metadata) -> Result<(), &'static str> {
+    if !m.file_type().is_file() {
+        return Err("is not a regular file");
+    }
+    // SAFETY: getuid() has no preconditions and cannot fail.
+    if m.uid() != unsafe { libc::getuid() } {
+        return Err("is owned by another user");
+    }
+    if m.mode() & 0o077 != 0 {
+        return Err("is accessible by other users");
+    }
+    Ok(())
+}
+
 /// The open `lock` file of `dir`, locked exclusively; the lock is released
-/// when the file is closed.
+/// when the file is closed. An existing `lock` that is not a private
+/// regular file (see [`check_private`]) is removed and created again; a
+/// symbolic link is never followed.
 fn lock(dir: &Path) -> Result<File, String> {
     let path = dir.join(LOCK_NAME);
+    if std::fs::symlink_metadata(&path).is_ok_and(|m| check_private(&m).is_err()) {
+        std::fs::remove_file(&path).map_err(|e| format!("remove {}: {e}", path.display()))?;
+    }
     let f = OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
         .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
         .open(&path)
         .map_err(|e| format!("open {}: {e}", path.display()))?;
     loop {
@@ -534,6 +603,15 @@ fn stamp(path: &Path) -> std::io::Result<(u64, i64)> {
 /// the same before and after it; otherwise it is retried, up to
 /// [`COPY_ATTEMPTS`] times in all.
 fn copy_store(src: &Path, dst: &Path) -> Result<(u64, i64), String> {
+    copy_store_with(src, dst, stamp)
+}
+
+/// [`copy_store`] with `stamp` reading the source's `(len, mtime in ns)`.
+fn copy_store_with(
+    src: &Path,
+    dst: &Path,
+    mut stamp: impl FnMut(&Path) -> std::io::Result<(u64, i64)>,
+) -> Result<(u64, i64), String> {
     let shown = src.display();
     for _ in 0..COPY_ATTEMPTS {
         let before = stamp(src).map_err(|e| format!("store {shown}: {e}"))?;
@@ -630,8 +708,8 @@ fn fill_events(conn: &Connection, window: (u64, u64)) -> rusqlite::Result<usize>
 }
 
 /// Fill `mcp_fts` with one row per message: subject, sender (name and
-/// address), preview and the body as text (HTML body, else the first body
-/// part), capped at [`MAX_FTS_BODY`] chars.
+/// address), preview and the body as text (HTML body, else, when that is
+/// NULL or empty, the first body part), capped at [`MAX_FTS_BODY`] chars.
 fn fill_fts(conn: &Connection) -> rusqlite::Result<usize> {
     let mut sel = conn.prepare(
         "SELECT guid, Subject, SenderDisplayName, SenderEmailAddress, Preview, body_html,
@@ -650,7 +728,7 @@ fn fill_fts(conn: &Connection) -> rusqlite::Result<usize> {
             .flatten()
             .filter(|s| !s.is_empty())
             .collect();
-        let body = match text(5)? {
+        let body = match text(5)?.filter(|b| !b.is_empty()) {
             Some(b) => Some(b),
             None => text(6)?,
         };
@@ -891,7 +969,7 @@ mod tests {
         };
         // Body only, HTML converted.
         assert_eq!(fts_guids("body:attached"), [guid_hex(&MAIL_MSGS[0])]);
-        // The binary body is read lossily.
+        // The non-text body is read lossily.
         assert_eq!(fts_guids("body:zebra"), [guid_hex(&MAIL_MSGS[2])]);
         assert_eq!(fts_guids("subject:שלום"), [guid_hex(&MAIL_MSGS[1])]);
         assert_eq!(fts_guids("body:בבוקר"), [guid_hex(&MAIL_MSGS[1])]);
@@ -1068,6 +1146,39 @@ mod tests {
             .map(Result::unwrap)
             .collect();
         assert_eq!(got, ["aa", "gg"]);
+    }
+
+    #[test]
+    fn empty_html_body_falls_back_to_the_first_body_part() {
+        let conn = Connection::open_in_memory().unwrap();
+        let mm = mail_store();
+        crate::export::export(
+            &crate::kv::Store::load(&mm),
+            &mm,
+            &conn,
+            crate::item::tick_window_at(NOW),
+        )
+        .unwrap();
+        for (i, html) in [(0, Some("")), (1, None)] {
+            let n = conn
+                .execute(
+                    "UPDATE \"MessageData\" SET HTMLBodyBytes = ?1,
+                            HTMLFirstBodyBytes = '<p>first <b>walrus</b></p>'
+                     WHERE guid = (SELECT MessageData FROM \"MessageHeader\" WHERE guid = ?2)",
+                    rusqlite::params![html, guid_hex(&MAIL_MSGS[i])],
+                )
+                .unwrap();
+            assert_eq!(n, 1);
+        }
+        prepare(&conn, NOW_I).unwrap();
+        let bodies: Vec<String> = conn
+            .prepare("SELECT body FROM mcp_fts WHERE mcp_fts MATCH 'body:walrus' ORDER BY guid")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(bodies, ["first walrus", "first walrus"]);
     }
 
     // --- store discovery ---
@@ -1288,7 +1399,11 @@ mod tests {
         assert_eq!(messages(&mut b, NOW_I + 1), 4);
         assert_eq!(b.builds, 1);
         let meta = b.status().meta.unwrap();
-        assert_eq!(meta.get("store_path"), Some(&*other.to_string_lossy()));
+        assert_eq!(
+            meta.get("store_path"),
+            Some(&*b.store_path().to_string_lossy())
+        );
+        assert_eq!(b.store_path(), std::fs::canonicalize(&other).unwrap());
     }
 
     #[test]
@@ -1330,6 +1445,212 @@ mod tests {
         assert_eq!(b.builds, 0);
         assert_eq!(built_unix(&b), Some(NOW_I + 1000));
         assert_eq!(b.status().store_changed, Some(false));
+    }
+
+    // --- store path ---
+
+    #[test]
+    fn store_path_is_resolved_through_symbolic_links() {
+        let t = TestDir::new("storelink");
+        let mut a = lazy(&t, 900);
+        messages(&mut a, NOW_I);
+        let real = std::fs::canonicalize(t.0.join("HxStore.hxd")).unwrap();
+        assert_eq!(a.store_path(), real);
+        let link = t.0.join("link.hxd");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        // The same file under another name: the same database.
+        let mut b = Cache::new(&t.cache_dir(), &link).unwrap();
+        assert_eq!(b.store_path(), real);
+        assert_eq!(messages(&mut b, NOW_I + 5), 4);
+        assert_eq!(b.builds, 0);
+    }
+
+    #[test]
+    fn missing_store_path_is_made_absolute() {
+        let t = TestDir::new("storeabs");
+        let c = Cache::new(&t.cache_dir(), Path::new("no-such-dir/HxStore.hxd")).unwrap();
+        assert!(c.store_path().is_absolute());
+        assert!(c.store_path().ends_with("no-such-dir/HxStore.hxd"));
+    }
+
+    // --- query connection ---
+
+    #[test]
+    fn query_connection_is_read_only_and_keeps_temp_data_in_memory() {
+        let t = TestDir::new("pragmas");
+        let mut c = lazy(&t, 900);
+        let conn = c.connection_at(NOW_I).unwrap();
+        // 2 is MEMORY.
+        assert_eq!(count(conn, "PRAGMA temp_store"), 2);
+        assert_eq!(count(conn, "PRAGMA query_only"), 1);
+        assert!(conn.execute_batch("CREATE TABLE x(a)").is_err());
+    }
+
+    // --- a build that panics ---
+
+    /// `connection_at`, with a panic caught: `None` when it panicked.
+    fn caught(c: &mut Cache, now: i64) -> Option<Result<(), String>> {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            c.connection_at(now).map(drop)
+        }))
+        .ok()
+    }
+
+    #[test]
+    fn panicking_first_build_is_not_repeated_inside_the_interval() {
+        let t = TestDir::new("panicfirst");
+        let mut c = lazy(&t, 900);
+        c.build_hook = Some(|| panic!("build hook"));
+        assert_eq!(caught(&mut c, NOW_I), None);
+        assert_eq!(c.builds, 1);
+        assert_eq!(c.status().last_error, Some(BUILD_UNFINISHED));
+        // Inside the interval: the recorded error, no new build.
+        assert_eq!(
+            caught(&mut c, NOW_I + 10),
+            Some(Err(BUILD_UNFINISHED.to_string()))
+        );
+        assert_eq!(c.builds, 1);
+        // The lock was released and the next build works.
+        c.build_hook = None;
+        assert_eq!(messages(&mut c, NOW_I + 900), 4);
+        assert_eq!(c.builds, 2);
+        assert!(c.status().last_error.is_none());
+        assert_eq!(files(&t.cache_dir()), ["lock", "mail.db"]);
+    }
+
+    #[test]
+    fn panicking_rebuild_keeps_serving_and_waits_for_the_interval() {
+        let t = TestDir::new("panicre");
+        let mut c = lazy(&t, 900);
+        messages(&mut c, NOW_I);
+        touch(c.store_path(), 1_000_000);
+        c.build_hook = Some(|| panic!("build hook"));
+        assert_eq!(caught(&mut c, NOW_I + 1000), None);
+        assert_eq!(c.builds, 2);
+        assert_eq!(messages(&mut c, NOW_I + 1010), 4);
+        assert_eq!(c.builds, 2);
+        assert_eq!(c.status().last_error, Some(BUILD_UNFINISHED));
+    }
+
+    // --- files found in the cache directory ---
+
+    #[test]
+    fn database_open_to_others_is_rebuilt() {
+        let t = TestDir::new("widedb");
+        let mut a = lazy(&t, 900);
+        messages(&mut a, NOW_I);
+        std::fs::set_permissions(a.db_path(), std::fs::Permissions::from_mode(0o644)).unwrap();
+        let mut b = Cache::new(&t.cache_dir(), a.store_path()).unwrap();
+        assert_eq!(messages(&mut b, NOW_I + 5), 4);
+        assert_eq!(b.builds, 1);
+        assert_eq!(mode(&b.db_path()), 0o600);
+    }
+
+    #[test]
+    fn symlinked_database_is_not_used() {
+        let t = TestDir::new("linkdb");
+        let mut a = lazy(&t, 900);
+        messages(&mut a, NOW_I);
+        let before = std::fs::read(a.db_path()).unwrap();
+        // Another cache directory whose `mail.db` points at the first one.
+        let dir = t.0.join("cache2");
+        std::fs::create_dir(&dir).unwrap();
+        std::os::unix::fs::symlink(a.db_path(), dir.join(DB_NAME)).unwrap();
+        let mut b = Cache::new(&dir, a.store_path()).unwrap();
+        assert_eq!(messages(&mut b, NOW_I + 5), 4);
+        assert_eq!(b.builds, 1);
+        let m = std::fs::symlink_metadata(b.db_path()).unwrap();
+        assert!(m.file_type().is_file());
+        assert_eq!(std::fs::read(a.db_path()).unwrap(), before);
+    }
+
+    #[test]
+    fn symlinked_lock_is_replaced() {
+        let t = TestDir::new("linklock");
+        let target = t.0.join("target");
+        std::fs::write(&target, b"keep").unwrap();
+        let dir = t.cache_dir();
+        std::fs::create_dir(&dir).unwrap();
+        std::os::unix::fs::symlink(&target, dir.join(LOCK_NAME)).unwrap();
+        let mut c = Cache::new(&dir, &t.store(&mail_store())).unwrap();
+        c.build(NOW_I).unwrap();
+        let m = std::fs::symlink_metadata(dir.join(LOCK_NAME)).unwrap();
+        assert!(m.file_type().is_file());
+        assert_eq!(mode(&dir.join(LOCK_NAME)), 0o600);
+        assert_eq!(std::fs::read(&target).unwrap(), b"keep");
+        // A link to nothing is not followed either.
+        std::fs::remove_file(dir.join(LOCK_NAME)).unwrap();
+        std::os::unix::fs::symlink(t.0.join("absent"), dir.join(LOCK_NAME)).unwrap();
+        c.build(NOW_I + 1).unwrap();
+        assert!(!t.0.join("absent").exists());
+    }
+
+    #[test]
+    fn build_time_in_the_future_does_not_block_a_rebuild() {
+        let t = TestDir::new("future");
+        let mut a = lazy(&t, 900);
+        messages(&mut a, NOW_I + 100_000);
+        touch(a.store_path(), 1_000_000);
+        // Another server, whose clock is behind the build time.
+        let mut b = Cache::new(&t.cache_dir(), a.store_path()).unwrap();
+        assert_eq!(messages(&mut b, NOW_I), 4);
+        assert_eq!(b.builds, 1);
+        assert_eq!(built_unix(&b), Some(NOW_I));
+        // The same value, after its own clock went back.
+        touch(a.store_path(), 2_000_000);
+        messages(&mut a, NOW_I + 50_000);
+        assert_eq!(a.builds, 2);
+    }
+
+    // --- copying a store that changes ---
+
+    /// `copy_store_with` over a fixture store, with the source's stamp
+    /// taken from `stamps` in turn; the result and the number of stamps
+    /// read.
+    fn copy_with_stamps(name: &str, stamps: &[(u64, i64)]) -> (Result<(u64, i64), String>, usize) {
+        let t = TestDir::new(name);
+        let src = t.store(&mail_store());
+        let dst = t.0.join("copy");
+        let mut n = 0;
+        let r = copy_store_with(&src, &dst, |_| {
+            n += 1;
+            Ok(stamps[n - 1])
+        });
+        if r.is_ok() {
+            assert_eq!(std::fs::read(&dst).unwrap(), mail_store());
+            assert_eq!(mode(&dst), 0o600);
+        }
+        (r, n)
+    }
+
+    #[test]
+    fn copy_is_retried_when_the_store_changed_meanwhile() {
+        let len = mail_store().len() as u64;
+        // Unchanged: one attempt.
+        assert_eq!(
+            copy_with_stamps("copy1", &[(len, 1), (len, 1)]),
+            (Ok((len, 1)), 2)
+        );
+        // Changed during the first attempt, quiet during the second.
+        assert_eq!(
+            copy_with_stamps("copy2", &[(len, 1), (len, 2), (len, 2), (len, 2)]),
+            (Ok((len, 2)), 4)
+        );
+        // A copy of another length than the source had is not accepted.
+        let stamps = [(len + 1, 1), (len + 1, 1), (len, 2), (len, 2)];
+        assert_eq!(copy_with_stamps("copy3", &stamps), (Ok((len, 2)), 4));
+    }
+
+    #[test]
+    fn copy_gives_up_when_the_store_keeps_changing() {
+        let len = mail_store().len() as u64;
+        let stamps: Vec<(u64, i64)> = (0..2 * COPY_ATTEMPTS as i64).map(|i| (len, i)).collect();
+        let (r, n) = copy_with_stamps("copy4", &stamps);
+        assert_eq!(
+            r,
+            Err("the store kept changing during the copy".to_string())
+        );
+        assert_eq!(n, 2 * COPY_ATTEMPTS);
     }
 
     /// Create the optional type tables the way [`prepare`] does, so a test

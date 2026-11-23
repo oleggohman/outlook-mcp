@@ -390,7 +390,7 @@ pub const MAIL_EVENT_TIMES: [(i64, i64); 2] = [
 /// 2025-12-15 08:30 and 2025-11-20 17:45 UTC.
 pub const MAIL_SENT: [i64; 4] = [1_764_579_600, 1_765_368_000, 1_765_787_400, 1_763_660_700];
 
-/// The body of the binary message: odd length and not UTF-8, so the export
+/// The body of the non-text message: odd length and not UTF-8, so the export
 /// writes it as a BLOB.
 pub const MAIL_BINARY_BODY: &[u8] = b"<p>caf\xe9 zebra</p>";
 
