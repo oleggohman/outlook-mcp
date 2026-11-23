@@ -3,12 +3,24 @@
 # Claude Code plugin. It finds or installs the `hxprobe` program for the
 # version in hxprobe/Cargo.toml and replaces itself with `hxprobe mcp`.
 #
+# The program lives at one stable path, <install dir>/bin/hxprobe, for every
+# version, so one Full Disk Access entry serves every client and upgrade. The
+# installed version is asked with `hxprobe --version`: the wanted version or
+# a newer one is run as it is (never downgrade); a missing or older program,
+# or one without an answer (0.1.0), is replaced by a rename under the install
+# lock. The server starts its refresh service from its own path, so it is
+# always started from the stable path.
+#
 # stdout is the JSON-RPC channel of the server, so this script writes nothing
 # to it: stdout is parked on fd 3 and only handed back to the server at exec.
 #
 # Environment:
 #   HXPROBE_BIN           run this program instead of installing one
-#   CLAUDE_PLUGIN_DATA    data directory (set by Claude Code)
+#   HXPROBE_INSTALL_DIR   install directory (default:
+#                         $HOME/Library/Application Support/hxprobe)
+#   CLAUDE_PLUGIN_DATA    plugin data directory (set by Claude Code); only
+#                         legacy programs bin/hxprobe-<version> are removed
+#                         from it after an install
 #   HXPROBE_RELEASE_BASE  base URL of the release downloads
 #   HXPROBE_SUMS          checksum file (default: release/SHA256SUMS)
 #
@@ -37,7 +49,7 @@ if [ -n "${HXPROBE_BIN:-}" ]; then
     die "HXPROBE_BIN is set to '$HXPROBE_BIN', which is not an executable file. Fix the path or unset HXPROBE_BIN."
 fi
 
-# b. Version, data directory and program path.
+# b. Version, install directory and program path.
 script_dir=$(CDPATH='' cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 repo=$(dirname "$script_dir")
 manifest="$repo/hxprobe/Cargo.toml"
@@ -55,14 +67,68 @@ case "$version" in
     *[!0-9A-Za-z.+-]* ) die "unexpected version '$version' in $manifest" ;;
 esac
 
-data=${CLAUDE_PLUGIN_DATA:-$HOME/Library/Application Support/hxprobe-plugin}
-bindir="$data/bin"
-bin="$bindir/hxprobe-$version"
+inst=${HXPROBE_INSTALL_DIR:-$HOME/Library/Application Support/hxprobe}
+bindir="$inst/bin"
+bin="$bindir/hxprobe"
+# Earlier launchers installed <plugin data>/bin/hxprobe-<version>.
+legacy=${CLAUDE_PLUGIN_DATA:-$HOME/Library/Application Support/hxprobe-plugin}/bin
 (umask 077 && mkdir -p "$bindir") || die "cannot create $bindir"
-chmod 700 "$data" "$bindir" 2>/dev/null || true
+chmod 700 "$inst" "$bindir" 2>/dev/null || true
+
+# Prints -1, 0 or 1 when version $1 is older than, equal to or newer than $2,
+# comparing major, minor and patch as numbers; a suffix after `-` or `+` is
+# ignored. Prints `?` when either is not of that form.
+version_cmp() {
+    awk -v a="$1" -v b="$2" '
+        function parse(v, p,    n) {
+            sub(/[-+].*$/, "", v)
+            if (v !~ /^[0-9]+\.[0-9]+\.[0-9]+$/) return 0
+            n = split(v, p, ".")
+            return n == 3
+        }
+        BEGIN {
+            if (!parse(a, x) || !parse(b, y)) { print "?"; exit }
+            for (i = 1; i <= 3; i++) {
+                if (x[i] + 0 < y[i] + 0) { print -1; exit }
+                if (x[i] + 0 > y[i] + 0) { print 1; exit }
+            }
+            print 0
+        }'
+}
+
+# The version that the program at $bin reports (`hxprobe <version>` from
+# `--version`), or nothing when it is missing or gives no such answer.
+installed_version() {
+    local out
+    [ -f "$bin" ] && [ -x "$bin" ] || return 0
+    out=$("$bin" --version </dev/null 2>/dev/null 3>&- 9>&-) || return 0
+    case "$out" in
+        'hxprobe '* ) out=${out#hxprobe } ;;
+        * ) return 0 ;;
+    esac
+    case "$out" in
+        '' | *[!0-9A-Za-z.+-]* ) return 0 ;;
+    esac
+    printf '%s\n' "$out"
+}
+
+# Succeeds when the installed program is to be run: it reports the wanted
+# version or a newer one. A newer one is kept (never downgrade: clients with
+# different plugin versions would otherwise reinstall on every start).
+installed_ok() {
+    local have
+    have=$(installed_version)
+    [ -n "$have" ] || return 1
+    case "$(version_cmp "$have" "$version")" in
+        0 ) return 0 ;;
+        1 ) log "hxprobe $have at $bin is newer than $version of this plugin; running it"
+            return 0 ;;
+    esac
+    return 1
+}
 
 # c. Already installed.
-if [ -f "$bin" ] && [ -x "$bin" ]; then
+if installed_ok; then
     run_server "$bin" ${1+"$@"}
 fi
 
@@ -136,7 +202,7 @@ run_child() {
 # there is no stale lock to detect. Without either tool the install runs
 # unlocked; build directories are per process, so two installs at once cost
 # time but do not disturb each other.
-lock="$data/install.lock"
+lock="$inst/install.lock"
 lock_held=0
 
 acquire_lock() {
@@ -200,25 +266,27 @@ pid_gone() {
 # it only those of processes that are gone.
 remove_old_build_dirs() {
     local d
-    if [ "$lock_held" = 1 ]; then rm -rf "$data/target"; fi
-    for d in "$data"/target.*; do
+    if [ "$lock_held" = 1 ]; then rm -rf "$inst/target"; fi
+    for d in "$inst"/target.*; do
         [ -d "$d" ] || continue
         if [ "$lock_held" = 1 ] || pid_gone "${d##*.}"; then rm -rf "$d"; fi
     done
 }
 
-# Move a verified or freshly built file into place, drop other versions and
-# start the server.
+# Move a verified or freshly built file into place, remove the programs of
+# earlier launchers and start the server. The move is a rename in one
+# directory: atomic, and a new file, so running copies of the old program
+# keep their file (overwriting a signed program in place would invalidate
+# the signature of running copies).
 install_and_run() {
     local src=$1 f
     shift
     chmod 700 "$src" || die "cannot make $src executable"
     mv -f "$src" "$bin" || die "cannot move $src to $bin"
     tmp_file=''
-    for f in "$bindir"/hxprobe-*; do
-        [ -e "$f" ] || continue
-        [ "$f" = "$bin" ] && continue
-        rm -f "$f"
+    for f in "$legacy"/hxprobe-*; do
+        [ -f "$f" ] || continue
+        rm -f "$f" || true
     done
     release_lock
     log "installed hxprobe $version at $bin"
@@ -227,7 +295,7 @@ install_and_run() {
 
 acquire_lock
 # Another start may have finished the install while this one waited.
-if [ -f "$bin" ] && [ -x "$bin" ]; then
+if installed_ok; then
     release_lock
     run_server "$bin" ${1+"$@"}
 fi
@@ -292,7 +360,8 @@ fi
 # e. Build from source with cargo, in a directory of this process.
 if command -v cargo >/dev/null 2>&1; then
     log "building hxprobe $version with cargo (first start only, about a minute)"
-    build_dir="$data/target.$$"
+    log "note: a program built here is not signed with the release identity, so a Full Disk Access grant for $bin may not survive the next build"
+    build_dir="$inst/target.$$"
     if ! run_child cargo build --release --locked \
             --manifest-path "$manifest" --target-dir "$build_dir"; then
         die "cargo build failed; see the messages above"

@@ -2,7 +2,9 @@
 # Tests for scripts/run-mcp.sh. No network: downloads come from file:// URLs,
 # and the program is a small shell script that prints its arguments.
 # Each case runs against a temporary copy of the repository layout, so the
-# real release/SHA256SUMS is never touched.
+# real release/SHA256SUMS is never touched, and with HOME, the install
+# directory (HXPROBE_INSTALL_DIR) and the plugin data directory
+# (CLAUDE_PLUGIN_DATA) in a temporary directory.
 
 set -euo pipefail
 
@@ -32,18 +34,56 @@ if ( : >&3 ) 2>/dev/null; then f3=open; fi
 if ( : >&9 ) 2>/dev/null; then f9=open; fi'
 fds_closed='fd3=closed fd9=closed'
 
-# Fake program: prints its arguments to stdout and leaves a marker file that
-# holds the state of fd 3 and fd 9. $3 is optional shell code to run last.
+# Fake program: answers `--version` with `hxprobe $4` (without $4 it fails
+# with a usage message and status 2, as 0.1.0 does). Otherwise it prints its
+# arguments to stdout and leaves a marker file that holds the state of fd 3
+# and fd 9, and the file `<marker>.path` with the path it was run as. $3 is
+# optional shell code to run last.
 make_fake() {
-    # $1 = path, $2 = marker file
+    # $1 = path, $2 = marker file, $3 = shell code, $4 = version
     cat > "$1" <<EOF
 #!/bin/sh
+if [ "\$1" = --version ]; then
+    if [ -n "${4:-}" ]; then echo "hxprobe ${4:-}"; exit 0; fi
+    echo "usage: hxprobe <command>" >&2
+    exit 2
+fi
 echo "FAKE \$*"
 $fd_probe
 echo "fd3=\$f3 fd9=\$f9" > "$2"
+printf '%s\n' "\$0" > "$2.path"
 ${3:-}
 EOF
     chmod 755 "$1"
+}
+
+# The inode number of file $1, or `none`.
+inode() { stat -f %i "$1" 2>/dev/null || echo none; }
+
+# The permission bits of $1, or `none`.
+mode_of() { stat -f %Lp "$1" 2>/dev/null || echo none; }
+
+# A release asset of the wanted version in repo $1 (served from file://$1/rel)
+# that writes marker $1/ran, and its checksum line in release/SHA256SUMS.
+make_asset() {
+    mkdir -p "$1/rel/v$version"
+    make_fake "$1/rel/v$version/$asset" "$1/ran" '' "$version"
+    printf '%s  %s\n' "$(shasum -a 256 "$1/rel/v$version/$asset" | awk '{print $1}')" "$asset" \
+        > "$1/release/SHA256SUMS"
+}
+
+# A curl stub in $1/stub that appends its arguments to $1/curl-args, records
+# whether the install lock of $1/inst is held (`held` or `free`) in
+# $1/curl-lock and then runs the real curl.
+make_curl_probe() {
+    mkdir -p "$1/stub"
+    cat > "$1/stub/curl" <<EOF
+#!/bin/sh
+printf '%s\n' "\$*" >> "$1/curl-args"
+if lockf -k -s -t 0 "$1/inst/install.lock" true 2>/dev/null; then echo free; else echo held; fi >> "$1/curl-lock"
+exec /usr/bin/curl "\$@"
+EOF
+    chmod 755 "$1/stub/curl"
 }
 
 # A fresh repository layout: scripts/run-mcp.sh, hxprobe/Cargo.toml and an
@@ -68,7 +108,9 @@ EOF
 
 # Runs the launcher of repo $1 with the remaining arguments as `env` settings
 # followed by `--` and launcher arguments. Sets out, err, rc. The launcher
-# starts with fd 9 open, as it would under a parent that leaks one.
+# starts with fd 9 open, as it would under a parent that leaks one. The
+# install directory is $1/inst and the plugin data directory $1/data unless
+# the settings say otherwise (an empty value selects the default).
 run() {
     local r=$1
     shift
@@ -78,19 +120,20 @@ run() {
     rc=0
     # shellcheck disable=SC2086
     env -u HXPROBE_BIN -u HXPROBE_RELEASE_BASE -u HXPROBE_SUMS -u CLAUDE_PLUGIN_DATA \
-        HOME="$root/home" $envs \
+        -u HXPROBE_INSTALL_DIR \
+        HOME="$root/home" HXPROBE_INSTALL_DIR="$r/inst" CLAUDE_PLUGIN_DATA="$r/data" $envs \
         bash "$r/scripts/run-mcp.sh" "$@" > "$root/out" 2> "$root/err" 9> "$root/fd9" || rc=$?
     out=$(cat "$root/out")
     err=$(cat "$root/err")
 }
 
-# Succeeds when nobody holds the install lock of data directory $1.
+# Succeeds when nobody holds the install lock of install directory $1.
 lock_free() {
     [ ! -e "$1/install.lock" ] || lockf -k -s -t 0 "$1/install.lock" true
 }
 
-# Counts leftovers of an install in data directory $1: temp files and build
-# directories.
+# Counts leftovers of an install in install directory $1: temp files and
+# build directories.
 leftovers() {
     find "$1" -mindepth 1 \( -name '.download.*' -o -name '.build.*' -o -name 'target' -o -name 'target.*' \) | wc -l | tr -d ' '
 }
@@ -131,7 +174,11 @@ while [ \$# -gt 0 ]; do
     shift
 done
 mkdir -p "\$t/release"
-printf '#!/bin/sh\necho "BUILT \$*"\n' > "\$t/release/hxprobe"
+cat > "\$t/release/hxprobe" <<'PROG'
+#!/bin/sh
+if [ "\$1" = --version ]; then echo "hxprobe $version"; exit 0; fi
+echo "BUILT \$*"
+PROG
 chmod 755 "\$t/release/hxprobe"
 EOF
     chmod 755 "$1/stub/cargo"
@@ -146,8 +193,8 @@ run_many() {
     i=0
     while [ "$i" -lt "$n" ]; do
         env -u HXPROBE_BIN -u HXPROBE_RELEASE_BASE -u HXPROBE_SUMS \
-            HOME="$root/home" CLAUDE_PLUGIN_DATA="$r/data" PATH="$path" \
-            bash "$r/scripts/run-mcp.sh" > "$r/out.$i" 2> "$r/err.$i" &
+            HOME="$root/home" HXPROBE_INSTALL_DIR="$r/inst" CLAUDE_PLUGIN_DATA="$r/data" \
+            PATH="$path" bash "$r/scripts/run-mcp.sh" > "$r/out.$i" 2> "$r/err.$i" &
         pids="$pids $!"
         i=$((i + 1))
     done
@@ -158,71 +205,87 @@ run_many() {
     done
 }
 
-# (i) HXPROBE_BIN runs the given program with `mcp` and the arguments.
+# (i) HXPROBE_BIN runs the given program with `mcp` and the arguments, and
+# installs nothing.
 t='HXPROBE_BIN'
 r=$(make_repo)
 make_fake "$r/fake" "$r/ran"
-run "$r" HXPROBE_BIN="$r/fake" CLAUDE_PLUGIN_DATA="$r/data" -- --store /x
+run "$r" HXPROBE_BIN="$r/fake" -- --store /x
 if [ "$rc" = 0 ] && [ "$out" = 'FAKE mcp --store /x' ] && [ -z "$err" ] \
-    && [ "$(cat "$r/ran")" = "$fds_closed" ]; then pass "$t"
+    && [ "$(cat "$r/ran")" = "$fds_closed" ] && [ "$(cat "$r/ran.path")" = "$r/fake" ] \
+    && [ ! -e "$r/inst" ] && [ ! -e "$r/data" ]; then pass "$t"
 else fail "$t" "rc=$rc out='$out' err='$err' fds='$(cat "$r/ran" 2>/dev/null || true)'"; fi
 
 # (i-b) HXPROBE_BIN that is not executable is an error, not a fallback.
 t='HXPROBE_BIN not executable'
-run "$r" HXPROBE_BIN="$r/missing" CLAUDE_PLUGIN_DATA="$r/data" --
+run "$r" HXPROBE_BIN="$r/missing" --
 if [ "$rc" = 1 ] && [ -z "$out" ] && [[ "$err" == 'hxprobe plugin: HXPROBE_BIN is set'* ]]; then pass "$t"
 else fail "$t" "rc=$rc out='$out' err='$err'"; fi
 
-# (ii) An installed program for the version is run directly, without
-# arguments too (bash 3.2 with set -u and an empty "$@").
-t='cached program'
+# (ii) An installed program that reports the wanted version is run from the
+# stable path without a download, without arguments too (bash 3.2 with set -u
+# and an empty "$@"). Legacy programs stay: nothing was installed.
+t='installed program of the version'
 r=$(make_repo)
-mkdir -p "$r/data/bin"
-make_fake "$r/data/bin/hxprobe-$version" "$r/ran"
-run "$r" CLAUDE_PLUGIN_DATA="$r/data" PATH="$nocargo_path" --
+make_asset "$r"
+make_curl_probe "$r"
+mkdir -p "$r/inst/bin" "$r/data/bin"
+make_fake "$r/inst/bin/hxprobe" "$r/inst-ran" '' "$version"
+make_fake "$r/data/bin/hxprobe-0.1.0" "$r/old-ran"
+run "$r" HXPROBE_RELEASE_BASE="file://$r/rel" PATH="$r/stub:$nocargo_path" --
 if [ "$rc" = 0 ] && [ "$out" = 'FAKE mcp' ] && [ -z "$err" ] \
-    && [ "$(cat "$r/ran")" = "$fds_closed" ]; then pass "$t"
-else fail "$t" "rc=$rc out='$out' err='$err' fds='$(cat "$r/ran" 2>/dev/null || true)'"; fi
+    && [ "$(cat "$r/inst-ran")" = "$fds_closed" ] \
+    && [ "$(cat "$r/inst-ran.path")" = "$r/inst/bin/hxprobe" ] \
+    && [ ! -e "$r/curl-args" ] && [ -e "$r/data/bin/hxprobe-0.1.0" ]; then pass "$t"
+else fail "$t" "rc=$rc out='$out' err='$err' curl='$(cat "$r/curl-args" 2>/dev/null || true)'"; fi
 
-# (ii-b) Default data directory under HOME, created with mode 0700.
-t='default data dir'
+# (ii-b) Default install directory under HOME: the program is installed as
+# $HOME/Library/Application Support/hxprobe/bin/hxprobe, the directories
+# with mode 0700, and run from there.
+t='default install dir'
 r=$(make_repo)
-d="$root/home/Library/Application Support/hxprobe-plugin"
-mkdir -p "$d/bin"
-make_fake "$d/bin/hxprobe-$version" "$r/ran"
-run "$r" PATH="$nocargo_path" -- a b
-mode=$(stat -f %Lp "$d/bin" 2>/dev/null || echo none)
-if [ "$rc" = 0 ] && [ "$out" = 'FAKE mcp a b' ] && [ "$mode" = 700 ]; then pass "$t"
-else fail "$t" "rc=$rc out='$out' mode=$mode err='$err'"; fi
+make_asset "$r"
+d="$root/home/Library/Application Support/hxprobe"
+run "$r" HXPROBE_INSTALL_DIR= HXPROBE_RELEASE_BASE="file://$r/rel" PATH="$nocargo_path" -- a b
+if [ "$rc" = 0 ] && [ "$out" = 'FAKE mcp a b' ] && [ "$(mode_of "$d")" = 700 ] \
+    && [ "$(mode_of "$d/bin")" = 700 ] && [ "$(mode_of "$d/bin/hxprobe")" = 700 ] \
+    && [ "$(cat "$r/ran.path")" = "$d/bin/hxprobe" ] && [ ! -e "$r/inst" ]; then pass "$t"
+else fail "$t" "rc=$rc out='$out' modes=$(mode_of "$d")/$(mode_of "$d/bin") err='$err'"; fi
 rm -rf "$root/home"
 
-# (iii) Download with a matching checksum: installed with mode 0700, other
-# versions removed, no temp files left, server started.
+# (iii) Download with a matching checksum: installed as <install dir>/bin/hxprobe
+# with mode 0700 in directories of mode 0700, legacy versioned programs in
+# <plugin data>/bin removed (other files stay), no temp files left, server
+# started from the stable path.
 t='download, checksum match'
 r=$(make_repo)
 mkdir -p "$r/rel/v$version" "$r/data/bin"
-make_fake "$r/rel/v$version/$asset" "$r/ran"
+make_fake "$r/rel/v$version/$asset" "$r/ran" '' "$version"
 sum=$(shasum -a 256 "$r/rel/v$version/$asset" | awk '{print $1}')
 printf '# test sums\n%s  %s\n' "$sum" "$asset" > "$r/sums"
 make_fake "$r/data/bin/hxprobe-0.0.1" "$r/old-ran"
-run "$r" CLAUDE_PLUGIN_DATA="$r/data" HXPROBE_RELEASE_BASE="file://$r/rel" \
+make_fake "$r/data/bin/hxprobe-$version" "$r/old-ran"
+: > "$r/data/bin/notes"
+run "$r" HXPROBE_RELEASE_BASE="file://$r/rel" \
     HXPROBE_SUMS="$r/sums" PATH="$nocargo_path" -- --refresh-secs 0
-mode=$(stat -f %Lp "$r/data/bin/hxprobe-$version" 2>/dev/null || echo none)
-left=$(find "$r/data" -mindepth 1 \( -name '.download.*' -o -name 'hxprobe-0.0.1' \) | wc -l | tr -d ' ')
-if [ "$rc" = 0 ] && [ "$out" = 'FAKE mcp --refresh-secs 0' ] && [ "$mode" = 700 ] \
-    && [ "$left" = 0 ] && lock_free "$r/data" \
+b="$r/inst/bin/hxprobe"
+left=$({ find "$r/inst" "$r/data" -mindepth 1 \( -name '.download.*' -o -name 'hxprobe-*' \) \
+    2>/dev/null || true; } | wc -l | tr -d ' ')
+if [ "$rc" = 0 ] && [ "$out" = 'FAKE mcp --refresh-secs 0' ] && [ "$(mode_of "$b")" = 700 ] \
+    && [ "$(mode_of "$r/inst")" = 700 ] && [ "$(mode_of "$r/inst/bin")" = 700 ] \
+    && [ "$(cat "$r/ran.path")" = "$b" ] && cmp -s "$b" "$r/rel/v$version/$asset" \
+    && [ "$left" = 0 ] && [ -e "$r/data/bin/notes" ] && lock_free "$r/inst" \
     && [[ "$err" == *'checksum of '"$asset"' verified'* ]]; then pass "$t"
-else fail "$t" "rc=$rc out='$out' mode=$mode left=$left err='$err'"; fi
+else fail "$t" "rc=$rc out='$out' mode=$(mode_of "$b") left=$left err='$err'"; fi
 
 # (iii-b) A non-file base URL is limited to https: http:// is refused by curl
 # before any connection, so the launcher falls through to the final error.
 t='download refuses http'
 r=$(make_repo)
 printf '%s  %s\n' "$sum" "$asset" > "$r/release/SHA256SUMS"
-run "$r" CLAUDE_PLUGIN_DATA="$r/data" HXPROBE_RELEASE_BASE="http://127.0.0.1:9" \
-    PATH="$nocargo_path" --
+run "$r" HXPROBE_RELEASE_BASE="http://127.0.0.1:9" PATH="$nocargo_path" --
 if [ "$rc" = 1 ] && [ -z "$out" ] && [[ "$err" == *"download of $asset failed"* ]] \
-    && [ ! -e "$r/data/bin/hxprobe-$version" ]; then pass "$t"
+    && [ ! -e "$r/inst/bin/hxprobe" ]; then pass "$t"
 else fail "$t" "rc=$rc out='$out' err='$err'"; fi
 
 # (iii-c) The options that curl is given, recorded by a stub: https only
@@ -241,11 +304,9 @@ echo "fd3=\$f3 fd9=\$f9" >> "$r/curl-fds"
 exit 22
 EOF
 chmod 755 "$r/stub/curl"
-run "$r" CLAUDE_PLUGIN_DATA="$r/data" PATH="$r/stub:$nocargo_path" --
-run "$r" CLAUDE_PLUGIN_DATA="$r/data" HXPROBE_RELEASE_BASE="http://127.0.0.1:9" \
-    PATH="$r/stub:$nocargo_path" --
-run "$r" CLAUDE_PLUGIN_DATA="$r/data" HXPROBE_RELEASE_BASE="file://$r/rel" \
-    PATH="$r/stub:$nocargo_path" --
+run "$r" PATH="$r/stub:$nocargo_path" --
+run "$r" HXPROBE_RELEASE_BASE="http://127.0.0.1:9" PATH="$r/stub:$nocargo_path" --
+run "$r" HXPROBE_RELEASE_BASE="file://$r/rel" PATH="$r/stub:$nocargo_path" --
 a1=$(sed -n 1p "$r/curl-args" 2>/dev/null || true)
 a2=$(sed -n 2p "$r/curl-args" 2>/dev/null || true)
 a3=$(sed -n 3p "$r/curl-args" 2>/dev/null || true)
@@ -268,44 +329,96 @@ else fail "$t" "rc=$rc a1='$a1' a2='$a2' a3='$a3' fds='$(cat "$r/curl-fds" 2>/de
 # installed and no temp file is left.
 t='install failure stops'
 r=$(make_repo)
-mkdir -p "$r/rel/v$version" "$r/stub"
-make_fake "$r/rel/v$version/$asset" "$r/ran"
-printf '%s  %s\n' "$(shasum -a 256 "$r/rel/v$version/$asset" | awk '{print $1}')" "$asset" > "$r/release/SHA256SUMS"
+make_asset "$r"
+mkdir -p "$r/stub"
 printf '#!/bin/sh\necho "mv: stub failure" >&2\nexit 1\n' > "$r/stub/mv"
 chmod 755 "$r/stub/mv"
-run "$r" CLAUDE_PLUGIN_DATA="$r/data" HXPROBE_RELEASE_BASE="file://$r/rel" \
-    PATH="$r/stub:$nocargo_path" --
+run "$r" HXPROBE_RELEASE_BASE="file://$r/rel" PATH="$r/stub:$nocargo_path" --
 if [ "$rc" = 1 ] && [ -z "$out" ] && [ ! -e "$r/ran" ] && [[ "$err" == *'cannot move'* ]] \
-    && [[ "$err" != *'installed hxprobe'* ]] && [ ! -e "$r/data/bin/hxprobe-$version" ] \
-    && [ "$(leftovers "$r/data")" = 0 ] && lock_free "$r/data"; then pass "$t"
+    && [[ "$err" != *'installed hxprobe'* ]] && [ ! -e "$r/inst/bin/hxprobe" ] \
+    && [ "$(leftovers "$r/inst")" = 0 ] && lock_free "$r/inst"; then pass "$t"
 else fail "$t" "rc=$rc out='$out' err='$err'"; fi
 
 # (iv) Checksum mismatch: the file is not run and not left behind.
 t='download, checksum mismatch'
 r=$(make_repo)
-mkdir -p "$r/rel/v$version"
-make_fake "$r/rel/v$version/$asset" "$r/ran"
+make_asset "$r"
 printf '%s  %s\n' "$(printf '0%.0s' $(seq 64))" "$asset" > "$r/release/SHA256SUMS"
-run "$r" CLAUDE_PLUGIN_DATA="$r/data" HXPROBE_RELEASE_BASE="file://$r/rel" \
-    PATH="$nocargo_path" --
-files=$(find "$r/data/bin" -mindepth 1 | wc -l | tr -d ' ')
+run "$r" HXPROBE_RELEASE_BASE="file://$r/rel" PATH="$nocargo_path" --
+files=$({ find "$r/inst/bin" -mindepth 1 2>/dev/null || true; } | wc -l | tr -d ' ')
 if [ "$rc" = 1 ] && [ -z "$out" ] && [ ! -e "$r/ran" ] && [ "$files" = 0 ] \
-    && [[ "$err" == *'checksum mismatch'* ]] && lock_free "$r/data"; then pass "$t"
+    && [[ "$err" == *'checksum mismatch'* ]] && lock_free "$r/inst"; then pass "$t"
 else fail "$t" "rc=$rc out='$out' files=$files err='$err'"; fi
+
+# (iv-b) Checksum mismatch with an older program installed: that program is
+# left untouched (same file, same content) and neither file is run.
+t='checksum mismatch keeps the installed program'
+r=$(make_repo)
+make_asset "$r"
+printf '%s  %s\n' "$(printf '0%.0s' $(seq 64))" "$asset" > "$r/release/SHA256SUMS"
+mkdir -p "$r/inst/bin"
+make_fake "$r/inst/bin/hxprobe" "$r/old-ran" '' 9.8.6
+cp "$r/inst/bin/hxprobe" "$r/old-copy"
+ino=$(inode "$r/inst/bin/hxprobe")
+run "$r" HXPROBE_RELEASE_BASE="file://$r/rel" PATH="$nocargo_path" --
+if [ "$rc" = 1 ] && [ -z "$out" ] && [ ! -e "$r/ran" ] && [ ! -e "$r/old-ran" ] \
+    && [ "$(inode "$r/inst/bin/hxprobe")" = "$ino" ] && cmp -s "$r/inst/bin/hxprobe" "$r/old-copy" \
+    && [ "$(leftovers "$r/inst")" = 0 ] && [[ "$err" == *'checksum mismatch'* ]] \
+    && lock_free "$r/inst"; then pass "$t"
+else fail "$t" "rc=$rc out='$out' err='$err'"; fi
+
+# (iv-c) An older installed program is replaced by a rename under the
+# install lock: a new file (new inode) with the asset's bytes, no temp file
+# left, the new program run. The same for a program that gives no answer to
+# --version (0.1.0 prints its usage and exits 2).
+for kind in older 'without --version'; do
+    t="$kind program replaced"
+    r=$(make_repo)
+    make_asset "$r"
+    make_curl_probe "$r"
+    mkdir -p "$r/inst/bin"
+    if [ "$kind" = older ]; then have=9.8.6; else have=''; fi
+    make_fake "$r/inst/bin/hxprobe" "$r/old-ran" '' "$have"
+    ino=$(inode "$r/inst/bin/hxprobe")
+    run "$r" HXPROBE_RELEASE_BASE="file://$r/rel" PATH="$r/stub:$nocargo_path" --
+    b="$r/inst/bin/hxprobe"
+    if [ "$rc" = 0 ] && [ "$out" = 'FAKE mcp' ] && [ ! -e "$r/old-ran" ] \
+        && [ "$(cat "$r/ran.path")" = "$b" ] && [ "$(inode "$b")" != "$ino" ] \
+        && cmp -s "$b" "$r/rel/v$version/$asset" && [ "$(mode_of "$b")" = 700 ] \
+        && [ "$(cat "$r/curl-lock")" = held ] && [ "$(leftovers "$r/inst")" = 0 ] \
+        && [ "$(find "$r/inst/bin" -mindepth 1 | wc -l | tr -d ' ')" = 1 ] \
+        && lock_free "$r/inst"; then pass "$t"
+    else fail "$t" "rc=$rc out='$out' lock='$(cat "$r/curl-lock" 2>/dev/null || true)' err='$err'"; fi
+done
+
+# (iv-d) A newer installed program is run as it is, with a log line: never
+# downgrade. 9.10.0 is newer than 9.8.7 only when compared by numbers.
+t='newer program kept'
+r=$(make_repo)
+make_asset "$r"
+make_curl_probe "$r"
+mkdir -p "$r/inst/bin"
+make_fake "$r/inst/bin/hxprobe" "$r/new-ran" '' 9.10.0
+ino=$(inode "$r/inst/bin/hxprobe")
+run "$r" HXPROBE_RELEASE_BASE="file://$r/rel" PATH="$r/stub:$nocargo_path" --
+if [ "$rc" = 0 ] && [ "$out" = 'FAKE mcp' ] && [ -e "$r/new-ran" ] && [ ! -e "$r/ran" ] \
+    && [ "$(inode "$r/inst/bin/hxprobe")" = "$ino" ] && [ ! -e "$r/curl-args" ] \
+    && [[ "$err" == *'9.10.0'*'newer'* ]]; then pass "$t"
+else fail "$t" "rc=$rc out='$out' err='$err'"; fi
 
 # (v) No cargo and no asset: exit 1 with the fix.
 t='no cargo, no asset'
 r=$(make_repo)
-run "$r" CLAUDE_PLUGIN_DATA="$r/data" PATH="$nocargo_path" --
+run "$r" PATH="$nocargo_path" --
 if [ "$rc" = 1 ] && [ -z "$out" ] && [[ "$err" == *'https://rustup.rs'* ]] \
-    && [[ "$err" == *HXPROBE_BIN* ]] && lock_free "$r/data"; then pass "$t"
+    && [[ "$err" == *HXPROBE_BIN* ]] && lock_free "$r/inst"; then pass "$t"
 else fail "$t" "rc=$rc out='$out' err='$err'"; fi
 
 # (v-b) Missing version in Cargo.toml: clear error.
 t='no version'
 r=$(make_repo)
 printf '[package]\nname = "hxprobe"\n[dependencies]\nversion = "1"\n' > "$r/hxprobe/Cargo.toml"
-run "$r" CLAUDE_PLUGIN_DATA="$r/data" PATH="$nocargo_path" --
+run "$r" PATH="$nocargo_path" --
 if [ "$rc" = 1 ] && [ -z "$out" ] && [[ "$err" == *'no version found'* ]]; then pass "$t"
 else fail "$t" "rc=$rc out='$out' err='$err'"; fi
 
@@ -317,50 +430,68 @@ t='stdout clean'
 r=$(make_repo)
 make_cargo_stub "$r" ''
 printf 'request\n' > "$r/stdin"
-run "$r" CLAUDE_PLUGIN_DATA="$r/data" PATH="$r/stub:$nocargo_path" -- x < "$r/stdin"
+run "$r" PATH="$r/stub:$nocargo_path" -- x < "$r/stdin"
 built_ok=0
 if [ "$rc" = 0 ] && [ "$out" = 'BUILT mcp x' ] && [[ "$err" == *'cargo noise on stdout'* ]] \
-    && [ "$(leftovers "$r/data")" = 0 ] && [ -x "$r/data/bin/hxprobe-$version" ] \
+    && [ "$(leftovers "$r/inst")" = 0 ] && [ -x "$r/inst/bin/hxprobe" ] \
     && [ "$(cat "$r/cargo-fds")" = "$fds_closed" ] && [ -e "$r/cargo-stdin" ] \
     && [ ! -s "$r/cargo-stdin" ]; then built_ok=1; fi
 r2=$(make_repo)
-make_fake "$r2/rel-$asset" "$r2/ran"
-mkdir -p "$r2/rel/v$version"
-mv "$r2/rel-$asset" "$r2/rel/v$version/$asset"
-printf '%s  %s\n' "$(shasum -a 256 "$r2/rel/v$version/$asset" | awk '{print $1}')" "$asset" > "$r2/release/SHA256SUMS"
-run "$r2" CLAUDE_PLUGIN_DATA="$r2/data" HXPROBE_RELEASE_BASE="file://$r2/rel" PATH="$nocargo_path" --
+make_asset "$r2"
+run "$r2" HXPROBE_RELEASE_BASE="file://$r2/rel" PATH="$nocargo_path" --
 if [ "$built_ok" = 1 ] && [ "$rc" = 0 ] && [ "$out" = 'FAKE mcp' ]; then pass "$t"
 else fail "$t" "built_ok=$built_ok rc=$rc out='$out' cargo-fds='$(cat "$r/cargo-fds" 2>/dev/null || true)' err='$err'"; fi
+
+# (vi-b) The cargo build is installed at the same stable path, replacing an
+# older program by a rename, and the launcher notes that a Full Disk Access
+# grant for a program built here may not survive the next build. Legacy
+# programs are removed after the install.
+t='cargo build at the stable path'
+r=$(make_repo)
+make_cargo_stub "$r" ''
+mkdir -p "$r/inst/bin" "$r/data/bin"
+make_fake "$r/inst/bin/hxprobe" "$r/old-ran" '' 9.8.6
+make_fake "$r/data/bin/hxprobe-0.1.0" "$r/old-ran"
+ino=$(inode "$r/inst/bin/hxprobe")
+run "$r" PATH="$r/stub:$nocargo_path" --
+b="$r/inst/bin/hxprobe"
+if [ "$rc" = 0 ] && [ "$out" = 'BUILT mcp' ] && [ "$(mode_of "$b")" = 700 ] \
+    && [ "$(inode "$b")" != "$ino" ] && [ ! -e "$r/old-ran" ] \
+    && [ ! -e "$r/data/bin/hxprobe-0.1.0" ] && [ "$(leftovers "$r/inst")" = 0 ] \
+    && [ "$(printf '%s\n' "$err" | grep -c 'Full Disk Access')" = 1 ] \
+    && lock_free "$r/inst"; then pass "$t"
+else fail "$t" "rc=$rc out='$out' err='$err'"; fi
 
 # (vii) The install lock. A lock directory left by an earlier launcher is
 # replaced by the lock file; a held lock is waited for until the holder has
 # installed the program.
 t='old lock directory'
 r=$(make_repo)
-mkdir -p "$r/data/install.lock" "$r/data/bin"
-dead_pid > "$r/data/install.lock/pid"
-run "$r" CLAUDE_PLUGIN_DATA="$r/data" PATH="$nocargo_path" --
+mkdir -p "$r/inst/install.lock" "$r/inst/bin"
+dead_pid > "$r/inst/install.lock/pid"
+run "$r" PATH="$nocargo_path" --
 if [ "$rc" = 1 ] && [[ "$err" == *'https://rustup.rs'* ]] && [[ "$err" != *'without a lock'* ]] \
-    && [ -f "$r/data/install.lock" ] && lock_free "$r/data"; then pass "$t"
+    && [ -f "$r/inst/install.lock" ] && lock_free "$r/inst"; then pass "$t"
 else fail "$t" "rc=$rc out='$out' err='$err'"; fi
 
 t='live lock'
 r=$(make_repo)
-mkdir -p "$r/data/bin"
-make_fake "$r/fake" "$r/ran"
-lockf -k "$r/data/install.lock" sh -c "sleep 2; cp '$r/fake' '$r/data/bin/hxprobe-$version'" &
+mkdir -p "$r/inst/bin"
+make_fake "$r/fake" "$r/ran" '' "$version"
+lockf -k "$r/inst/install.lock" sh -c "sleep 2; cp '$r/fake' '$r/inst/bin/hxprobe'" &
 helper=$!
 i=0
-while lock_free "$r/data" && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
-run "$r" CLAUDE_PLUGIN_DATA="$r/data" PATH="$nocargo_path" --
+while lock_free "$r/inst" && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+run "$r" PATH="$nocargo_path" --
 wait "$helper" || true
 if [ "$rc" = 0 ] && [ "$out" = 'FAKE mcp' ] && [[ "$err" == *'waiting'* ]] \
-    && lock_free "$r/data"; then pass "$t"
+    && lock_free "$r/inst"; then pass "$t"
 else fail "$t" "rc=$rc out='$out' err='$err'"; fi
 
-# (viii) Many launchers at once: exactly one build runs and every launcher
-# starts the server. Second variant: the lock file and build directories are
-# left over from a process that was killed while it held the lock.
+# (viii) Many launchers at once: exactly one build and one install run and
+# every launcher starts the server. Second variant: the lock file and build
+# directories are left over from a process that was killed while it held the
+# lock.
 many=8
 rounds=5
 for variant in 'fresh' 'leftover lock of a dead process'; do
@@ -372,19 +503,21 @@ for variant in 'fresh' 'leftover lock of a dead process'; do
         r=$(make_repo)
         make_cargo_stub "$r" 'sleep 0.3'
         if [ "$variant" != fresh ]; then
-            mkdir -p "$r/data/bin" "$r/data/target/release" "$r/data/target.$(dead_pid)/release"
-            ( exec 9>> "$r/data/install.lock"; lockf -s -t 0 9; exec sleep 30 ) &
+            mkdir -p "$r/inst/bin" "$r/inst/target/release" "$r/inst/target.$(dead_pid)/release"
+            ( exec 9>> "$r/inst/install.lock"; lockf -s -t 0 9; exec sleep 30 ) &
             holder=$!
             i=0
-            while lock_free "$r/data" && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+            while lock_free "$r/inst" && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
             kill -9 "$holder"
             wait "$holder" 2>/dev/null || true
         fi
         run_many "$r" "$many" "$r/stub:$nocargo_path"
         builds=$(wc -l < "$r/builds" | tr -d ' ')
-        if [ "$bad" != 0 ] || [ "$builds" != 1 ] || [ "$(leftovers "$r/data")" != 0 ] \
-            || ! lock_free "$r/data"; then
-            detail="round $round: bad=$bad builds=$builds leftovers=$(leftovers "$r/data") err='$(cat "$r"/err.*)'"
+        installs=$(cat "$r"/err.* | grep -c 'installed hxprobe' || true)
+        if [ "$bad" != 0 ] || [ "$builds" != 1 ] || [ "$installs" != 1 ] \
+            || [ "$(leftovers "$r/inst")" != 0 ] || [ ! -x "$r/inst/bin/hxprobe" ] \
+            || ! lock_free "$r/inst"; then
+            detail="round $round: bad=$bad builds=$builds installs=$installs leftovers=$(leftovers "$r/inst") err='$(cat "$r"/err.*)'"
         fi
     done
     if [ -z "$detail" ]; then pass "$t"; else fail "$t" "$detail"; fi
@@ -400,9 +533,9 @@ mkdir -p "$r/tools"
 for tool in dirname awk mktemp uname env; do ln -s "/usr/bin/$tool" "$r/tools/$tool"; done
 run_many "$r" "$many" "$r/stub:$r/tools:/bin"
 builds=$(wc -l < "$r/builds" | tr -d ' ')
-if [ "$bad" = 0 ] && [ "$builds" -ge 1 ] && [ "$(leftovers "$r/data")" = 0 ] \
+if [ "$bad" = 0 ] && [ "$builds" -ge 1 ] && [ "$(leftovers "$r/inst")" = 0 ] \
     && [[ "$(cat "$r/err.0")" == *'installing without a lock'* ]]; then pass "$t"
-else fail "$t" "bad=$bad builds=$builds leftovers=$(leftovers "$r/data") err='$(cat "$r"/err.*)'"; fi
+else fail "$t" "bad=$bad builds=$builds leftovers=$(leftovers "$r/inst") err='$(cat "$r"/err.*)'"; fi
 
 # (vii-b) The lock is free while the server that was just installed runs, and
 # the server has neither fd 9 nor fd 3.
@@ -411,15 +544,15 @@ r=$(make_repo)
 mkdir -p "$r/rel/v$version"
 make_fake "$r/rel/v$version/$asset" "$r/ran" 'sleep 2'
 printf '%s  %s\n' "$(shasum -a 256 "$r/rel/v$version/$asset" | awk '{print $1}')" "$asset" > "$r/release/SHA256SUMS"
-env -u HXPROBE_BIN -u HXPROBE_SUMS HOME="$root/home" CLAUDE_PLUGIN_DATA="$r/data" \
-    HXPROBE_RELEASE_BASE="file://$r/rel" PATH="$nocargo_path" \
+env -u HXPROBE_BIN -u HXPROBE_SUMS HOME="$root/home" HXPROBE_INSTALL_DIR="$r/inst" \
+    CLAUDE_PLUGIN_DATA="$r/data" HXPROBE_RELEASE_BASE="file://$r/rel" PATH="$nocargo_path" \
     bash "$r/scripts/run-mcp.sh" > "$r/out" 2> "$r/err" 9> "$root/fd9" &
 pid=$!
 i=0
 while [ ! -e "$r/ran" ] && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
 running=0; free=0
 if kill -0 "$pid" 2>/dev/null; then running=1; fi
-if lock_free "$r/data"; then free=1; fi
+if lock_free "$r/inst"; then free=1; fi
 rc=0
 wait "$pid" || rc=$?
 if [ "$running" = 1 ] && [ "$free" = 1 ] && [ "$rc" = 0 ] && [ "$(cat "$r/out")" = 'FAKE mcp' ] \
@@ -474,7 +607,8 @@ EOF
     fi
     chmod 755 "$r/stub"/*
     env -u HXPROBE_BIN -u HXPROBE_RELEASE_BASE -u HXPROBE_SUMS \
-        HOME="$root/home" CLAUDE_PLUGIN_DATA="$r/data" PATH="$r/stub:$nocargo_path" \
+        HOME="$root/home" HXPROBE_INSTALL_DIR="$r/inst" CLAUDE_PLUGIN_DATA="$r/data" \
+        PATH="$r/stub:$nocargo_path" \
         bash "$r/scripts/run-mcp.sh" > "$r/out" 2> "$r/err" &
     pid=$!
     i=0
@@ -494,9 +628,9 @@ EOF
     sleep 0.3
     if [ -e "$r/started" ] && [ "$rc" = 143 ] && [ "$took" -le "$limit" ] && [ ! -s "$r/out" ] \
         && [ -n "$stub_pid" ] && [ -n "$grandchild_pid" ] && [ -z "$alive" ] \
-        && [ "$(leftovers "$r/data")" = 0 ] && lock_free "$r/data" \
-        && [ ! -e "$r/data/bin/hxprobe-$version" ]; then pass "$t"
-    else fail "$t" "rc=$rc took=${took}s alive='$alive' leftovers=$(leftovers "$r/data") err='$(cat "$r/err")'"; fi
+        && [ "$(leftovers "$r/inst")" = 0 ] && lock_free "$r/inst" \
+        && [ ! -e "$r/inst/bin/hxprobe" ]; then pass "$t"
+    else fail "$t" "rc=$rc took=${took}s alive='$alive' leftovers=$(leftovers "$r/inst") err='$(cat "$r/err")'"; fi
     for p in $stub_pid $grandchild_pid; do kill -KILL "$p" 2>/dev/null || true; done
 done
 
@@ -504,19 +638,20 @@ done
 # lockf process that was waiting is gone. A lockf stub records the pids.
 t='TERM during the wait for the lock'
 r=$(make_repo)
-mkdir -p "$r/stub" "$r/data/bin"
+mkdir -p "$r/stub" "$r/inst/bin"
 cat > "$r/stub/lockf" <<EOF
 #!/bin/sh
 echo \$\$ >> "$r/lockf.pids"
 exec /usr/bin/lockf "\$@"
 EOF
 chmod 755 "$r/stub/lockf"
-( exec 9>> "$r/data/install.lock"; lockf -s -t 0 9; exec sleep 30 ) &
+( exec 9>> "$r/inst/install.lock"; lockf -s -t 0 9; exec sleep 30 ) &
 holder=$!
 i=0
-while lock_free "$r/data" && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+while lock_free "$r/inst" && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
 env -u HXPROBE_BIN -u HXPROBE_RELEASE_BASE -u HXPROBE_SUMS \
-    HOME="$root/home" CLAUDE_PLUGIN_DATA="$r/data" PATH="$r/stub:$nocargo_path" \
+    HOME="$root/home" HXPROBE_INSTALL_DIR="$r/inst" CLAUDE_PLUGIN_DATA="$r/data" \
+    PATH="$r/stub:$nocargo_path" \
     bash "$r/scripts/run-mcp.sh" > "$r/out" 2> "$r/err" &
 pid=$!
 # Two lockf runs: the attempt that fails at once and the one that waits.
