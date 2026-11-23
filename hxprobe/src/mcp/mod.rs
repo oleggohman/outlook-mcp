@@ -2,6 +2,7 @@
 //! store.
 
 pub mod cache;
+pub mod proto;
 pub mod rpc;
 pub mod text;
 pub mod tools;
