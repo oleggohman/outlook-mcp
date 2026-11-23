@@ -204,7 +204,10 @@ impl Cache {
                 // Up to date without a build of this value (another process
                 // built it, or it could not be opened right after a build):
                 // the error of the earlier attempt is over.
-                if stamp(&self.store).ok() == meta.stamp() {
+                if stamp(&self.store)
+                    .ok()
+                    .is_some_and(|s| meta.stamp() == Some(s))
+                {
                     self.last_error = None;
                 }
             }
@@ -1363,6 +1366,29 @@ mod tests {
         assert_eq!(messages(&mut c, NOW_I + 900), 4);
         assert_eq!(c.builds, 2);
         assert!(c.status().last_error.is_none());
+    }
+
+    #[test]
+    fn unreadable_store_does_not_clear_the_error() {
+        let t = TestDir::new("nostamp");
+        let store = t.store(b"this is not a store file, only some text that is long enough");
+        let mut c = Cache::new(&t.cache_dir(), &store).unwrap();
+        let e = c.connection_at(NOW_I).unwrap_err();
+        // Another process leaves a database without the store's size, and
+        // the store goes away: neither side has a stamp to compare.
+        t.store(&mail_store());
+        Cache::new(&t.cache_dir(), &store)
+            .unwrap()
+            .build(NOW_I)
+            .unwrap();
+        Connection::open(t.cache_dir().join("mail.db"))
+            .unwrap()
+            .execute("DELETE FROM mcp_meta WHERE key = 'store_len'", [])
+            .unwrap();
+        std::fs::remove_file(&store).unwrap();
+        assert!(c.connection_at(NOW_I + 10).is_ok());
+        assert_eq!(c.builds, 1);
+        assert_eq!(c.status().last_error, Some(e.as_str()));
     }
 
     #[test]
