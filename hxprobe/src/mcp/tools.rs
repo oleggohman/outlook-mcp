@@ -12,7 +12,7 @@ use rusqlite::{params_from_iter, Connection, Row};
 use serde_json::{json, Map, Value};
 
 use crate::mcp::cache::Cache;
-use crate::mcp::text::{cap, html_to_text, iso, lossy, parse_time};
+use crate::mcp::text::{cap, html_to_text, integer, iso, lossy, parse_time};
 
 /// The sentence every description ends with.
 macro_rules! untrusted {
@@ -315,16 +315,6 @@ fn sql_failed(e: rusqlite::Error) -> ToolError {
     failed(format!("database query failed: {e}"))
 }
 
-/// A JSON number as an integer: an integer, or a number written with a
-/// fraction of zero (`20.0`) that fits in an `i64`.
-fn integer(v: &Value) -> Option<i64> {
-    const LIMIT: f64 = 9_223_372_036_854_775_808.0; // 2^63
-    v.as_i64().or_else(|| {
-        let f = v.as_f64().filter(|_| !v.is_u64())?;
-        (f.fract() == 0.0 && (-LIMIT..LIMIT).contains(&f)).then_some(f as i64)
-    })
-}
-
 /// True for a control character other than tab and line breaks.
 fn is_forbidden_control(c: char) -> bool {
     c.is_control() && !matches!(c, '\t' | '\n' | '\r')
@@ -354,14 +344,14 @@ impl Args {
             }
             // `20.0` is an integer for JSON Schema: kept as `20`.
             let as_int = match p.kind {
-                Kind::Int => integer(v),
+                Kind::Int | Kind::Time => integer(v),
                 _ => None,
             };
             let ok = match p.kind {
                 Kind::Str => v.is_string(),
                 Kind::Bool => v.is_boolean(),
                 Kind::Int => as_int.is_some(),
-                Kind::Time => v.is_i64() || v.is_string(),
+                Kind::Time => as_int.is_some() || v.is_string(),
             };
             if !ok {
                 let want = match p.kind {
@@ -1490,8 +1480,15 @@ mod tests {
             f.msgs("list_messages", json!({"until": t.to_string()})),
             [0, 3]
         );
+        // A number written with a zero fraction is unix seconds too.
+        let args: Value = serde_json::from_str(&format!("{{\"since\": {t}.0}}")).unwrap();
+        assert_eq!(f.msgs("list_messages", args), [2, 1]);
+        let args: Value = serde_json::from_str(&format!("{{\"until\": {t}.0}}")).unwrap();
+        assert_eq!(f.msgs("list_messages", args), [0, 3]);
         f.err("list_messages", json!({"since": "-5"}));
         f.err("list_messages", json!({"since": 1.5}));
+        let args: Value = serde_json::from_str(r#"{"since": 1e30}"#).unwrap();
+        f.err("list_messages", args);
     }
 
     #[test]

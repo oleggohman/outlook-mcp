@@ -331,7 +331,8 @@ before `limit` and `offset`. Times in results are UTC, as
 
 Arguments:
 
-* `limit`: 1 to 100, default 20 (a number outside that range is clamped).
+* `limit`: 1 to 100, default 20 (an integer outside that range is clamped; a
+  number that is not a 64-bit integer, such as `1e30`, is an error).
   `offset`: 0 to 100,000, default 0.
 * `folder`: a folder guid, or a folder name matched case-insensitively (a name
   selects every folder with that name), at most 200 characters. A folder that
@@ -362,6 +363,35 @@ type or out of range (except `limit`), or an unknown message guid in
 tool result with `isError: true` and a short message. `list_attachments` with
 an unknown message guid returns an empty list. An unknown tool name is a
 JSON-RPC error.
+
+### Install as a Claude Code plugin
+
+The repository is also a Claude Code plugin. It provides the `outlook` MCP
+server and the `outlook-local-mail` skill (`skills/`), which tells Claude Code
+how to use the tools. The plugin starts the server through
+`scripts/run-mcp.sh`, which finds or installs the `hxprobe` program for the
+version in `hxprobe/Cargo.toml` and then runs `hxprobe mcp`.
+
+On the first start the launcher installs the program:
+
+* When `release/SHA256SUMS` lists a prebuilt program for the release and the
+  Mac's architecture, it downloads it from the GitHub release over HTTPS and
+  uses it only if its SHA-256 matches the listed sum. A file that does not
+  match is deleted and never run.
+* Otherwise it builds the program with `cargo build --release --locked`. This
+  needs Rust (install it from <https://rustup.rs>) and takes about a minute,
+  so the first connection can time out; reconnect the MCP server once the
+  build has finished. Without a prebuilt program and without `cargo` the
+  server does not start, and the message on stderr says what to do.
+
+Later starts run the installed program directly. The program is kept as
+`bin/hxprobe-<version>` in the plugin's data directory (`$CLAUDE_PLUGIN_DATA`,
+or `~/Library/Application Support/hxprobe-plugin` when that is not set).
+Programs of other versions are removed after an update installs a new one.
+
+To use a program you built yourself, set `HXPROBE_BIN` to its absolute path
+in the environment of Claude Code; the launcher then runs it and installs
+nothing. `scripts/test-run-mcp.sh` tests the launcher.
 
 ### Registration
 
@@ -395,7 +425,9 @@ hxprobe mcp [--store <file>] [--cache-dir <dir>] [--refresh-secs <n>]
   request. The path is resolved at start to an absolute path without
   symbolic links; `store_status` shows that path, and the cache is kept for
   it.
-* `--cache-dir`: default `~/Library/Caches/hxprobe-mcp`.
+* `--cache-dir`: default `~/Library/Caches/hxprobe-mcp`. The directory must
+  be on a filesystem that keeps Unix permissions (not exFAT or a network
+  share without them).
 * `--refresh-secs`: the shortest time between two builds of a changed store,
   default 900; 0 rebuilds whenever the store changed.
 
@@ -419,9 +451,11 @@ temporary files `store.copy-<pid>` and `mail.db.tmp-<pid>`.
   A `lock` that is not such a file is removed and created again.
 * The `refresh` tool rebuilds at once, whatever the interval.
 * A failed build (one stopped by an internal error included) keeps the
-  previous `mail.db` in use and is not retried before `--refresh-secs` have
-  passed; `store_status` shows the error in `last_error`. With no previous
-  database the tool calls fail with that error.
+  previous `mail.db` in use (unless the new one was already put in its
+  place; the next call then opens that one) and is not retried before
+  `--refresh-secs` have passed; `store_status` shows the error in
+  `last_error`. With no previous database the tool calls fail with that
+  error.
 * Two servers that share a cache directory build one after the other; when
   the store did not change in between, the second uses the database the
   first built.

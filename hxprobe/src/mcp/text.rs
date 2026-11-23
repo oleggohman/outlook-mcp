@@ -28,6 +28,10 @@ fn tag_text(name: &str, closing: bool) -> Option<char> {
     }
 }
 
+/// Most `<` inside the quoted attribute values of one tag; a tag with more
+/// is text.
+const MAX_QUOTED_LT: usize = 8;
+
 /// A tag found by [`tag_at`].
 struct Tag {
     /// Where the name starts and how long it is (ASCII letters and digits;
@@ -39,34 +43,95 @@ struct Tag {
     end: usize,
 }
 
-/// The tag that starts at the `<` at `b[i]`, or `None` when that `<` is
-/// plain text. A tag is `<` followed by a letter, `/` and a letter, `!` or
-/// `?`, and closed by a `>` that comes before the next `<`. `<` followed by
-/// an address (`<ann@example.org>`: an `@` before any space, quote, `=`, `/`
-/// or `>`) is not a tag.
-///
-/// Looks no further than the next `<` or `>`, so calling it for every `<`
-/// of a text is linear in the text.
-fn tag_at(b: &[u8], i: usize) -> Option<Tag> {
+/// Where the name of the tag opened by the `<` at `b[i]` starts and whether
+/// it is a closing tag, or `None` when that `<` cannot open a tag. A tag
+/// opens with `<` followed by a letter, `/` and a letter, `!` or `?`. `<`
+/// followed by an address (`<ann@example.org>`: an `@` before any space,
+/// quote, `=`, `/`, `<` or `>`) or by a URL (`<https://example.org>`: a
+/// scheme and `://`) opens no tag.
+fn tag_open(b: &[u8], i: usize) -> Option<(usize, bool)> {
     let after = b.get(i + 1).copied();
     let closing = after == Some(b'/');
     let name_at = i + 1 + usize::from(closing);
-    let starts_with_letter = b.get(name_at).is_some_and(u8::is_ascii_alphabetic);
-    if !starts_with_letter && (closing || !matches!(after, Some(b'!' | b'?'))) {
+    if !b.get(name_at).is_some_and(u8::is_ascii_alphabetic) {
+        return (!closing && matches!(after, Some(b'!' | b'?'))).then_some((name_at, false));
+    }
+    let rest = &b[name_at..];
+    let is_address = rest
+        .iter()
+        .take_while(|c| {
+            !c.is_ascii_whitespace() && !matches!(c, b'"' | b'\'' | b'=' | b'/' | b'<' | b'>')
+        })
+        .any(|&c| c == b'@');
+    let scheme_len = rest
+        .iter()
+        .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, b'+' | b'-' | b'.'))
+        .count();
+    if is_address || rest[scheme_len..].starts_with(b"://") {
         return None;
     }
-    let close = i + 1 + memchr::memchr2(b'<', b'>', &b[i + 1..])?;
-    if b[close] == b'<' {
-        return None;
-    }
-    let is_address = starts_with_letter
-        && b[name_at..close]
+    Some((name_at, closing))
+}
+
+/// Index of the `>` that closes the tag whose inside starts at `b[from]`,
+/// or `None` when a `<` or the end of the input comes first.
+///
+/// A quote that follows `=` (spaces allowed between them) opens an
+/// attribute value that runs to the next quote of the same kind; `<` and
+/// `>` inside it do not count. A quote with no closing quote is an ordinary
+/// character. A tag whose values hold more than [`MAX_QUOTED_LT`] `<` is not
+/// a tag.
+///
+/// The search stops at the first `<` outside a value and passes at most
+/// [`MAX_QUOTED_LT`] `<` inside values, so calling it for every `<` of a
+/// text is linear in the text.
+fn tag_close(b: &[u8], from: usize) -> Option<usize> {
+    let mut quoted_lt = 0;
+    let mut p = from;
+    // The first `<` or `>` at or after `p`, found once per stretch.
+    let mut stop = None;
+    loop {
+        let end = match stop {
+            Some(end) if end >= p => end,
+            _ => p + memchr::memchr2(b'<', b'>', &b[p..])?,
+        };
+        stop = Some(end);
+        let Some(n) = memchr::memchr2(b'"', b'\'', &b[p..end]) else {
+            return (b[end] == b'>').then_some(end);
+        };
+        let at = p + n;
+        p = at + 1;
+        let follows_eq = b[from..at]
             .iter()
-            .take_while(|c| !c.is_ascii_whitespace() && !matches!(c, b'"' | b'\'' | b'=' | b'/'))
-            .any(|&c| c == b'@');
-    if is_address {
-        return None;
+            .rev()
+            .find(|c| !c.is_ascii_whitespace())
+            .is_some_and(|&c| c == b'=');
+        if !follows_eq {
+            continue;
+        }
+        // The end of the value; without one, the search goes on after the
+        // opening quote.
+        let mut q = p;
+        while let Some(n) = memchr::memchr2(b[at], b'<', &b[q..]) {
+            q += n + 1;
+            if b[q - 1] == b[at] {
+                p = q;
+                break;
+            }
+            quoted_lt += 1;
+            if quoted_lt > MAX_QUOTED_LT {
+                return None;
+            }
+        }
     }
+}
+
+/// The tag that starts at the `<` at `b[i]`, or `None` when that `<` is
+/// plain text: it opens no tag (see [`tag_open`]) or the tag is not closed
+/// (see [`tag_close`]).
+fn tag_at(b: &[u8], i: usize) -> Option<Tag> {
+    let (name_at, closing) = tag_open(b, i)?;
+    let close = tag_close(b, name_at)?;
     let name_len = b[name_at..close]
         .iter()
         .take_while(|c| c.is_ascii_alphanumeric())
@@ -120,14 +185,15 @@ fn entity(name: &str) -> Option<char> {
 /// spaces become one space and more than two line breaks become two; lines
 /// are trimmed. In HTML, line breaks of the source are spaces; input that
 /// holds no tag keeps its line breaks. A `<` that does not start a tag (see
-/// [`tag_at`]: no `>` before the next `<`, or an address in angle brackets)
-/// stays in the text with what follows it. An unclosed comment or dropped
-/// element ends the text.
+/// [`tag_at`]: no `>` before the next `<` outside a quoted attribute value,
+/// or an address or URL in angle brackets) stays in the text with what
+/// follows it. An unclosed comment or dropped element ends the text, and so
+/// does a tag cut off by the end of an input that holds a tag.
 ///
-/// Every search moves forward from the current position; a tag search stops
-/// at the next `<` or `>`, and the text after a failed search for the end of
-/// a comment or dropped element is dropped, so the run time is linear in the
-/// input.
+/// Every search moves forward from the current position; a tag search
+/// passes a bounded number of `<` (see [`tag_close`]), and the text after a
+/// failed search for the end of a comment or dropped element is dropped, so
+/// the run time is linear in the input.
 pub fn html_to_text(html: &str) -> String {
     let b = html.as_bytes();
     let is_html = looks_like_html(b);
@@ -174,6 +240,13 @@ pub fn html_to_text(html: &str) -> String {
             continue;
         }
         let Some(tag) = tag_at(b, i) else {
+            // HTML that ends inside a tag: what is left is markup.
+            let cut_off = is_html
+                && tag_open(b, i).is_some()
+                && memchr::memchr2(b'<', b'>', &b[i + 1..]).is_none();
+            if cut_off {
+                break;
+            }
             raw.push('<');
             i += 1;
             continue;
@@ -340,12 +413,22 @@ fn parse_unix_digits(s: &str) -> Option<i64> {
     s.parse().ok()
 }
 
-/// Unix seconds of a time argument: an integer or a string of digits (unix
-/// seconds), `YYYY-MM-DD` (midnight UTC) or `YYYY-MM-DDThh:mm:ssZ`, in the
-/// years 1970 to 9999.
+/// A JSON number as an integer: an integer, or a number written with a
+/// fraction of zero (`20.0`) that fits in an `i64`.
+pub fn integer(v: &Value) -> Option<i64> {
+    const LIMIT: f64 = 9_223_372_036_854_775_808.0; // 2^63
+    v.as_i64().or_else(|| {
+        let f = v.as_f64().filter(|_| !v.is_u64())?;
+        (f.fract() == 0.0 && (-LIMIT..LIMIT).contains(&f)).then_some(f as i64)
+    })
+}
+
+/// Unix seconds of a time argument: an integer (see [`integer`]) or a string
+/// of digits (unix seconds), `YYYY-MM-DD` (midnight UTC) or
+/// `YYYY-MM-DDThh:mm:ssZ`, in the years 1970 to 9999.
 pub fn parse_time(v: &Value) -> Result<i64, String> {
     let t = match v {
-        Value::Number(n) => n.as_i64(),
+        Value::Number(_) => integer(v),
         Value::String(s) => parse_unix_digits(s).or_else(|| parse_iso(s)),
         _ => None,
     }
@@ -481,11 +564,93 @@ mod tests {
     }
 
     #[test]
-    fn unclosed_tag_stays_and_unclosed_script_ends_the_text() {
+    fn less_than_and_greater_than_in_quoted_attribute_values() {
         assert_eq!(
-            html_to_text("<p>before</p><a href=\"x"),
-            "before\n<a href=\"x"
+            html_to_text("<img alt=\"1 < 2\" src=\"x.png\">tail"),
+            "tail"
         );
+        assert_eq!(
+            html_to_text("<a href=\"x\" title=\"Reply to John <john@example.org>\">John</a> tail"),
+            "John tail"
+        );
+        assert_eq!(html_to_text("<a title=\"a<b\">link</a> tail"), "link tail");
+        assert_eq!(html_to_text("<a title='a<b>c'>link</a> tail"), "link tail");
+        assert_eq!(
+            html_to_text("<script data-x=\"<\">secret()</script>after"),
+            "after"
+        );
+        assert_eq!(
+            html_to_text("<style media=\"a<b\">p{color:red}</style>after"),
+            "after"
+        );
+        assert_eq!(html_to_text("<p style=\"a>b\">text</p>"), "text");
+        assert_eq!(html_to_text("<p title = \"a>b\" id=x>text</p>"), "text");
+        // The other kind of quote inside a value is part of the value.
+        assert_eq!(
+            html_to_text("<a title=\"it's a<b\" id='\"<'>link</a>"),
+            "link"
+        );
+    }
+
+    #[test]
+    fn quotes_that_open_no_attribute_value_are_plain_characters() {
+        // Not after `=`.
+        assert_eq!(
+            html_to_text("<a href=x'y>link</a> it's <b>z</b>"),
+            "link it's z"
+        );
+        assert_eq!(
+            html_to_text("<p>a</p>if x <y, don't stop <b>now</b>, it's ok"),
+            "a\nif x <y, don't stop now, it's ok"
+        );
+        // No closing quote.
+        assert_eq!(html_to_text("<a title=\"x>link</a> tail"), "link tail");
+        assert_eq!(html_to_text("<a title=\"x <b>y</b>"), "<a title=\"x y");
+    }
+
+    #[test]
+    fn tag_with_too_many_less_than_signs_in_its_values_is_text() {
+        let within = format!("<a title=\"{}\">x</a>", "<".repeat(MAX_QUOTED_LT));
+        assert_eq!(html_to_text(&within), "x");
+        let over = format!("<a title=\"{}\">x</a>", "<".repeat(MAX_QUOTED_LT + 1));
+        assert_eq!(html_to_text(&over), over[..over.len() - 4]);
+    }
+
+    #[test]
+    fn urls_in_angle_brackets_are_kept() {
+        assert_eq!(
+            html_to_text("Click here <https://example.org/a?b=c>\nSecond line\nThird"),
+            "Click here <https://example.org/a?b=c>\nSecond line\nThird"
+        );
+        assert_eq!(
+            html_to_text("<p>See <http://example.com/x> or <mailto:ann@example.org></p>"),
+            "See <http://example.com/x> or <mailto:ann@example.org>"
+        );
+        // A name with a colon is still a tag.
+        assert_eq!(html_to_text("a<o:p>b</o:p><v:shape id=\"://\">c"), "abc");
+    }
+
+    #[test]
+    fn tag_cut_off_by_the_end_is_dropped_from_html_only() {
+        assert_eq!(html_to_text("<p>before</p><a href=\"x"), "before");
+        assert_eq!(
+            html_to_text("<p>trunc</p><a href=\"https://example.org/very/long"),
+            "trunc"
+        );
+        assert_eq!(html_to_text("<p>before</p></di"), "before");
+        // Not the start of a tag: text.
+        assert_eq!(html_to_text("<p>a</p>5 < 6"), "a\n5 < 6");
+        assert_eq!(
+            html_to_text("<p>a</p>Ann <ann@example.org"),
+            "a\nAnn <ann@example.org"
+        );
+        // Input without a tag is plain text and keeps everything.
+        assert_eq!(html_to_text("see <a href=\"x"), "see <a href=\"x");
+        assert_eq!(html_to_text("if x <y then stop"), "if x <y then stop");
+    }
+
+    #[test]
+    fn unclosed_script_or_comment_ends_the_text() {
         assert_eq!(html_to_text("<p>before</p><script>var a = 1;"), "before");
         assert_eq!(html_to_text("<p>before</p><!-- open"), "before");
         assert_eq!(html_to_text("<"), "<");
@@ -511,6 +676,10 @@ mod tests {
             "<!",
             "<a@",
             "<a href=\"x\" ",
+            "<a t=\"",
+            "<a t=\"'\"'\"",
+            "<a t=\"<",
+            "<https://",
             "&#",
             "&",
             "<a>",
@@ -525,6 +694,12 @@ mod tests {
                 .iter()
                 .map(|unit| unit.repeat(n) + "<!--"),
         )
+        // Quotes that are never closed, after or before a long run of
+        // openings.
+        .chain([
+            "<a t=".repeat(n) + "\" '",
+            "<a t=\"".to_string() + &"<a ".repeat(n),
+        ])
         .chain(["<script>".repeat(n), "<!--".repeat(n), "<head>".repeat(n)])
         .collect()
     }
@@ -636,6 +811,18 @@ mod tests {
         assert_eq!(parse_time(&json!("1795421730")), Ok(1_795_421_730));
         assert_eq!(parse_time(&json!("0")), Ok(0));
         assert_eq!(parse_time(&json!("253402300799")), Ok(253_402_300_799));
+    }
+
+    #[test]
+    fn parse_time_accepts_numbers_with_a_zero_fraction() {
+        let v: Value = serde_json::from_str("1764579600.0").unwrap();
+        assert_eq!(parse_time(&v), Ok(1_764_579_600));
+        let v: Value = serde_json::from_str("1.7645796e9").unwrap();
+        assert_eq!(parse_time(&v), Ok(1_764_579_600));
+        for bad in ["1764579600.5", "-1.0", "1e30", "253402300800.0"] {
+            let v: Value = serde_json::from_str(bad).unwrap();
+            assert!(parse_time(&v).is_err(), "{bad}");
+        }
     }
 
     #[test]

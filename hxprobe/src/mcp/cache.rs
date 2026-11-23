@@ -40,7 +40,7 @@ const TMP_PREFIX: &str = "mail.db.tmp-";
 
 /// Version of what [`prepare`] adds to the export; bump it whenever that
 /// changes, so databases of an older version are rebuilt.
-pub const FORMAT_VERSION: &str = "2";
+pub const FORMAT_VERSION: &str = "3";
 
 /// Default shortest time between two builds of a changed store, in seconds.
 pub const DEFAULT_REFRESH_SECS: u64 = 900;
@@ -189,7 +189,9 @@ impl Cache {
     /// - no usable `mail.db` (missing, not a private regular file, not a
     ///   database, no readable `mcp_meta`, another `format_version` or
     ///   another store path) -> build, unless a build failed less than
-    ///   `refresh_secs` ago, in which case that error is returned;
+    ///   `refresh_secs` ago, in which case that error is returned. A
+    ///   `mail.db` opened here that was built from the store as it is now
+    ///   clears the error of an earlier attempt;
     /// - the live store differs from the one `mail.db` was built from and
     ///   the last build or attempt is at least `refresh_secs` old ->
     ///   rebuild; if that fails the old database stays in use. A build or
@@ -198,11 +200,20 @@ impl Cache {
     pub fn connection_at(&mut self, now: i64) -> Result<&Connection, String> {
         if self.db.is_none() {
             self.db = open_db(&self.db_path(), &self.store).ok();
+            if let Some((_, meta)) = &self.db {
+                // Up to date without a build of this value (another process
+                // built it, or it could not be opened right after a build):
+                // the error of the earlier attempt is over.
+                if stamp(&self.store).ok() == meta.stamp() {
+                    self.last_error = None;
+                }
+            }
         }
         match &self.db {
             None => {
                 if let (Some(at), Some(e)) = (self.last_attempt_unix, &self.last_error) {
-                    if now.saturating_sub(at) < self.refresh_secs {
+                    // An attempt time after `now` does not count.
+                    if (0..self.refresh_secs).contains(&now.saturating_sub(at)) {
                         return Err(e.clone());
                     }
                 }
@@ -1600,6 +1611,50 @@ mod tests {
         touch(a.store_path(), 2_000_000);
         messages(&mut a, NOW_I + 50_000);
         assert_eq!(a.builds, 2);
+    }
+
+    #[test]
+    fn failed_attempt_in_the_future_does_not_block_a_build() {
+        let t = TestDir::new("futurefail");
+        let store = t.store(b"this is not a store file, only some text that is long enough");
+        let mut c = Cache::new(&t.cache_dir(), &store).unwrap();
+        assert!(c.connection_at(NOW_I + 100_000).is_err());
+        assert_eq!(c.builds, 1);
+        // The clock went back: the attempt is not inside the interval.
+        t.store(&mail_store());
+        assert_eq!(messages(&mut c, NOW_I), 4);
+        assert_eq!(c.builds, 2);
+        assert!(c.status().last_error.is_none());
+    }
+
+    #[test]
+    fn database_built_by_another_server_clears_the_error() {
+        let t = TestDir::new("clearerr");
+        let mut a = lazy(&t, 900);
+        a.build_hook = Some(|| panic!("build hook"));
+        assert_eq!(caught(&mut a, NOW_I), None);
+        assert_eq!(a.status().last_error, Some(BUILD_UNFINISHED));
+        let mut b = Cache::new(&t.cache_dir(), a.store_path()).unwrap();
+        messages(&mut b, NOW_I + 5);
+        // Inside the interval: the other server's database, no build here.
+        assert_eq!(messages(&mut a, NOW_I + 10), 4);
+        assert_eq!(a.builds, 1);
+        assert!(a.status().last_error.is_none());
+    }
+
+    #[test]
+    fn stale_database_of_another_server_keeps_the_error() {
+        let t = TestDir::new("keeperr");
+        let mut a = lazy(&t, 900);
+        a.build_hook = Some(|| panic!("build hook"));
+        assert_eq!(caught(&mut a, NOW_I), None);
+        let mut b = Cache::new(&t.cache_dir(), a.store_path()).unwrap();
+        messages(&mut b, NOW_I + 5);
+        touch(a.store_path(), 1_000_000);
+        // Served, but not built from the store as it is now.
+        assert_eq!(messages(&mut a, NOW_I + 10), 4);
+        assert_eq!(a.builds, 1);
+        assert_eq!(a.status().last_error, Some(BUILD_UNFINISHED));
     }
 
     // --- copying a store that changes ---
