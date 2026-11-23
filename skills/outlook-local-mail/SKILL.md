@@ -1,6 +1,6 @@
 ---
 name: outlook-local-mail
-description: Use when the user asks to check their inbox, find or read an email, look up a contact or see their meetings and the local hxprobe MCP server for Outlook is available (tools store_status, refresh, list_folders, list_messages, search_messages, get_message, list_attachments, search_people, list_events), or when one of those tools returns an argument error, an empty result, a stale result or a timeout.
+description: Use when the user asks to check their inbox, find or read an email, look up a contact or see their meetings and the local hxprobe MCP server for Outlook is available (tools store_status, refresh, list_folders, list_messages, search_messages, get_message, list_attachments, search_people, list_events), or when one of those tools returns an argument error, a permission error (Operation not permitted), an empty result, a stale result or a timeout.
 ---
 
 # Outlook local mail (hxprobe MCP)
@@ -28,6 +28,29 @@ the server is registered as `outlook`). When none of them is present, the
 server is not registered in this client: say so and point the user to the
 "MCP server" section of the hxprobe README. Do not try to read the Outlook
 store by other means.
+
+## Permission errors (macOS Full Disk Access)
+
+If a tool result or `last_error` in `store_status` says `Operation not
+permitted`, `os error 1` or `permission denied` for the Outlook store, macOS
+blocked the hxprobe program. Retrying does not help, and nothing you run can
+fix it: stop and give the user these steps.
+
+Claude starts hxprobe as a "disclaimed" helper, so macOS checks hxprobe's own
+permissions, not Claude's or Terminal's. That is why giving Claude Full Disk
+Access does not help, and why the same store opens fine from Terminal.
+
+1. Find the program path. It is `<data>/bin/hxprobe-<version>`, where
+   `<data>` is `$CLAUDE_PLUGIN_DATA` or, when that is not set,
+   `~/Library/Application Support/hxprobe-plugin`. List that `bin` folder to
+   get the exact name and give the user the full absolute path.
+2. Tell the user: open System Settings → Privacy & Security → Full Disk
+   Access and click **+**. Press Cmd+Shift+G, paste the path, click Open and
+   make sure its toggle is on. If it is already listed, remove it with **–**
+   and add it again (a new version is a new file and needs its own entry).
+3. Tell the user to run `pkill -f hxprobe-<version>` (with the real version),
+   so the next mail call starts a fresh helper that has the permission.
+4. After the user confirms, call `store_status` to check.
 
 ## Argument rules that cause errors
 
@@ -165,3 +188,5 @@ back to the user's zone. If two senders match "dana", show both and ask.
   local midnight. Use the full `...Z` form for local day boundaries.
 - Calling `search_people` only to get an address for `from`.
 - Reporting `unread_count` as the number of messages that can be listed.
+- On "Operation not permitted": retrying, or telling the user to give Claude
+  or Terminal Full Disk Access. The hxprobe program itself needs it.
