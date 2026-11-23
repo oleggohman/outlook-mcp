@@ -71,9 +71,12 @@ esac
 echo "codesign stub: unexpected arguments" >&2
 exit 64
 EOF
+    echo 0 > "$c/shasum-rc"
     cat > "$c/stub/shasum" <<EOF
 #!/bin/sh
 printf '%s\n' "\$*" >> "$c/shasum-args"
+rc=\$(cat "$c/shasum-rc")
+if [ "\$rc" != 0 ]; then echo "shasum: stub failure" >&2; exit "\$rc"; fi
 exec /usr/bin/shasum "\$@"
 EOF
     echo arm64 > "$c/archs"
@@ -260,6 +263,12 @@ run_signed "$c"
 if [ "$rc" = 0 ] && [[ "$out" == *"  $asset" ]] && [ -e "$c/work/$asset" ] \
     && grep -q -e '-archs' "$c/lipo-args"; then pass "$t"
 else fail "$t" "rc=$rc out='$out' err='$err'"; fi
+
+# (iv-c) A checksum that cannot be computed leaves no asset behind: a file
+# under the final name would look like a finished release.
+c=$(make_case)
+echo 1 > "$c/shasum-rc"
+check_stops 'checksum fails, no asset left' "$c" 'SHA-256'
 
 # (v) A failing codesign that names the identity in its error: the script
 # stops and its output holds the error without the identity.

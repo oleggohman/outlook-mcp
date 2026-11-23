@@ -128,12 +128,14 @@ else
     log "not asking the program for its version: this machine is not $arch"
 fi
 
-mv -f "$tmp" "$asset"
-tmp=''
-sum=$(shasum -a 256 "$asset" | awk '{ print tolower($1) }')
+# The checksum is taken before the file gets its final name, so a failure
+# here leaves nothing that looks like a finished asset.
+sum=$(shasum -a 256 "$tmp" | awk '{ print tolower($1) }') || sum=''
 case "$sum" in
     *[!0-9a-f]* | '' ) die "cannot compute the SHA-256 of $asset" ;;
 esac
 [ "${#sum}" = 64 ] || die "cannot compute the SHA-256 of $asset"
+mv -f "$tmp" "$asset"
+tmp=''
 log "signed and checked $asset; add this line to release/SHA256SUMS:"
 printf '%s  %s\n' "$sum" "$asset"
