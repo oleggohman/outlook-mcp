@@ -1475,7 +1475,6 @@ fn stop_with_a_server_kept_open_and_the_next_call_starts_a_new_service() {
     let _s = serial();
     let d = Dir::new();
     let mut m = spawn_mcp(&d);
-    let first_call = Instant::now();
     let pid = m.tool("store_status")["service"]["pid"].clone();
     // The service is an unreaped child of the open server: `--stop` must not
     // wait for the 5 s limit.
@@ -1486,9 +1485,8 @@ fn stop_with_a_server_kept_open_and_the_next_call_starts_a_new_service() {
         request(&d, &Request::Status),
         Err(ExchangeError::NotRunning)
     );
-    // A server starts a service at most every 2 s.
-    let gap = Duration::from_millis(2100);
-    std::thread::sleep(gap.saturating_sub(first_call.elapsed()));
+    // Inside the 2 s in which a server starts no second service: the call
+    // waits for the rest of them, then starts one.
     let next = m.tool("store_status");
     assert_eq!(next["service"]["running"], true, "{next}\n{}", m.log());
     assert_ne!(next["service"]["pid"], pid);

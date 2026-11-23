@@ -237,13 +237,24 @@ impl Client {
         start: bool,
     ) -> Result<ServiceStatus, String> {
         let deadline = (self.clock)() + self.timeouts.start;
-        // The child started here while it runs, and when it was started.
+        // The child started here while it runs, and when the last start
+        // was. Without a start now (a service of this process is still
+        // there, or one was started a moment ago), that is the earlier
+        // start: when nobody answers, the loop below starts one as soon as
+        // none of this process is left and the silent-peer delay passed.
         let mut child: Option<u32> = None;
-        let mut spawned_at: Option<Instant> = None;
-        if start {
+        let mut spawned_at = if start {
             let (pid, at) = self.spawn(now)?;
-            (child, spawned_at) = (Some(pid), Some(at));
-        }
+            child = Some(pid);
+            at
+        } else {
+            let limit = proto::SILENT_PEER.as_secs();
+            let ago = self.last_start_unix.map_or(limit, |t| {
+                u64::try_from(now.saturating_sub(t)).map_or(0, |s| s.min(limit))
+            });
+            let at = Instant::now();
+            at.checked_sub(Duration::from_secs(ago)).unwrap_or(at)
+        };
         let mut probes = 0u32;
         loop {
             if let Some(pid) = child {
@@ -267,10 +278,11 @@ impl Client {
                     }
                 }
             }
-            // The peer that won the lock stays silent: start again.
-            if child.is_none() && spawned_at.is_some_and(|t| t.elapsed() >= proto::SILENT_PEER) {
+            // The peer that won the lock stays silent, or the service that
+            // was there is gone: start again.
+            if child.is_none() && spawned_at.elapsed() >= proto::SILENT_PEER && self.no_children() {
                 let (pid, at) = self.spawn(now)?;
-                (child, spawned_at) = (Some(pid), Some(at));
+                (child, spawned_at) = (Some(pid), at);
             }
             match proto::exchange(&self.sock, req, self.timeout(req)) {
                 Ok(v) => return self.accept(req, &v, now, round),
@@ -348,6 +360,12 @@ impl Client {
     fn reap(&mut self) {
         self.children
             .retain_mut(|c| matches!(c.try_wait(), Ok(None)));
+    }
+
+    /// Whether no service this process started is left.
+    fn no_children(&mut self) -> bool {
+        self.reap();
+        self.children.is_empty()
     }
 
     /// The remembered error while starts are blocked at `now`.
@@ -928,6 +946,42 @@ mod tests {
         // Blocked: answered at once with the same error.
         assert_eq!(c.call(&Request::Touch, NOW + 1), Err(e));
         assert_eq!(t.runs(), 1);
+    }
+
+    #[test]
+    fn call_right_after_a_start_starts_again_once_the_silent_peer_delay_passed() {
+        let _p = process_lock();
+        let t = TestDir::new();
+        let mut c = t
+            .client(t.script("svc", "exit 3"))
+            .with_timeouts(LONG, SHORT, SHORT);
+        // A service was started a second ago and is gone already.
+        c.last_start_unix = Some(NOW - 1);
+        let started = Instant::now();
+        let e = c.call(&Request::Touch, NOW).unwrap_err();
+        let took = started.elapsed();
+        assert!(e.contains("exit status: 3"), "{e}");
+        assert_eq!(t.runs(), 1);
+        // Not before the rest of the delay.
+        assert!(took >= Duration::from_millis(900), "{took:?}");
+    }
+
+    #[test]
+    fn call_while_the_own_service_ends_starts_a_new_one_when_it_is_gone() {
+        let _p = process_lock();
+        let t = TestDir::new();
+        let mut c = t
+            .client(t.script("svc", "exit 3"))
+            .with_timeouts(LONG, SHORT, SHORT);
+        // The service this client started long ago has closed its socket
+        // and exits in a moment.
+        c.last_start_unix = Some(NOW - 1000);
+        c.children
+            .push(Command::new("sleep").arg("0.3").spawn().unwrap());
+        let e = c.call(&Request::Touch, NOW).unwrap_err();
+        assert!(e.contains("exit status: 3"), "{e}");
+        assert_eq!(t.runs(), 1);
+        assert!(c.children.is_empty());
     }
 
     #[test]
