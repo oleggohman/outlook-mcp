@@ -404,11 +404,18 @@ How a new program is installed:
 * When `release/SHA256SUMS` lists a prebuilt program for the release and the
   Mac's architecture, the launcher downloads it from the GitHub release over
   HTTPS and installs it only if its SHA-256 matches the listed sum. A file
-  that does not match is deleted, and the launcher stops: nothing is built or
-  run in its place.
+  that does not match is deleted and never run, and nothing is built in its
+  place. With no program of the wanted version installed the launcher then
+  stops, also when an older one is installed. With a program of that version
+  built here, the launcher logs the mismatch and runs that program.
 * When the download fails (no network, for example) and a program that
-  answers `--version` is installed, that program is run, even an older one;
-  the next start tries the download again.
+  answers `--version` is installed, that program is run, even an older one.
+  With an older one the next start tries the download again.
+* When a program of the wanted version built here is run because the
+  download failed or the file did not match, the launcher leaves
+  `<install dir>/bin/.download-failed` and does not try the download again
+  for about 6 hours, so the starts in that time do not each wait for it. The
+  next install removes the file; delete it to have the next start try again.
 * Otherwise the launcher builds the program with
   `cargo build --release --locked`. This needs Rust (install it from
   <https://rustup.rs>) and takes about a minute, so the first connection can
