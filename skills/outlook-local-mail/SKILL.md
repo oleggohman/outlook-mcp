@@ -53,11 +53,21 @@ before showing them.
 |---|---|
 | Mail from a person or domain | `list_messages` with `from` set to part of the name or address (`"dana"`, `"example.org"`). `from` is a substring match on sender name and address, so no people lookup is needed first. |
 | Mail about a topic | `search_messages` with `query`; add `from`, `folder`, `since`, `until`, `unread_only`, `has_attachment` to narrow it. |
-| Read a message | `get_message` with the `guid` from a list. Default format is plain text. |
+| Read a message | `get_message` with the `guid` from a list. `format` is `text` (default, HTML converted to plain text) or `html`. |
 | Find an address | `search_people` (substring of name or address). |
-| Folder overview, unread counts | `list_folders`. |
-| Calendar | `list_events` with `since` and `until`. Without them the window is now to 14 days ahead. |
+| Folder overview, unread counts | `list_folders` with `limit: 100`, paging if `total` is larger: the default of 20 can hide a folder. |
+| Calendar | `list_events` with `since` and `until`. It returns events that overlap the window, earliest first, without cancelled ones unless `include_cancelled` is true. Without `since`/`until` the window is now to 14 days ahead. |
 | Is the data current? | `store_status`. |
+
+Order and filters: `list_messages` returns newest first, so `limit: 1` gives
+the newest match. `search_messages` returns best matches first, not newest.
+For mail, `since` and `until` filter on the sent time. Items carry `guid`,
+`subject`, `sender_name`, `sender_address`, `sent`, `is_read`,
+`has_attachment`, `folder` and `preview`.
+
+`from` matches part of the sender's name or address and has no exact mode:
+`"example.org"` also matches `example.org.il`. When several senders match,
+show them and ask, or filter the results by `sender_address` yourself.
 
 ### Search behaviour
 
@@ -97,7 +107,7 @@ and say the full text is not cached.
   checked).
 - The server rebuilds by itself when the store changed and the last build is
   at least 15 minutes old (the default).
-- `refresh` rebuilds now. Use it when the user says recent mail is missing or
+- `refresh` rebuilds now, waits for the build and returns the new status. Use it when the user says recent mail is missing or
   `store_changed_since_build` is true and the answer depends on new mail. Do
   not call it before every query: a rebuild takes 10 seconds or more on a
   large mailbox.
@@ -143,7 +153,7 @@ Monday 2026-11-23, last week = Sunday 15 to Saturday 21 November local time):
                "limit": 50}}
 ```
 
-Then `get_message` for the ones worth reading, and report times converted
+If `total` is above 50, page with `offset`. Then `get_message` for the ones worth reading, and report times converted
 back to the user's zone. If two senders match "dana", show both and ask.
 
 ## Common mistakes
@@ -151,5 +161,7 @@ back to the user's zone. If two senders match "dana", show both and ask.
 - Treating an empty result as "no such mail" without checking `store_status`
   when the user expects recent mail.
 - Calling `refresh` on every request.
+- Using the date-only form for a local day: `2026-11-15` is midnight UTC, not
+  local midnight. Use the full `...Z` form for local day boundaries.
 - Calling `search_people` only to get an address for `from`.
 - Reporting `unread_count` as the number of messages that can be listed.
