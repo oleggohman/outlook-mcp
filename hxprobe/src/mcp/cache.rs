@@ -439,14 +439,23 @@ impl Cache {
     ///
     /// In service mode: send `refresh` (the service builds, or joins its
     /// running build, and replies when it is over), then open the new
-    /// `mail.db`. A failed build is the error; the old database stays.
+    /// `mail.db`. A failed build is the error; the old database stays, and
+    /// the service's status is asked so that [`Cache::status`] shows the
+    /// failure.
     pub fn force_refresh_at(&mut self, now: i64) -> Result<(), String> {
         let Some(r) = self.refresher.as_mut() else {
             return self.attempt(now, false);
         };
         let reply = r.refresh(now);
+        // The error of a failed refresh does not say how the service is
+        // (a failed build, or no service): ask, so the status shows it.
+        let view = match &reply {
+            Ok(_) => ServiceView::of(&reply),
+            Err(_) => ServiceView::of(&r.status(now)),
+        };
+        self.service = Some(view);
         self.reopen_if_replaced();
-        reply.map(|st| self.service = Some(ServiceView::of(&Ok(st))))
+        reply.map(drop)
     }
 
     /// The state of the cache; checks the live store's size and time. In
@@ -2736,11 +2745,37 @@ mod tests {
         let mut c = served(&t, &fake);
         rebuild_in(&t.cache_dir(), NOW_I);
         messages(&mut c, NOW_I);
+        // What the service says after its failed build.
+        fake.script().reply = Ok(ServiceStatus {
+            last_error: Some("export: boom".into()),
+            last_attempt_unix: Some(NOW_I + 5),
+            ..fake_status(Some(NOW_I))
+        });
         assert_eq!(c.force_refresh_at(NOW_I + 5).unwrap_err(), "export: boom");
         assert_eq!(built_unix(&c), Some(NOW_I));
+        // The status shows the failure at once, not the view of before.
+        let st = c.status();
+        assert_eq!(st.last_error, Some("export: boom"));
+        assert_eq!(st.last_attempt_unix, Some(NOW_I + 5));
+        assert!(st.service.unwrap().running);
+        assert_eq!(fake.counts(), (1, 1, 1));
         assert_eq!(messages(&mut c, NOW_I + 6), 4);
-        assert_eq!(fake.counts(), (2, 0, 1));
         assert_eq!(c.builds, 0);
+    }
+
+    #[test]
+    fn refresh_of_an_unavailable_service_shows_in_the_status() {
+        let t = TestDir::new("svcrefreshdown");
+        let fake = FakeRefresher::new(Ok(fake_status(Some(NOW_I))));
+        let mut c = served(&t, &fake);
+        rebuild_in(&t.cache_dir(), NOW_I);
+        messages(&mut c, NOW_I);
+        let why = "the refresh service did not start; see service.log";
+        fake.script().reply = Err(why.into());
+        assert_eq!(c.force_refresh_at(NOW_I + 5).unwrap_err(), why);
+        let st = c.status();
+        assert_eq!(st.last_error, Some(why));
+        assert!(!st.service.unwrap().running);
     }
 
     /// Create the optional type tables the way [`prepare`] does, so a test
