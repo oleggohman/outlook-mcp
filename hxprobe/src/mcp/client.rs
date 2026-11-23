@@ -52,6 +52,8 @@ pub struct Client {
     /// When this process last started a service (unix seconds).
     last_start_unix: Option<i64>,
     timeouts: Timeouts,
+    /// The clock of the start timeout: [`Instant::now`]; tests replace it.
+    clock: fn() -> Instant,
 }
 
 /// How often a reply may lead to another round (a replaced or refusing
@@ -92,6 +94,7 @@ impl Client {
                 probe: proto::REQUEST_TIMEOUT,
                 stop_wait: proto::GONE_WAIT,
             },
+            clock: Instant::now,
         })
     }
 
@@ -233,7 +236,7 @@ impl Client {
         round: u32,
         start: bool,
     ) -> Result<ServiceStatus, String> {
-        let deadline = Instant::now() + self.timeouts.start;
+        let deadline = (self.clock)() + self.timeouts.start;
         // The child started here while it runs, and when it was started.
         let mut child: Option<u32> = None;
         let mut spawned_at: Option<Instant> = None;
@@ -274,7 +277,7 @@ impl Client {
                 Err(ExchangeError::BadReply) => return Err(self.unreadable()),
                 Err(ExchangeError::NotRunning | ExchangeError::Timeout) => {}
             }
-            if Instant::now() >= deadline {
+            if (self.clock)() >= deadline {
                 let e = format!(
                     "the refresh service did not start; see {}",
                     self.log_path().display()
@@ -541,6 +544,65 @@ mod tests {
 
     const NOW: i64 = 1_800_000_000;
     const SHORT: Duration = Duration::from_millis(300);
+    /// A start timeout no started script comes near, also under load.
+    const LONG: Duration = Duration::from_secs(5);
+    /// Well before [`LONG`]: a call that returned at a script's exit.
+    const AT_ONCE: Duration = Duration::from_secs(2);
+
+    /// The pid file of the child whose exit [`after_exit_clock`] waits
+    /// for, and how often that clock has seen the child gone.
+    static EXIT_GATE: Mutex<Option<(PathBuf, u32)>> = Mutex::new(None);
+
+    /// Arms [`after_exit_clock`] while it lives.
+    struct ExitGate;
+
+    impl ExitGate {
+        fn set(pid_file: PathBuf) -> ExitGate {
+            *EXIT_GATE.lock().unwrap_or_else(|e| e.into_inner()) = Some((pid_file, 0));
+            ExitGate
+        }
+
+        /// Whether the clock has jumped past every timeout.
+        fn passed() -> bool {
+            EXIT_GATE
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .is_some_and(|(_, seen)| *seen >= 2)
+        }
+    }
+
+    impl Drop for ExitGate {
+        fn drop(&mut self) {
+            *EXIT_GATE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
+    }
+
+    /// A start-timeout clock: real time until it has seen the child of
+    /// [`EXIT_GATE`] gone at two of its readings, an hour later from then.
+    /// The client reads it once before the start (no pid file yet) and then
+    /// at the end of each probe round, after it looked at its child; so by
+    /// the second reading that saw the child gone, the client has seen the
+    /// exit too.
+    fn after_exit_clock() -> Instant {
+        let now = Instant::now();
+        let mut gate = EXIT_GATE.lock().unwrap_or_else(|e| e.into_inner());
+        let Some((pid_file, seen)) = gate.as_mut() else {
+            return now;
+        };
+        let gone = std::fs::read_to_string(&*pid_file)
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .is_some_and(proto::pid_gone);
+        if gone && *seen < 2 {
+            *seen += 1;
+        }
+        if *seen >= 2 {
+            now + Duration::from_secs(3600)
+        } else {
+            now
+        }
+    }
 
     /// A short scratch directory with a store file and the cache directory
     /// `c`; removed on drop.
@@ -720,10 +782,13 @@ mod tests {
             Request::Shutdown { .. } => "{\"ok\":true,\"stopping\":true}\n".into(),
             _ => status_line("0.0.1", pid, &store),
         });
-        // The replacement cannot start: its error is the result.
-        let mut c = t.client(t.script("svc", "exit 3"));
+        // The replacement cannot start: its error is the result. The start
+        // timeout leaves the script all the time it needs to run.
+        let mut c = t
+            .client(t.script("svc", "exit 3"))
+            .with_timeouts(LONG, SHORT, SHORT);
         let e = c.call(&Request::Touch, NOW).unwrap_err();
-        assert!(e.contains('3'), "{e}");
+        assert!(e.contains("exit status: 3"), "{e}");
         assert_eq!(played.requests(), [Request::Touch, shutdown("0.0.1")]);
         assert_eq!(t.runs(), 1);
     }
@@ -786,11 +851,13 @@ mod tests {
     fn no_new_start_within_30_s_of_a_failed_start() {
         let _p = process_lock();
         let t = TestDir::new();
-        let mut c = t.client(t.script("svc", "exit 3"));
+        let mut c = t
+            .client(t.script("svc", "exit 3"))
+            .with_timeouts(LONG, SHORT, SHORT);
         let started = Instant::now();
         let e = c.call(&Request::Touch, NOW).unwrap_err();
-        // At once, not after the start timeout.
-        assert!(started.elapsed() < SHORT, "{:?}", started.elapsed());
+        // At the exit, well before the start timeout.
+        assert!(started.elapsed() < AT_ONCE, "{:?}", started.elapsed());
         assert!(e.contains("exit status: 3"), "{e}");
         assert!(e.contains(proto::LOG_NAME), "{e}");
         assert_eq!(t.runs(), 1);
@@ -838,12 +905,20 @@ mod tests {
     fn lost_lock_keeps_probing_until_the_start_timeout() {
         let _p = process_lock();
         let t = TestDir::new();
-        let mut c = t.client(t.script("svc", "exit 75"));
+        // The script leaves its pid; the start timeout passes only once the
+        // client has seen it exit.
+        let mut c = t
+            .client(t.script("svc", "echo $$ > pid\nexit 75"))
+            .with_timeouts(LONG, SHORT, SHORT);
+        c.clock = after_exit_clock;
+        let _gate = ExitGate::set(t.cache().join("pid"));
         let started = Instant::now();
         let e = c.call(&Request::Touch, NOW).unwrap_err();
         let took = started.elapsed();
-        assert!(took >= SHORT, "{took:?}");
-        assert!(took < Duration::from_secs(2), "{took:?}");
+        assert!(took < AT_ONCE, "{took:?}");
+        // Still probing after the exit: the error came from the clock
+        // passing the start timeout.
+        assert!(ExitGate::passed());
         assert!(e.contains("did not start"), "{e}");
         assert!(e.contains(proto::LOG_NAME), "{e}");
         // No second start inside the silent-peer delay.
