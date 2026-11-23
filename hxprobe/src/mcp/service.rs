@@ -280,19 +280,24 @@ impl<B: Backend> Core<B> {
         }
         match self.db() {
             None => {
-                // An attempt time after `now` does not count. After a
+                // Only the very first attempt runs without a client call:
+                // a build that keeps failing must not keep the service
+                // copying the store after its clients left. After a
                 // successful build that left no usable database, wait a
                 // little: another program may be replacing it with its own.
-                let recent = |secs: i64| {
-                    self.last_attempt_unix
-                        .is_some_and(|at| (0..secs).contains(&now.saturating_sub(at)))
+                // An attempt time after `now` does not count.
+                let due = match self.last_attempt_unix {
+                    None => true,
+                    Some(at) => {
+                        let wait = if self.last_error.is_some() {
+                            secs(self.refresh_secs).max(UNUSABLE_REBUILD_SECS)
+                        } else {
+                            UNUSABLE_REBUILD_SECS
+                        };
+                        self.touched && !(0..wait).contains(&now.saturating_sub(at))
+                    }
                 };
-                let blocked = if self.last_error.is_some() {
-                    recent(secs(self.refresh_secs))
-                } else {
-                    recent(UNUSABLE_REBUILD_SECS)
-                };
-                if !blocked {
+                if due {
                     return Action::Build(BuildReason::First);
                 }
             }
@@ -1359,9 +1364,49 @@ pub(crate) mod tests {
             assert_eq!(c.poll(NOW), Action::Build(BuildReason::First));
             run_build(&mut c, NOW, NOW + 1);
             assert_eq!(c.status().last_error, None);
-            assert_eq!(c.poll(NOW + 59), Action::Wait, "file: {file}");
-            assert_eq!(c.poll(NOW + 60), Action::Build(BuildReason::First));
+            // Never again without a client call.
+            assert_eq!(c.poll(NOW + 60), Action::Wait, "file: {file}");
+            assert_eq!(c.poll(NOW + DAY), Action::Wait, "file: {file}");
+            let mut c2 = core(900, 0);
+            if file {
+                c2.backend().set(|s| s.db_id = Some(id(7)));
+            }
+            run_build(&mut c2, NOW, NOW + 1);
+            assert_eq!(touch(&mut c2, NOW + 59).build, None, "file: {file}");
+            assert_eq!(c2.poll(NOW + 59), Action::Wait, "file: {file}");
+            assert_eq!(c2.poll(NOW + 60), Action::Build(BuildReason::First));
         }
+    }
+
+    #[test]
+    fn failed_first_build_is_not_retried_without_a_touch_and_the_service_goes_idle() {
+        let mut c = core(900, 1800);
+        c.backend().set(|s| s.fail = Some("boom".into()));
+        assert_eq!(c.poll(NOW), Action::Build(BuildReason::First));
+        run_build(&mut c, NOW, NOW + 2);
+        for t in [NOW + 2, NOW + 900, NOW + 1800, NOW + 1801] {
+            assert_eq!(c.poll(t), Action::Wait, "at {}", t - NOW);
+        }
+        assert_eq!(c.poll(NOW + 1802), Action::Exit(Exit::Idle));
+        assert_eq!(c.backend().get(|s| s.builds), 1);
+    }
+
+    #[test]
+    fn failed_first_build_with_refresh_secs_zero_does_not_loop() {
+        let mut c = core(0, 0);
+        c.backend().set(|s| s.fail = Some("boom".into()));
+        assert_eq!(c.poll(NOW), Action::Build(BuildReason::First));
+        run_build(&mut c, NOW, NOW + 2);
+        for t in [NOW + 2, NOW + 3, NOW + 60, NOW + DAY] {
+            assert_eq!(c.poll(t), Action::Wait, "at {}", t - NOW);
+        }
+        // A client call starts the next attempt, not sooner than a minute
+        // after the failed one.
+        let mut c = core(0, 0);
+        c.backend().set(|s| s.fail = Some("boom".into()));
+        run_build(&mut c, NOW, NOW + 2);
+        assert_eq!(touch(&mut c, NOW + 59).build, None);
+        assert_eq!(touch(&mut c, NOW + 60).build, Some(BuildReason::First));
     }
 
     #[test]
