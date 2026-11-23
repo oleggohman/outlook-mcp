@@ -727,6 +727,27 @@ if [ "$rc" = 1 ] && [ -z "$out" ] && [[ "$err" == *'cannot set the mode'* ]] \
     && [ ! -e "$r/curl-args" ] && [ ! -e "$r/ran" ]; then pass "$t"
 else fail "$t" "rc=$rc out='$out' err='$err'"; fi
 
+# (xii) Versions with a suffix. A pre-release (`-rc1`) is older than the
+# release with the same numbers and is replaced by it; build metadata (`+b5`)
+# makes no difference; a pre-release of a later version is newer.
+for have in 9.8.7-rc1 9.8.7+b5 9.8.8-rc1; do
+    t="installed $have"
+    r=$(make_repo)
+    make_asset "$r"
+    make_curl_probe "$r"
+    mkdir -p "$r/inst/bin"
+    make_fake "$r/inst/bin/hxprobe" "$r/old-ran" '' "$have"
+    run "$r" HXPROBE_RELEASE_BASE="file://$r/rel" PATH="$r/stub:$nocargo_path" --
+    ok=0
+    case "$have" in
+        9.8.7-rc1 ) [ -e "$r/ran" ] && [ ! -e "$r/old-ran" ] && [ -e "$r/curl-args" ] && ok=1 ;;
+        9.8.7+b5 ) [ -e "$r/old-ran" ] && [ ! -e "$r/curl-args" ] && [ -z "$err" ] && ok=1 ;;
+        9.8.8-rc1 ) [ -e "$r/old-ran" ] && [ ! -e "$r/curl-args" ] && [[ "$err" == *'newer'* ]] && ok=1 ;;
+    esac
+    if [ "$rc" = 0 ] && [ "$out" = 'FAKE mcp' ] && [ "$ok" = 1 ]; then pass "$t"
+    else fail "$t" "rc=$rc out='$out' err='$err'"; fi
+done
+
 if [ "$failures" -ne 0 ]; then
     printf '%d case(s) failed\n' "$failures"
     exit 1

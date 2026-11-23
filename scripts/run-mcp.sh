@@ -93,8 +93,10 @@ fi
 chmod 700 "$inst" "$bindir" || die "cannot set the mode of $inst and $bindir"
 
 # Prints -1, 0 or 1 when version $1 is older than, equal to or newer than $2,
-# comparing major, minor and patch as numbers; a suffix after `-` or `+` is
-# ignored. Prints `?` when either is not of that form.
+# comparing major, minor and patch as numbers. With equal numbers a
+# pre-release (a suffix after `-`) is older than the version without one, and
+# two pre-releases compare as text; build metadata after `+` is ignored.
+# Prints `?` when either is not of that form.
 version_cmp() {
     awk -v a="$1" -v b="$2" '
         function parse(v, p,    n) {
@@ -103,13 +105,22 @@ version_cmp() {
             n = split(v, p, ".")
             return n == 3
         }
+        function pre(v,    i) {
+            sub(/\+.*$/, "", v)
+            i = index(v, "-")
+            return i ? substr(v, i + 1) : ""
+        }
         BEGIN {
             if (!parse(a, x) || !parse(b, y)) { print "?"; exit }
             for (i = 1; i <= 3; i++) {
                 if (x[i] + 0 < y[i] + 0) { print -1; exit }
                 if (x[i] + 0 > y[i] + 0) { print 1; exit }
             }
-            print 0
+            pa = pre(a); pb = pre(b)
+            if (pa == pb) print 0
+            else if (pa == "") print 1
+            else if (pb == "") print -1
+            else print ((pa "") < (pb "")) ? -1 : 1
         }'
 }
 
