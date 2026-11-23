@@ -11,7 +11,7 @@
 //! one of its cache directory.
 
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufRead, Read, Write};
+use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -876,14 +876,44 @@ enum Line {
 }
 
 /// Read one request line, at most [`proto::MAX_REQUEST_BYTES`] and its
-/// newline.
-fn read_line(s: &UnixStream) -> Line {
+/// newline, all within `timeout`: a client that sends a byte now and then
+/// does not keep its connection for longer.
+fn read_line(mut s: &UnixStream, timeout: Duration) -> Line {
+    let deadline = Instant::now() + timeout;
+    let limit = proto::MAX_REQUEST_BYTES + 2;
     let mut buf = Vec::new();
-    let limit = proto::MAX_REQUEST_BYTES as u64 + 2;
-    match io::BufReader::new(s.take(limit)).read_until(b'\n', &mut buf) {
-        Ok(0) | Err(_) => Line::Nothing,
-        Ok(_) if !buf.ends_with(b"\n") && buf.len() > proto::MAX_REQUEST_BYTES => Line::Bad,
-        Ok(_) => String::from_utf8(buf).map_or(Line::Bad, Line::Text),
+    let mut chunk = [0u8; 1024];
+    loop {
+        let left = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|d| !d.is_zero());
+        let Some(left) = left else {
+            return Line::Nothing;
+        };
+        // When this fails the timeout set before still bounds the read.
+        let _ = s.set_read_timeout(Some(left));
+        match s.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                if let Some(end) = buf.iter().position(|&b| b == b'\n') {
+                    buf.truncate(end + 1);
+                    break;
+                }
+                if buf.len() >= limit {
+                    break;
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => return Line::Nothing,
+        }
+    }
+    if buf.is_empty() {
+        Line::Nothing
+    } else if !buf.ends_with(b"\n") && buf.len() > proto::MAX_REQUEST_BYTES {
+        Line::Bad
+    } else {
+        String::from_utf8(buf).map_or(Line::Bad, Line::Text)
     }
 }
 
@@ -905,7 +935,7 @@ where
     {
         return;
     }
-    let req = match read_line(&s) {
+    let req = match read_line(&s, proto::CONNECTION_TIMEOUT) {
         Line::Nothing => return,
         Line::Bad => return reply(&s, &proto::bad_request_reply()),
         Line::Text(t) => match Request::parse(&t) {
@@ -2112,6 +2142,50 @@ pub(crate) mod tests {
         assert_eq!(reply, format!("{}\n", proto::bad_request_reply()));
         // Still served, while the silent client is connected.
         assert_eq!(r.req(&Request::Status).unwrap()["ok"], true);
+    }
+
+    #[test]
+    fn request_line_has_one_deadline_for_all_its_reads() {
+        let (a, mut b) = UnixStream::pair().unwrap();
+        // A client that sends a byte now and then and never a newline.
+        let writer = thread::spawn(move || {
+            for _ in 0..30 {
+                if b.write_all(b"x").is_err() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+        });
+        let started = Instant::now();
+        let line = read_line(&a, Duration::from_millis(300));
+        let took = started.elapsed();
+        assert!(matches!(line, Line::Nothing));
+        assert!(took >= Duration::from_millis(300), "{took:?}");
+        assert!(took < Duration::from_millis(1200), "{took:?}");
+        drop(a);
+        writer.join().unwrap();
+    }
+
+    #[test]
+    fn request_lines_are_read_whole_and_bounded() {
+        let line = |bytes: &[u8]| {
+            let (a, mut b) = UnixStream::pair().unwrap();
+            b.write_all(bytes).unwrap();
+            drop(b);
+            read_line(&a, REQ)
+        };
+        assert!(matches!(line(b""), Line::Nothing));
+        assert!(
+            matches!(line(b"{\"op\":\"status\"}\nrest"), Line::Text(t) if t == "{\"op\":\"status\"}\n")
+        );
+        // Without a newline at the end of input.
+        assert!(matches!(line(b"abc"), Line::Text(t) if t == "abc"));
+        assert!(matches!(line(b"\xff\n"), Line::Bad));
+        let long = vec![b'x'; proto::MAX_REQUEST_BYTES + 1];
+        assert!(matches!(line(&long), Line::Bad));
+        let mut fits = vec![b'x'; proto::MAX_REQUEST_BYTES];
+        fits.push(b'\n');
+        assert!(matches!(line(&fits), Line::Text(t) if t.len() == proto::MAX_REQUEST_BYTES + 1));
     }
 
     #[test]
