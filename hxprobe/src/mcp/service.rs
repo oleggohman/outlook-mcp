@@ -1000,15 +1000,11 @@ pub fn stop_command(dir: &Path) -> Result<String, String> {
         Err(proto::ExchangeError::NotRunning) => {}
         Err(e) => return Err(not_stopped(dir, &e.to_string())),
     }
-    let deadline = Instant::now() + proto::GONE_WAIT;
-    while !proto::pid_gone(st.pid) {
-        if Instant::now() >= deadline {
-            return Err(not_stopped(
-                dir,
-                &format!("it did not stop within {} s", proto::GONE_WAIT.as_secs()),
-            ));
-        }
-        thread::sleep(proto::GONE_POLL);
+    if !proto::wait_gone(st.pid, proto::GONE_WAIT) {
+        return Err(not_stopped(
+            dir,
+            &format!("it did not stop within {} s", proto::GONE_WAIT.as_secs()),
+        ));
     }
     Ok(format!(
         "stopped the refresh service {} (pid {})",

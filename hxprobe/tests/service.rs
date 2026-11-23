@@ -16,7 +16,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use hxprobe::mcp::proto::{self, ExchangeError, Request, LOCK_NAME, SOCKET_NAME};
+use hxprobe::mcp::client::Client;
+use hxprobe::mcp::proto::{self, ExchangeError, Refresher, Request, LOCK_NAME, SOCKET_NAME};
 use serde_json::Value;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -762,4 +763,351 @@ fn stale_socket_does_not_prevent_a_start() {
     let v = answering(&d);
     assert_eq!(v["pid"], svc.pid());
     assert_ne!(std::fs::symlink_metadata(d.sock()).unwrap().ino(), stale);
+}
+
+// --- the client: start and upgrade ---
+
+/// The current time, in unix seconds.
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+}
+
+/// A [`Client`] for `d` that starts this crate's program.
+fn new_client(d: &Dir) -> Client {
+    new_client_with(d, 900)
+}
+
+/// [`new_client`] with the service's `--refresh-secs`.
+fn new_client_with(d: &Dir, refresh_secs: u64) -> Client {
+    Client::new(
+        &d.cache(),
+        &d.store(),
+        PathBuf::from(env!("CARGO_BIN_EXE_hxprobe")),
+        refresh_secs,
+        30,
+    )
+    .unwrap()
+}
+
+/// `<cache>/service.log` so far: the log of services a client started.
+fn service_log(d: &Dir) -> String {
+    std::fs::read_to_string(d.cache().join(proto::LOG_NAME)).unwrap_or_default()
+}
+
+/// Lines of `<cache>/service.log` that contain `what`.
+fn log_lines(d: &Dir, what: &str) -> usize {
+    service_log(d).lines().filter(|l| l.contains(what)).count()
+}
+
+const LOST: &str = "another service holds the lock";
+
+#[test]
+fn client_starts_a_detached_service() {
+    let _s = serial();
+    let d = Dir::new();
+    let mut c = new_client(&d);
+    let st = c.touch(unix_now()).unwrap();
+    assert_eq!(st.version, VERSION);
+    let lock = std::fs::read_to_string(d.cache().join(LOCK_NAME)).unwrap();
+    assert_eq!(lock, format!("{} {VERSION}\n", st.pid));
+    drop(c);
+    // Lives on after the client is gone.
+    let v = request(&d, &Request::Status).unwrap();
+    assert_eq!(v["pid"], st.pid);
+    // SAFETY: getsid() has no preconditions.
+    assert_eq!(
+        unsafe { libc::getsid(st.pid as libc::pid_t) },
+        st.pid as libc::pid_t
+    );
+    // Its stderr is the log.
+    assert_eq!(log_lines(&d, "listening on"), 1, "{}", service_log(&d));
+    assert_eq!(
+        log_lines(&d, &format!("[{}]", st.pid)),
+        service_log(&d).lines().count()
+    );
+}
+
+#[test]
+fn two_clients_starting_at_once_end_with_one_service() {
+    let _s = serial();
+    let d = Dir::new();
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let pids: Vec<u32> = std::thread::scope(|s| {
+        let hs: Vec<_> = (0..2)
+            .map(|_| {
+                let b = std::sync::Arc::clone(&barrier);
+                let mut c = new_client(&d);
+                s.spawn(move || {
+                    b.wait();
+                    c.touch(unix_now()).unwrap().pid
+                })
+            })
+            .collect();
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    assert_eq!(pids[0], pids[1]);
+    assert_eq!(log_lines(&d, "listening on"), 1, "{}", service_log(&d));
+    // A loser, if one started, must have given up before the test ends:
+    // it would otherwise take the lock once the winner is killed.
+    let losers: Vec<u32> = own_children()
+        .into_iter()
+        .filter(|p| *p != pids[0] && !proto::pid_gone(*p))
+        .collect();
+    for p in &losers {
+        wait_until("a losing service to exit", Duration::from_secs(5), || {
+            proto::pid_gone(*p)
+        });
+    }
+    assert!(log_lines(&d, LOST) >= losers.len(), "{}", service_log(&d));
+}
+
+/// Pids of the child processes of this test process.
+fn own_children() -> Vec<u32> {
+    let out = Command::new("pgrep")
+        .arg("-P")
+        .arg(std::process::id().to_string())
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .filter_map(|p| p.parse().ok())
+        .collect()
+}
+
+#[test]
+fn client_gives_up_on_a_service_that_never_answers() {
+    let _s = serial();
+    let d = Dir::new();
+    let pid = stand_in();
+    let played = SilentService::start(&d, pid.pid());
+    let mut c = new_client(&d).with_timeouts(
+        Duration::from_millis(300),
+        Duration::from_millis(300),
+        Duration::from_millis(300),
+    );
+    let started = Instant::now();
+    let e = c.touch(unix_now()).unwrap_err();
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "{:?}",
+        started.elapsed()
+    );
+    assert!(e.contains(proto::LOG_NAME), "{e}");
+    // The service it started lost against the lock holder, which kept it.
+    wait_until(
+        "the started service to give up",
+        Duration::from_secs(5),
+        || log_lines(&d, LOST) == 1,
+    );
+    assert!(played.lock_held(&d));
+    assert_eq!(
+        std::fs::read_to_string(d.cache().join(LOCK_NAME)).unwrap(),
+        format!("{} {VERSION}\n", pid.pid())
+    );
+}
+
+/// What a played old service does after it accepted a `shutdown`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OnShutdown {
+    /// As a real service: the socket goes at once, the lock 300 ms later,
+    /// and only then the process (the stand-in, killed and not waited for).
+    Exit,
+    /// The socket and the lock go at once; the stand-in never exits.
+    Hang,
+}
+
+/// A service played by the test: holds `service.lock` naming the pid of a
+/// stand-in, answers `status` and `touch` with `version` and records the
+/// requests.
+struct Played {
+    requests: std::sync::Arc<Mutex<Vec<Request>>>,
+    /// After an `Exit`: whether `service.log` was still absent when the
+    /// stand-in was killed (no service was started before it was gone).
+    log_absent_at_kill: std::sync::Arc<Mutex<Option<bool>>>,
+    done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    pid: u32,
+}
+
+impl Played {
+    fn start(d: &Dir, version: &'static str, on_shutdown: OnShutdown) -> Played {
+        use std::io::{BufRead, Write};
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        use std::sync::Arc;
+        let _ = std::fs::create_dir(d.cache());
+        std::fs::set_permissions(d.cache(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut stand_in = stand_in();
+        let pid = stand_in.pid();
+        let mut lock = Some(
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .mode(0o600)
+                .open(d.cache().join(LOCK_NAME))
+                .unwrap(),
+        );
+        let f = lock.as_mut().unwrap();
+        // SAFETY: flock() on a descriptor owned by `f`.
+        assert_eq!(
+            unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        f.set_len(0).unwrap();
+        writeln!(f, "{pid} {version}").unwrap();
+        let sock = d.sock();
+        let log = d.cache().join(proto::LOG_NAME);
+        let store = std::fs::canonicalize(d.store()).unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let log_absent_at_kill = Arc::new(Mutex::new(None));
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (seen, absent, stop) = (
+            Arc::clone(&requests),
+            Arc::clone(&log_absent_at_kill),
+            Arc::clone(&done),
+        );
+        let thread = std::thread::spawn(move || {
+            let mut listener = Some(listener);
+            while !stop.load(Ordering::SeqCst) {
+                let Some(Ok((s, _))) = listener.as_ref().map(|l| l.accept()) else {
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                };
+                s.set_nonblocking(false).unwrap();
+                s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                let mut line = String::new();
+                if std::io::BufReader::new(&s).read_line(&mut line).is_err() {
+                    continue;
+                }
+                let Ok(req) = Request::parse(&line) else {
+                    continue;
+                };
+                seen.lock().unwrap().push(req.clone());
+                let stopping = req
+                    == Request::Shutdown {
+                        version: version.into(),
+                    };
+                let reply = if stopping {
+                    serde_json::json!({"ok": true, "stopping": true})
+                } else {
+                    serde_json::json!({"ok": true, "version": version, "pid": pid,
+                        "store_path": store.to_str().unwrap(), "building": false,
+                        "db_usable": true, "builds": 0})
+                };
+                let _ = (&s).write_all(format!("{reply}\n").as_bytes());
+                drop(s);
+                if !stopping {
+                    continue;
+                }
+                // The socket goes first, as `cmd_service` does.
+                listener = None;
+                let _ = std::fs::remove_file(&sock);
+                if on_shutdown == OnShutdown::Exit {
+                    std::thread::sleep(Duration::from_millis(300));
+                    lock = None;
+                    *absent.lock().unwrap() = Some(!log.exists());
+                    let _ = stand_in.0.kill();
+                } else {
+                    lock = None;
+                }
+            }
+            drop(lock);
+            drop(stand_in);
+        });
+        Played {
+            requests,
+            log_absent_at_kill,
+            done,
+            thread: Some(thread),
+            pid,
+        }
+    }
+
+    fn requests(&self) -> Vec<Request> {
+        self.requests.lock().unwrap().clone()
+    }
+}
+
+impl Drop for Played {
+    fn drop(&mut self) {
+        self.done.store(true, Ordering::SeqCst);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+fn old_shutdown() -> Request {
+    Request::Shutdown {
+        version: "0.0.1".into(),
+    }
+}
+
+#[test]
+fn client_replaces_an_older_service_once_it_is_gone() {
+    let _s = serial();
+    let d = Dir::new();
+    // The store changed after the database was built: the service rebuilds
+    // it only after a touch.
+    old_database(&d);
+    let played = Played::start(&d, "0.0.1", OnShutdown::Exit);
+    let mut c = new_client_with(&d, 0);
+    let started = Instant::now();
+    let st = c.touch(unix_now()).unwrap();
+    let took = started.elapsed();
+    assert_eq!(st.version, VERSION);
+    assert_ne!(st.pid, played.pid);
+    assert!(took < Duration::from_millis(1500), "took {took:?}");
+    assert_eq!(played.requests(), [Request::Touch, old_shutdown()]);
+    assert_eq!(*played.log_absent_at_kill.lock().unwrap(), Some(true));
+    assert!(proto::pid_gone(played.pid));
+    assert_eq!(log_lines(&d, "listening on"), 1, "{}", service_log(&d));
+    assert_eq!(log_lines(&d, LOST), 0, "{}", service_log(&d));
+    // The new service got the touch: it rebuilds the changed store. (Its
+    // `built_unix` may equal the old one: both are whole seconds.)
+    wait_until("the rebuild", Duration::from_secs(10), || {
+        request(&d, &Request::Status).is_ok_and(|v| v["builds"] == 1 && v["building"] == false)
+    });
+    assert!(
+        service_log(&d).contains("build started (changed)"),
+        "{}",
+        service_log(&d)
+    );
+}
+
+#[test]
+fn client_starts_after_the_limit_when_an_old_service_left_its_socket_and_lock() {
+    let _s = serial();
+    let d = Dir::new();
+    let played = Played::start(&d, "0.0.1", OnShutdown::Hang);
+    let wait = Duration::from_millis(300);
+    let mut c = new_client_with(&d, 900).with_timeouts(proto::START_TIMEOUT, REQ, wait);
+    let started = Instant::now();
+    let st = c.touch(unix_now()).unwrap();
+    assert!(started.elapsed() >= wait, "{:?}", started.elapsed());
+    assert_eq!(st.version, VERSION);
+    assert_eq!(played.requests(), [Request::Touch, old_shutdown()]);
+    assert!(!proto::pid_gone(played.pid));
+    assert_eq!(log_lines(&d, "listening on"), 1, "{}", service_log(&d));
+    assert_eq!(log_lines(&d, LOST), 0, "{}", service_log(&d));
+}
+
+#[test]
+fn client_uses_a_newer_service_and_never_stops_it() {
+    let _s = serial();
+    let d = Dir::new();
+    let played = Played::start(&d, "99.0.0", OnShutdown::Exit);
+    let mut c = new_client(&d);
+    let st = c.touch(unix_now()).unwrap();
+    assert_eq!(st.version, "99.0.0");
+    assert_eq!(st.pid, played.pid);
+    assert_eq!(played.requests(), [Request::Touch]);
+    // Nothing was started.
+    assert!(!d.cache().join(proto::LOG_NAME).exists());
 }

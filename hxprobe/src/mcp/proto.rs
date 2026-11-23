@@ -408,6 +408,19 @@ pub fn pid_gone(pid: u32) -> bool {
     is_zombie(pid)
 }
 
+/// Wait until process `pid` is gone (see [`pid_gone`]), looking every
+/// [`GONE_POLL`], for at most `limit`; whether it is gone.
+pub fn wait_gone(pid: u32, limit: Duration) -> bool {
+    let deadline = Instant::now() + limit;
+    while !pid_gone(pid) {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(GONE_POLL);
+    }
+    true
+}
+
 /// Whether `pid` is a zombie, or vanished meanwhile.
 #[cfg(target_os = "macos")]
 fn is_zombie(pid: libc::pid_t) -> bool {
