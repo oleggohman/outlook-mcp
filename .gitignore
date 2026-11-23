@@ -1,0 +1,14 @@
+# Never commit mail data. Stores and exports hold real messages.
+*.hxd
+*.db
+*.db-wal
+*.db-shm
+snapshots/
+testdata/
+
+target/
+.DS_Store
+*.swp
+
+# Local editor and assistant settings.
+.claude/
