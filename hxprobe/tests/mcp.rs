@@ -89,7 +89,10 @@ fn mcp_with(
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::piped())
+        // The in-process mode: these tests start no refresh service.
+        .env("HXPROBE_SERVICE", "0")
+        .env_remove("HXPROBE_TEST_BUILD_DELAY_MS");
     configure(&mut cmd);
     let mut child = Running(cmd.spawn().unwrap());
     let out = drain(child.0.stdout.take().unwrap());
@@ -265,6 +268,7 @@ fn mcp_with_bad_options_fails() {
     for args in [
         vec![Path::new("--store")],
         vec![Path::new("--refresh-secs"), Path::new("soon")],
+        vec![Path::new("--idle-secs"), Path::new("soon")],
         vec![Path::new("--colour"), Path::new("red")],
     ] {
         let (status, out, err) = mcp(&args, &[("HOME", &d.0)], b"");
@@ -396,4 +400,47 @@ fn mcp_keeps_serving_when_stderr_is_closed() {
     assert_eq!(tool_result(&lines[0])["last_error"], Value::Null);
     assert_eq!(tool_result(&lines[1])["total"], 0);
     assert_eq!(lines[2]["result"], json!({}));
+}
+
+/// Run a `store_status` call in fallback mode (`configure` chooses how) and
+/// check that no refresh service was started or asked.
+fn assert_fallback(name: &str, args: &[&Path], configure: impl FnOnce(&mut Command)) {
+    let d = Dir::new(name);
+    let store = d.path("HxStore.hxd");
+    std::fs::write(&store, empty_store()).unwrap();
+    let cache = d.path("cache");
+    let mut all = vec![
+        Path::new("--store"),
+        &store,
+        Path::new("--cache-dir"),
+        &cache,
+    ];
+    all.extend_from_slice(args);
+    let input = request(1, "tools/call", json!({"name": "store_status"}));
+    let (status, out, err) = mcp_with(&all, input.as_bytes(), true, |cmd| {
+        cmd.env("HOME", &d.0);
+        configure(cmd);
+    });
+    assert_eq!(status.code(), Some(0), "stderr: {err}");
+    let v = tool_result(&responses(&out)[0]);
+    assert_eq!(v["service"], Value::Null, "{v}");
+    assert_eq!(v["last_error"], Value::Null, "{v}");
+    assert!(v["built"].is_string(), "{v}");
+    for f in ["service.sock", "service.lock", "service.log"] {
+        assert!(!cache.join(f).exists(), "{f} exists");
+    }
+    assert!(err.contains("fallback"), "stderr: {err}");
+}
+
+#[test]
+fn mcp_with_hxprobe_service_0_runs_without_a_service() {
+    assert_fallback("envzero", &[], |_| {});
+}
+
+#[test]
+fn mcp_with_no_service_runs_without_a_service() {
+    // Without the variable, so only the option can choose the mode.
+    assert_fallback("noservice", &[Path::new("--no-service")], |cmd| {
+        cmd.env_remove("HXPROBE_SERVICE");
+    });
 }

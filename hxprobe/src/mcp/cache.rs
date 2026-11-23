@@ -167,7 +167,12 @@ impl ServiceView {
                 building: st.building,
                 version: Some(st.version.clone()),
                 pid: Some(st.pid),
-                last_error: st.last_error.clone(),
+                // The service sets this text when a build starts; it is an
+                // error only when the build is over (one that broke off).
+                last_error: st
+                    .last_error
+                    .clone()
+                    .filter(|e| !(st.building && e == BUILD_UNFINISHED)),
                 last_attempt_unix: st.last_attempt_unix,
             },
             Err(e) => ServiceView {
@@ -2445,6 +2450,28 @@ mod tests {
         assert_eq!(view.last_error, None);
         assert_eq!(st.last_error, None);
         assert_eq!(st.store_changed, Some(true));
+    }
+
+    #[test]
+    fn unfinished_build_text_of_the_service_is_no_error_while_it_builds() {
+        let t = TestDir::new("svcunfinished");
+        let fake = FakeRefresher::new(Ok(ServiceStatus {
+            building: true,
+            last_error: Some(BUILD_UNFINISHED.into()),
+            ..fake_status(Some(NOW_I))
+        }));
+        let mut c = served(&t, &fake);
+        rebuild_in(&t.cache_dir(), NOW_I);
+        messages(&mut c, NOW_I);
+        assert_eq!(c.status().last_error, None);
+        assert_eq!(c.status().service.unwrap().last_error, None);
+        // Once the build is over it is the error of a build that broke off.
+        fake.script().reply = Ok(ServiceStatus {
+            last_error: Some(BUILD_UNFINISHED.into()),
+            ..fake_status(Some(NOW_I))
+        });
+        messages(&mut c, NOW_I + 1);
+        assert_eq!(c.status().last_error, Some(BUILD_UNFINISHED));
     }
 
     #[test]

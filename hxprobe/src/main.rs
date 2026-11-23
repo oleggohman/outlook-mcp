@@ -796,11 +796,17 @@ usage:
   hxprobe map    <file> [n]          dump the field map for n records (0 = stats)
   hxprobe find   <file> <term> [n]   show records whose text contains <term>
   hxprobe mcp [--store <file>] [--cache-dir <dir>] [--refresh-secs <n>]
+              [--idle-secs <n>] [--no-service]
                                      read-only MCP server on stdin/stdout; --store
                                      defaults to the Outlook profile's HxStore.hxd,
                                      --cache-dir to ~/Library/Caches/hxprobe-mcp,
                                      --refresh-secs (shortest time between two
-                                     rebuilds of a changed store) to 900
+                                     rebuilds of a changed store) to 900; the
+                                     cache is built by the service of the cache
+                                     directory, started when none runs (with
+                                     --refresh-secs and --idle-secs); with
+                                     --no-service or HXPROBE_SERVICE=0 the
+                                     server builds it itself
   hxprobe service [--store <file>] [--cache-dir <dir>] [--refresh-secs <n>]
                   [--idle-secs <n>]
                                      the one process per cache directory that
@@ -824,6 +830,9 @@ struct McpOptions {
     store: Option<PathBuf>,
     cache_dir: Option<PathBuf>,
     refresh_secs: Option<u64>,
+    idle_secs: Option<u64>,
+    /// `--no-service`: build the cache in this process.
+    no_service: bool,
 }
 
 /// Parse the options after `mcp`; a usage error message on failure.
@@ -835,13 +844,18 @@ fn parse_mcp_options(args: &[String]) -> Result<McpOptions, String> {
         match a.as_str() {
             "--store" => o.store = Some(PathBuf::from(value()?)),
             "--cache-dir" => o.cache_dir = Some(PathBuf::from(value()?)),
-            "--refresh-secs" => {
+            "--refresh-secs" | "--idle-secs" => {
                 let v = value()?;
-                o.refresh_secs = Some(
-                    v.parse()
-                        .map_err(|_| format!("--refresh-secs: {v:?} is not a number"))?,
-                );
+                let n = v
+                    .parse()
+                    .map_err(|_| format!("{a}: {v:?} is not a number"))?;
+                if a == "--refresh-secs" {
+                    o.refresh_secs = Some(n);
+                } else {
+                    o.idle_secs = Some(n);
+                }
             }
+            "--no-service" => o.no_service = true,
             other => return Err(format!("unknown mcp option {other:?}")),
         }
     }
@@ -850,9 +864,19 @@ fn parse_mcp_options(args: &[String]) -> Result<McpOptions, String> {
 
 /// `hxprobe mcp`: serve the MCP tools on stdin/stdout until end of input.
 /// stdout carries only JSON-RPC messages; logs go to stderr.
+///
+/// Service mode (the default): the refresh service of the cache directory
+/// builds the cache; it is started from this program's own file when none
+/// answers. Fallback mode, where this process builds the cache itself:
+/// `--no-service`, `HXPROBE_SERVICE=0`, or a socket path that does not fit.
 fn cmd_mcp(args: &[String]) {
-    use hxprobe::mcp::{cache, log, rpc};
+    use hxprobe::mcp::{cache, client, log, proto, rpc};
     use std::io::Write;
+
+    // Children (the service) must stay waitable for their exit status,
+    // also when the client started this server with SIGCHLD ignored.
+    // SAFETY: no thread exists yet; signal() has no other preconditions.
+    unsafe { libc::signal(libc::SIGCHLD, libc::SIG_DFL) };
 
     // A panic message could hold mail content: print only where it happened.
     // Nothing here uses `eprintln!`, which panics when stderr is closed.
@@ -897,14 +921,39 @@ fn cmd_mcp(args: &[String]) {
         .cache_dir
         .or_else(|| env::var_os("HOME").map(|h| Path::new(&h).join("Library/Caches/hxprobe-mcp")))
         .unwrap_or_else(|| fail("HOME is not set; pass --cache-dir".into()));
-    let cache = cache::Cache::new(&cache_dir, &store)
+    let refresh_secs = opts.refresh_secs.unwrap_or(cache::DEFAULT_REFRESH_SECS);
+    let mut cache = cache::Cache::new(&cache_dir, &store)
         .unwrap_or_else(|e| fail(format!("cache directory {}: {e}", cache_dir.display())))
-        .with_refresh_secs(opts.refresh_secs.unwrap_or(cache::DEFAULT_REFRESH_SECS));
+        .with_refresh_secs(refresh_secs);
     log(&format!(
         "serving {} with cache {}",
         cache.store_path().display(),
         cache_dir.display()
     ));
+    let service = if opts.no_service {
+        Err("--no-service".to_string())
+    } else if env::var_os("HXPROBE_SERVICE").is_some_and(|v| v == "0") {
+        Err("HXPROBE_SERVICE=0".to_string())
+    } else {
+        client::service_program().and_then(|program| {
+            client::Client::new(
+                &cache_dir,
+                cache.store_path(),
+                program,
+                refresh_secs,
+                opts.idle_secs.unwrap_or(proto::DEFAULT_IDLE_SECS),
+            )
+        })
+    };
+    match service {
+        Ok(c) => {
+            log("service mode: the refresh service builds the cache");
+            cache = cache.with_refresher(Box::new(c));
+        }
+        Err(why) => log(&format!(
+            "fallback mode, this server builds the cache: {why}"
+        )),
+    }
     let mut server = rpc::Server::new(cache);
     if let Err(e) = rpc::run(
         &mut server,

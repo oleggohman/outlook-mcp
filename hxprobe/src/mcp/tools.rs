@@ -142,7 +142,9 @@ pub const TOOLS: &[Tool] = &[
         name: "store_status",
         description: concat!(
             "State of the local mail cache: store path, build time, whether the store changed \
-             since, and counts of messages, folders, people and events.",
+             since, counts of messages, folders, people and events, and the background refresh \
+             service (running, building a new cache, last error). Answered at once; a rebuild \
+             runs in the background.",
             untrusted!()
         ),
         params: &[],
@@ -151,8 +153,8 @@ pub const TOOLS: &[Tool] = &[
     Tool {
         name: "refresh",
         description: concat!(
-            "Rebuild the mail cache from the store now (can take a while), then return \
-             store_status.",
+            "Rebuild the mail cache from the store now and wait for the rebuild (can take a \
+             while), then return store_status. Other calls do not wait for a rebuild.",
             untrusted!()
         ),
         params: &[],

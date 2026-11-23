@@ -1111,3 +1111,374 @@ fn client_uses_a_newer_service_and_never_stops_it() {
     // Nothing was started.
     assert!(!d.cache().join(proto::LOG_NAME).exists());
 }
+
+// --- `hxprobe mcp` in service mode ---
+
+/// A running `hxprobe mcp`: requests go to its stdin, responses are read
+/// from its stdout by a thread; its stderr is appended to a file in the
+/// test directory. Killed and waited for on drop.
+struct Mcp {
+    child: Child,
+    stdin: Option<std::process::ChildStdin>,
+    lines: std::sync::mpsc::Receiver<String>,
+    err: PathBuf,
+    next_id: i64,
+}
+
+/// How long a response of `hxprobe mcp` may take.
+const RESPONSE: Duration = Duration::from_secs(60);
+
+/// Start `hxprobe mcp --store <store> --cache-dir <cache> <args>` in service
+/// mode (`HXPROBE_SERVICE` removed) with `HOME` in `d` and `configure`
+/// applied.
+fn spawn_mcp_with(
+    d: &Dir,
+    store: &std::path::Path,
+    cache: &std::path::Path,
+    args: &[&str],
+    configure: impl FnOnce(&mut Command),
+) -> Mcp {
+    use std::io::BufRead;
+    static N: AtomicUsize = AtomicUsize::new(0);
+    let err =
+        d.0.join(format!("mcp-{}.err", N.fetch_add(1, Ordering::Relaxed)));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_hxprobe"));
+    cmd.arg("mcp")
+        .arg("--store")
+        .arg(store)
+        .arg("--cache-dir")
+        .arg(cache)
+        .args(args)
+        .env_remove("HXPROBE_SERVICE")
+        .env_remove("HXPROBE_TEST_BUILD_DELAY_MS")
+        .env("HOME", &d.0)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(std::fs::File::create(&err).unwrap());
+    configure(&mut cmd);
+    let mut child = cmd.spawn().unwrap();
+    let stdin = child.stdin.take();
+    let stdout = child.stdout.take().unwrap();
+    let (tx, lines) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(stdout).lines() {
+            let Ok(line) = line else { return };
+            if tx.send(line).is_err() {
+                return;
+            }
+        }
+        // End of file: the sender is dropped, the receiver sees it.
+    });
+    Mcp {
+        child,
+        stdin,
+        lines,
+        err,
+        next_id: 1,
+    }
+}
+
+/// [`spawn_mcp_with`] on the store and cache directory of `d`.
+fn spawn_mcp(d: &Dir) -> Mcp {
+    spawn_mcp_with(d, &d.store(), &d.cache(), &[], |_| {})
+}
+
+impl Mcp {
+    /// Write a `tools/call` of `name` without waiting for the response.
+    fn send(&mut self, name: &str) {
+        use std::io::Write;
+        let req = serde_json::json!({"jsonrpc": "2.0", "id": self.next_id,
+            "method": "tools/call", "params": {"name": name, "arguments": {}}});
+        self.next_id += 1;
+        let stdin = self.stdin.as_mut().unwrap();
+        writeln!(stdin, "{req}").unwrap();
+        stdin.flush().unwrap();
+    }
+
+    /// The next response.
+    fn response(&mut self) -> Value {
+        let line = self
+            .lines
+            .recv_timeout(RESPONSE)
+            .unwrap_or_else(|e| panic!("no response from hxprobe mcp: {e}\n{}", self.log()));
+        serde_json::from_str(&line).unwrap()
+    }
+
+    /// The result of the tool `name`, which must succeed.
+    fn tool(&mut self, name: &str) -> Value {
+        self.send(name);
+        let r = self.response();
+        assert_eq!(r["result"]["isError"], false, "{r}\n{}", self.log());
+        serde_json::from_str(r["result"]["content"][0]["text"].as_str().unwrap()).unwrap()
+    }
+
+    /// The error text of the tool `name`, which must fail.
+    fn tool_error(&mut self, name: &str) -> String {
+        self.send(name);
+        let r = self.response();
+        assert_eq!(r["result"]["isError"], true, "{r}");
+        r["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    /// The server's stderr so far.
+    fn log(&self) -> String {
+        std::fs::read_to_string(&self.err).unwrap_or_default()
+    }
+
+    /// Close stdin; stdout must reach end of file and the server exit,
+    /// both within [`RESPONSE`].
+    fn close(&mut self) -> ExitStatus {
+        drop(self.stdin.take());
+        match self.lines.recv_timeout(RESPONSE) {
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {}
+            other => panic!("stdout did not reach end of file: {other:?}"),
+        }
+        let started = Instant::now();
+        loop {
+            if let Some(st) = self.child.try_wait().unwrap() {
+                return st;
+            }
+            assert!(started.elapsed() < RESPONSE, "hxprobe mcp did not exit");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+impl Drop for Mcp {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Wait until every service that lost the lock against the one that
+/// answers has said so in `service.log`: each start of a server (the
+/// "starting" lines in `logs`) beyond the one that listens.
+fn wait_for_losers(d: &Dir, logs: &[String]) {
+    let starts: usize = logs
+        .iter()
+        .map(|l| l.matches("starting the refresh service").count())
+        .sum();
+    let listening = log_lines(d, "listening on");
+    wait_until("losing services to exit", Duration::from_secs(5), || {
+        log_lines(d, LOST) + listening >= starts
+    });
+}
+
+#[test]
+fn mcp_session_in_service_mode() {
+    let _s = serial();
+    let d = Dir::new();
+    let mut m = spawn_mcp(&d);
+    // The first call ever waits for the first build.
+    let st = m.tool("store_status");
+    assert!(st["built"].is_string(), "{st}");
+    assert_eq!(st["last_error"], Value::Null, "{st}");
+    assert_eq!(st["messages"], 0);
+    assert_eq!(st["service"]["running"], true, "{st}");
+    assert_eq!(st["service"]["version"], VERSION);
+    assert_eq!(st["service"]["last_error"], Value::Null);
+    let pid = st["service"]["pid"].as_u64().unwrap();
+    assert_eq!(m.tool("list_messages")["total"], 0);
+    assert_eq!(m.tool("list_events")["total"], 0);
+    let log = m.log();
+    assert!(
+        log.contains(&format!(
+            "starting the refresh service: {}",
+            env!("CARGO_BIN_EXE_hxprobe")
+        )),
+        "{log}"
+    );
+    // Stdout ends with the server although the service lives on.
+    assert_eq!(m.close().code(), Some(0), "{}", m.log());
+    let v = request(&d, &Request::Status).unwrap();
+    assert_eq!(v["pid"], pid);
+    assert_eq!(v["builds"], 1, "{v}");
+}
+
+#[test]
+fn two_servers_started_at_once_share_one_service() {
+    let _s = serial();
+    let d = Dir::new();
+    let mut a = spawn_mcp(&d);
+    let mut b = spawn_mcp(&d);
+    a.send("store_status");
+    b.send("store_status");
+    let (ra, rb) = (a.response(), b.response());
+    let pid = |r: &Value| -> Value {
+        let v: Value =
+            serde_json::from_str(r["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(v["service"]["running"], true, "{v}");
+        v["service"]["pid"].clone()
+    };
+    assert_eq!(pid(&ra), pid(&rb));
+    assert_eq!(log_lines(&d, "listening on"), 1, "{}", service_log(&d));
+    wait_for_losers(&d, &[a.log(), b.log()]);
+}
+
+#[test]
+fn refresh_gives_a_later_build_that_an_open_server_reopens() {
+    let _s = serial();
+    let d = Dir::new();
+    let mut a = spawn_mcp(&d);
+    let first = a.tool("store_status")["built"].clone();
+    assert!(first.is_string(), "{first}");
+    // `built` has whole seconds.
+    std::thread::sleep(Duration::from_millis(1100));
+    let mut b = spawn_mcp(&d);
+    let refreshed = b.tool("refresh");
+    let later = refreshed["built"].clone();
+    assert!(
+        later.as_str().unwrap() > first.as_str().unwrap(),
+        "{first} {later}"
+    );
+    assert_eq!(refreshed["service"]["running"], true);
+    // The server kept open serves the new file on its next call.
+    assert_eq!(a.tool("store_status")["built"], later);
+    assert!(a.log().contains("reopened mail.db"), "{}", a.log());
+    let v = request(&d, &Request::Status).unwrap();
+    assert_eq!(v["builds"], 2, "{v}");
+}
+
+/// Whether the tests run as root, for whom mode 000 does not deny reading.
+fn is_root() -> bool {
+    // SAFETY: geteuid() has no preconditions and cannot fail.
+    unsafe { libc::geteuid() == 0 }
+}
+
+/// Set the mode of the store of `d`.
+fn store_mode(d: &Dir, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(d.store(), std::fs::Permissions::from_mode(mode)).unwrap();
+}
+
+#[test]
+fn unreadable_store_with_a_database_is_served_and_names_the_permission() {
+    if is_root() {
+        return;
+    }
+    let _s = serial();
+    let d = Dir::new();
+    let built = old_database(&d);
+    store_mode(&d, 0o000);
+    let mut m = spawn_mcp(&d);
+    let st = m.tool("store_status");
+    store_mode(&d, 0o600);
+    assert_eq!(st["built"], hxprobe::mcp::text::iso(built), "{st}");
+    let e = st["last_error"].as_str().unwrap();
+    assert!(e.contains("permission denied"), "{e}");
+    assert_eq!(st["service"]["running"], false, "{st}");
+    assert_eq!(m.tool("list_messages")["total"], 0);
+}
+
+#[test]
+fn unreadable_store_without_a_database_is_a_tool_error() {
+    if is_root() {
+        return;
+    }
+    let _s = serial();
+    let d = Dir::new();
+    store_mode(&d, 0o000);
+    let mut m = spawn_mcp(&d);
+    let started = Instant::now();
+    let e = m.tool_error("list_messages");
+    store_mode(&d, 0o600);
+    assert!(e.contains("permission denied"), "{e}");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn too_long_socket_path_means_fallback_mode() {
+    let _s = serial();
+    let d = Dir::new();
+    let cache = d.0.join("x".repeat(120));
+    let mut m = spawn_mcp_with(&d, &d.store(), &cache, &[], |_| {});
+    let st = m.tool("store_status");
+    assert_eq!(st["service"], Value::Null, "{st}");
+    assert!(st["built"].is_string(), "{st}");
+    assert!(!cache.join(SOCKET_NAME).exists());
+    assert!(!cache.join(LOCK_NAME).exists());
+    assert_eq!(m.close().code(), Some(0));
+    let log = m.log();
+    assert_eq!(
+        log.lines().filter(|l| l.contains("fallback")).count(),
+        1,
+        "{log}"
+    );
+    assert!(log.contains("too long"), "{log}");
+}
+
+#[test]
+fn second_store_on_the_same_cache_directory_is_refused() {
+    let _s = serial();
+    let d = Dir::new();
+    let mut a = spawn_mcp(&d);
+    let built = a.tool("store_status")["built"].clone();
+    let db = db_file(&d);
+    let other = d.0.join("Other.hxd");
+    std::fs::write(&other, empty_store()).unwrap();
+    let mut b = spawn_mcp_with(&d, &other, &d.cache(), &[], |_| {});
+    let e = b.tool_error("list_messages");
+    let served = std::fs::canonicalize(d.store()).unwrap();
+    assert!(
+        e.contains(&format!("serves another store: {}", served.display())),
+        "{e}"
+    );
+    assert!(e.contains("--cache-dir"), "{e}");
+    // Nothing was rebuilt for the second store.
+    let v = request(&d, &Request::Status).unwrap();
+    assert_eq!(v["builds"], 1, "{v}");
+    assert!(db_file(&d) == db, "mail.db was replaced");
+    assert_eq!(a.tool("store_status")["built"], built);
+}
+
+#[test]
+fn server_started_with_sigchld_ignored_still_starts_a_service() {
+    let _s = serial();
+    let d = Dir::new();
+    let mut m = spawn_mcp_with(&d, &d.store(), &d.cache(), &[], |cmd| {
+        // SAFETY: signal() is async-signal-safe; nothing else runs here.
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::signal(libc::SIGCHLD, libc::SIG_IGN);
+                Ok(())
+            });
+        }
+    });
+    let st = m.tool("store_status");
+    assert_eq!(st["service"]["running"], true, "{st}\n{}", m.log());
+    assert_eq!(st["last_error"], Value::Null, "{st}");
+    assert!(st["built"].is_string(), "{st}");
+}
+
+#[test]
+fn stop_with_a_server_kept_open_and_the_next_call_starts_a_new_service() {
+    let _s = serial();
+    let d = Dir::new();
+    let mut m = spawn_mcp(&d);
+    let first_call = Instant::now();
+    let pid = m.tool("store_status")["service"]["pid"].clone();
+    // The service is an unreaped child of the open server: `--stop` must not
+    // wait for the 5 s limit.
+    let (st, _, err, took) = client(&d, "--stop");
+    assert_eq!(st.code(), Some(0), "{err}");
+    assert!(took < Duration::from_secs(2), "took {took:?}");
+    assert_eq!(
+        request(&d, &Request::Status),
+        Err(ExchangeError::NotRunning)
+    );
+    // A server starts a service at most every 2 s.
+    let gap = Duration::from_millis(2100);
+    std::thread::sleep(gap.saturating_sub(first_call.elapsed()));
+    let next = m.tool("store_status");
+    assert_eq!(next["service"]["running"], true, "{next}\n{}", m.log());
+    assert_ne!(next["service"]["pid"], pid);
+    assert_eq!(next["last_error"], Value::Null, "{next}");
+}
