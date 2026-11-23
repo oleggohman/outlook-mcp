@@ -703,6 +703,30 @@ for how in unset empty; do
     else fail "$t" "rc=$rc1/$rc out='$out1' err='$err1' / '$err'"; fi
 done
 
+# (xi) The install directory must belong to the user, and its mode must be
+# settable: a program that runs from it reads the user's mail. The chmod stub
+# changes nothing, so the directory of another owner is only looked at.
+t='install dir of another owner'
+r=$(make_repo)
+make_asset "$r"
+make_curl_probe "$r"
+printf '#!/bin/sh\nexit 1\n' > "$r/stub/chmod"
+chmod 755 "$r/stub/chmod"
+if [ "$(id -u)" = 0 ]; then
+    pass "$t (skipped for root)"
+else
+    run "$r" HXPROBE_INSTALL_DIR=/usr HXPROBE_RELEASE_BASE="file://$r/rel" PATH="$r/stub:$nocargo_path" --
+    if [ "$rc" = 1 ] && [ -z "$out" ] && [[ "$err" == *'not owned by'* ]] \
+        && [ ! -e "$r/curl-args" ] && [ ! -e "$r/ran" ]; then pass "$t"
+    else fail "$t" "rc=$rc out='$out' err='$err'"; fi
+fi
+
+t='install dir mode cannot be set'
+run "$r" HXPROBE_RELEASE_BASE="file://$r/rel" PATH="$r/stub:$nocargo_path" --
+if [ "$rc" = 1 ] && [ -z "$out" ] && [[ "$err" == *'cannot set the mode'* ]] \
+    && [ ! -e "$r/curl-args" ] && [ ! -e "$r/ran" ]; then pass "$t"
+else fail "$t" "rc=$rc out='$out' err='$err'"; fi
+
 if [ "$failures" -ne 0 ]; then
     printf '%d case(s) failed\n' "$failures"
     exit 1

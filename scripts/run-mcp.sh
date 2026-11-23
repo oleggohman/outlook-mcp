@@ -85,7 +85,12 @@ if [ -z "$legacy" ] && [ -n "$home" ]; then
 fi
 if [ -n "$legacy" ]; then legacy="$legacy/bin"; fi
 (umask 077 && mkdir -p "$bindir") || die "cannot create $bindir"
-chmod 700 "$inst" "$bindir" 2>/dev/null || true
+# The program run from here reads the user's mail: the directories must be
+# the user's own and closed to everyone else.
+if ! [ -O "$inst" ] || ! [ -O "$bindir" ]; then
+    die "$inst or $bindir is not owned by the current user; set HXPROBE_INSTALL_DIR to a directory of your own"
+fi
+chmod 700 "$inst" "$bindir" || die "cannot set the mode of $inst and $bindir"
 
 # Prints -1, 0 or 1 when version $1 is older than, equal to or newer than $2,
 # comparing major, minor and patch as numbers; a suffix after `-` or `+` is
