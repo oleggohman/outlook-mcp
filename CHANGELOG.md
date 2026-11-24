@@ -4,6 +4,23 @@ All notable changes to this project are listed here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.3] - 2026-11-24
+
+The hxprobe program has no functional change; its version follows the plugin.
+
+### Changed
+
+- The skill asks whether the Mac is managed by an organisation when a
+  permission error appears. On a managed Mac it no longer walks the user
+  through System Settings: the user sends the error text to the
+  administrator, who installs the device profile
+  `mdm/hxprobe-full-disk-access.mobileconfig` through device management. The
+  Full Disk Access steps stay for the user's own Mac.
+- The skill and the README no longer say that Full Disk Access for the MCP
+  client does not help: a grant for the app that starts the server has been
+  seen to be enough on its own. The skill offers it as the next step when a
+  grant for the program does not remove the error.
+
 ## [0.2.2] - 2026-11-24
 
 ### Added
@@ -146,6 +163,7 @@ Plugin release; the hxprobe program stays at 0.2.0.
 - Prebuilt program for Apple Silicon Macs, verified by the launcher against
   `release/SHA256SUMS`.
 
+[0.2.3]: https://github.com/oleggohman/outlook-mcp/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/oleggohman/outlook-mcp/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/oleggohman/outlook-mcp/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/oleggohman/outlook-mcp/compare/v0.1.1...v0.2.0
