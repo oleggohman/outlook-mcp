@@ -44,39 +44,8 @@ If a tool error, a `warning` or the top-level `last_error` of `store_status`
 contains `cannot read the store: permission denied`, macOS blocked the
 hxprobe program. Errors of earlier versions say
 `Operation not permitted (os error 1)` for the store instead. Retrying at
-once does not help, and nothing you run can fix it: stop.
-
-First find out which kind of Mac this is. If the user has not said, ask
-once: "Is this a work Mac managed by your organisation?"
-
-### On a Mac managed by an organisation
-
-The organisation grants the access on every Mac with a device profile, so
-the user has nothing to set up, and a standard user cannot change the Full
-Disk Access list anyway. Do not walk the user through System Settings.
-
-A permission error on such a Mac means the profile has not reached this Mac
-yet, or does not cover the program the error names. Tell the user:
-
-1. Nothing is wrong with their mail and there is nothing for them to
-   change.
-2. Send the administrator (IT) the error text, complete and unchanged. It
-   names the program path and, when there is one, the ` Note: ...` at the
-   end; both are what the administrator needs.
-3. Tell the administrator that the fix is to install the device profile
-   that comes with hxprobe on this Mac, and give its address:
-   https://github.com/oleggohman/outlook-mcp/blob/main/mdm/hxprobe-full-disk-access.mobileconfig
-   The administrator installs it through the organisation's device
-   management service. Do not tell the user to download or open the file:
-   macOS accepts this kind of profile only from device management, and
-   opening it by hand does not grant anything.
-4. When the administrator says it is installed, ask again. No restart is
-   needed unless the error says `restart the MCP client`.
-
-Until then, answer from the data the server still serves, and say from when
-it is (see `warning` under "Freshness").
-
-### On the user's own Mac
+once does not help, and nothing you run can fix it: stop and give the user
+the steps below.
 
 Full Disk Access for either of two things lets the server read the store:
 the hxprobe program the error names, or the app that starts the server (the
@@ -268,7 +237,7 @@ and say the full text is not cached.
 | `this cache directory serves another store` | Another server uses this cache for another Outlook store. Tell the user to give this server its own `--cache-dir`. Do not retry. |
 | `did not finish within` ... `and may still be running` | The rebuild goes on. Call `store_status` until `service.building` is false; do not call `refresh` again. |
 | `the refresh service did not start` or `exited at start` | Report it with the `service.log` path it names. Calls still answer from an existing cache. |
-| `cannot read the store: permission denied` | Follow "Permission errors": on a managed Mac the error goes to the administrator, on the user's own Mac the user grants the access. Do not retry before that. Also given when the default store cannot be looked up. |
+| `cannot read the store: permission denied` | Follow "Permission errors". Do not retry before the user has granted the access. Also given when the default store cannot be looked up. |
 | `no Outlook store found under the default profile directory; pass --store` | The server has no `--store` and found no default store. Tell the user to register it with `--store <path of HxStore.hxd>` and restart the MCP client. Do not retry. |
 | `mail data is from` ... `and is not being refreshed` (a `warning`) | Tell the user the data is old and why, call `store_status`, and act on its `last_error`. |
 
@@ -344,9 +313,6 @@ back to the user's zone. If two senders match "dana", show both and ask.
 - Reporting `unread_count` as the number of messages that can be listed.
 - On "cannot read the store: permission denied" or "Operation not
   permitted": retrying before anything changed.
-- On a Mac managed by an organisation: walking the user through System
-  Settings. They have nothing to set up and cannot change that list; the
-  error goes to their administrator.
 - Ignoring a `warning`, or presenting the mail of a result that carries one
   as current.
 - After the update to 0.2.2, telling the user to add the program path of

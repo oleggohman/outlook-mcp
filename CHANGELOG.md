@@ -32,10 +32,12 @@ The hxprobe program has no functional change; its version follows the plugin.
 
 ### Removed
 
-- Three sections of the skill: "For administrators", "When the shared
-  directory is not used" and "Restarting the MCP client". The README keeps
-  that material; a note at the end of an error is passed on to the user
-  unchanged.
+- Four sections of the skill: "On a Mac managed by an organisation", "For
+  administrators", "When the shared directory is not used" and "Restarting
+  the MCP client". On a permission error the skill gives the Full Disk
+  Access steps again without asking which kind of Mac it is. The README
+  keeps the material for administrators; a note at the end of an error is
+  passed on to the user unchanged.
 
 ## [0.2.3] - 2026-11-24
 
