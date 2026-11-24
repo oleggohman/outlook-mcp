@@ -302,7 +302,7 @@ library (Python's `sqlite3` returns the whole string).
 
 ## MCP server
 
-`hxprobe mcp` is a local, read-only MCP server for an AI client. It speaks
+`hxprobe mcp` is a local, read-only MCP server for an MCP client. It speaks
 MCP over stdin/stdout (newline-delimited JSON-RPC 2.0: `initialize`, `ping`,
 `tools/list`, `tools/call`) and lets the client list folders, list and search
 messages, read a message body, list attachments, search people and list
@@ -711,12 +711,15 @@ users do not need to add the entry themselves (a standard user cannot).
   their own directory, which the profile does not cover. To serve all
   accounts, create `/Users/Shared/hxprobe/bin` as root and put the release
   program there as `hxprobe` (directories and program mode `0755`, owned by
-  root, not writable by group or others). The launcher runs it only when its
-  SHA-256 is listed in the plugin's `release/SHA256SUMS`, and never writes
-  to it. Update it only after the plugin update has reached the users: an
-  older plugin does not list the newer program and falls back. A listed
-  older program is still run, with a log line that an administrator has to
-  update it.
+  root, not writable by group or others). Download the program with `curl`
+  (`curl -fLO https://github.com/oleggohman/outlook-mcp/releases/download/v<version>/hxprobe-<version>-macos-arm64`),
+  not with a browser: macOS blocks the first run of a copy that a browser
+  downloaded (see "Signed, not notarized"). The launcher runs it only when
+  its SHA-256 is listed in the plugin's `release/SHA256SUMS`, and never
+  writes to it. Update it only after the plugin update has reached the
+  users: an older plugin does not list the newer program and falls back. A
+  listed older program is still run, with a log line that an administrator
+  has to update it.
 * To check a program against the profile, run
   `scripts/release-sign.sh --compare <signed program>` on a Mac with the
   repository. It needs no signing identity and writes nothing; exit status 0
@@ -736,10 +739,8 @@ five privacy services of this payload are marked as deprecated in macOS
 (`https://github.com/apple/device-management/blob/release/declarative/declarations/configurations/app.settings.yaml`),
 which has no entry for Full Disk Access and no identity by path. The
 payload as a whole and `SystemPolicyAllFiles` carry no deprecation mark
-there; Apple's reference page is reported to show the payload as deprecated
-from macOS 27, which could not be confirmed. If a later macOS stops honouring
-the payload for a program identified by path, the entry added by hand
-remains the way.
+there. If a later macOS stops honouring the payload for a program
+identified by path, the entry added by hand remains the way.
 
 ### Registration
 
