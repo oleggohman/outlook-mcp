@@ -230,11 +230,8 @@ check_skill_description() {
     # A description that holds ": " has to be a quoted YAML string, or a
     # strict parser reads the rest as a mapping.
     case "$d" in
-        *': '* )
-            case "$d" in
-                '"'*'"' ) d=${d#\"}; d=${d%\"} ;;
-                * ) why='the description holds ": " and is not in double quotes'; return 1 ;;
-            esac ;;
+        '"'*'"' ) d=${d#\"}; d=${d%\"} ;;
+        *': '* ) why='the description holds ": " and is not in double quotes'; return 1 ;;
     esac
     case "$d" in
         'Use when '* ) ;;
@@ -481,7 +478,7 @@ expect_pass 'skill: the reference files it names exist' \
 mkdir -p "$tmp/skill-ref" && { cat "$repo/skills/outlook-local-mail/SKILL.md"; echo 'See references/absent.md.'; } > "$tmp/skill-ref/SKILL.md"
 expect_fail 'self-test: skill that names a missing reference file' \
     check_skill_references "$tmp/skill-ref/SKILL.md"
-sed 's/^description: "\(.*\)"$/description: \1/' "$repo/skills/outlook-local-mail/SKILL.md" > "$tmp/skill-unquoted.md"
+sed 's/^description: .*$/description: Use when a tool returns this: a warning/' "$repo/skills/outlook-local-mail/SKILL.md" > "$tmp/skill-unquoted.md"
 expect_fail 'self-test: skill description with a colon and no quotes' \
     check_skill_description "$tmp/skill-unquoted.md"
 

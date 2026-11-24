@@ -25,7 +25,7 @@ The hxprobe program has no functional change; its version follows the plugin.
 
 - The skill reports attachments with `inline` 0 as the attached files and
   the others as embedded images; this holds for nearly all entries.
-- The description of the skill is a quoted string, as it holds a colon, and
+- The description of the skill is shorter (308 characters, was 567), a quoted string, and
   names triage, threads and the reply check as triggers.
   `scripts/test-repo.sh` checks the quotes and that every reference file the
   skill names exists.

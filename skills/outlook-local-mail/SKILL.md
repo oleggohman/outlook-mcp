@@ -1,6 +1,6 @@
 ---
 name: outlook-local-mail
-description: "Use when the user asks to check their inbox, find or read an email, triage important or urgent mail, analyze an email thread, check whether they already replied, look up a contact or see their meetings and the local hxprobe MCP server for Outlook is available (tools store_status, refresh, list_folders, list_messages, search_messages, get_message, list_attachments, search_people, list_events), or when one of those tools returns a result with a warning field, an argument error, a permission error (cannot read the store: permission denied, Operation not permitted), a cache or refresh service error, an empty result, a stale result or a timeout."
+description: "Use when the user asks about their Outlook mail, contacts or meetings (check the inbox, find or read an email, triage what is urgent, analyze a thread, check for a reply) and the local hxprobe Outlook MCP tools are available, or when one of those tools returns an error, a warning, or empty or stale results."
 metadata:
   version: "0.2.4"
 ---
