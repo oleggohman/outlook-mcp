@@ -816,6 +816,23 @@ mod tests {
         }
     }
 
+    /// Kills the process whose pid the file holds when dropped, so a test
+    /// that fails early leaves no process behind. A test that ended the
+    /// process itself removes the file first.
+    struct KillOnDrop(PathBuf);
+
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let pid = std::fs::read_to_string(&self.0)
+                .ok()
+                .and_then(|s| s.trim().parse::<libc::pid_t>().ok());
+            if let Some(pid) = pid.filter(|p| *p > 0) {
+                // SAFETY: kill() on the pid of a child this test started.
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+            }
+        }
+    }
+
     /// A status reply line of a played service.
     fn status_line(version: &str, pid: u32, store: &Path) -> String {
         format!(
@@ -1148,6 +1165,8 @@ mod tests {
              [ \"$n\" -eq 2 ] && { echo $$ > pid; exec sleep 30; }\n\
              exit 3",
         );
+        // Declared after `t`, so it is dropped before the directory is removed.
+        let _sleeper = KillOnDrop(t.cache().join("pid"));
         let mut c = t.client(program).with_timeouts(LONG, SHORT, SHORT);
         assert!(c
             .call(&Request::Touch, NOW)
@@ -1189,6 +1208,7 @@ mod tests {
             let _ = child.kill();
             let _ = child.wait();
         }
+        std::fs::remove_file(t.cache().join("pid")).unwrap();
         drop(own);
         std::fs::remove_file(t.sock()).unwrap();
         let (store, gone) = (t.store(), gone_pid());
