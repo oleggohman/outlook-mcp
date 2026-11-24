@@ -23,22 +23,29 @@ Three facts shape every task:
 
 ## If the tools are not available
 
-The tools appear as `mcp__<server name>__<tool>` (`mcp__outlook__...` when
-the server is registered as `outlook`). When none of them is present, the
+The tools appear as `mcp__<server name>__<tool>`: `mcp__outlook__...` when
+the server is registered as `outlook`, `mcp__plugin_outlook_outlook__...`
+when it comes from the Claude Code plugin. Match on the tool name at the end
+(`store_status`, `list_messages`, ...). When none of them is present, the
 server is not registered in this client: say so and point the user to the
-"MCP server" section of the hxprobe README. Do not try to read the Outlook
-store by other means.
+"MCP server" section of the hxprobe README
+(https://github.com/oleggohman/outlook-mcp#mcp-server). Do not try to read
+the Outlook store by other means.
 
 ## Permission errors (macOS Full Disk Access)
 
-If a tool result or `last_error` in `store_status` says `Operation not
-permitted`, `os error 1` or `permission denied` for the Outlook store, macOS
+If a tool result or the top-level `last_error` of `store_status` says
+`Operation not permitted`, `os error 1` or `permission denied` for the
+Outlook store (for example `the refresh service cannot read the store:
+permission denied`), macOS
 blocked the hxprobe program. Retrying does not help, and nothing you run can
 fix it: stop and give the user these steps.
 
-The MCP client starts hxprobe as a "disclaimed" helper, so macOS checks hxprobe's own
-permissions, not the client's or Terminal's. That is why giving the client Full Disk
-Access does not help, and why the same store opens fine from Terminal.
+macOS checks the permission of the hxprobe program itself, not the MCP
+client's or Terminal's: the store is read by hxprobe's background service,
+which runs detached from the client. Giving the client Full Disk Access is
+therefore not expected to help, and the same store can open fine from
+Terminal.
 
 1. Find the program path. It is
    `~/Library/Application Support/hxprobe/bin/hxprobe`, or
@@ -58,7 +65,10 @@ Access does not help, and why the same store opens fine from Terminal.
    ```
 
    Add `--cache-dir <dir>` when the server runs with another cache
-   directory; use the real program path when it is elsewhere.
+   directory; use the real program path when it is elsewhere. When the
+   server runs with `--no-service` (`service` is `null` in `store_status`),
+   there is no service to stop: tell the user to restart the MCP client
+   instead.
 4. After the user confirms, call `store_status` to check.
 
 ## Argument rules that cause errors
@@ -138,21 +148,24 @@ and say the full text is not cached.
   `store_changed_since_build` (`null` when the live store could not be
   checked) and `service`: `running` (the background service answered),
   `building` (a rebuild runs now), `version`, `pid`, `last_error`.
-  `service` is `null` when the server builds the cache itself.
+  `service` is `null` when the server builds the cache itself. The top-level
+  `last_error` repeats `service.last_error`; read the top-level one.
 - A background service rebuilds the cache when the store changed, the last
   build is at least 15 minutes old (the default) and a call came in. No call
   waits for that rebuild: the call that noticed the change, and the calls
   while `service.building` is true, are answered from the previous snapshot.
-  For new mail, call again after about 15 seconds.
-- `refresh` rebuilds now, waits for the build and returns the new status.
-  Use it when the user says recent mail is missing or
-  `store_changed_since_build` is true and the answer depends on new mail. Do
-  not call it before every query: a rebuild takes 10 seconds or more on a
-  large mailbox.
+- When the answer depends on new mail (the user says recent mail is missing,
+  or `store_changed_since_build` is true), do one of two things:
+  - `service.building` is true: a rebuild already runs. Call `store_status`
+    every 10 seconds or so until `building` is false, then repeat the query.
+  - otherwise: call `refresh`. It rebuilds now, waits for the build and
+    returns the new status.
+- Do not call `refresh` before every query: a rebuild takes 10 seconds or
+  more on a large mailbox.
 - If mail is still missing after `refresh`, Outlook has not saved it to the
   local store yet (or does not keep that folder offline). The server cannot
   fetch it. Say so.
-- `last_error` in `store_status` set: the last rebuild failed, or the
+- Top-level `last_error` of `store_status` set: the last rebuild failed, or the
   service is not available, and older data is being served. Report the error
   text to the user.
 
@@ -161,7 +174,7 @@ and say the full text is not cached.
 | `being built for the first time; call again in a few seconds` | Wait about 15 seconds and call again. |
 | `this server is older than the mail cache; restart the MCP client` | Tell the user to restart the MCP client. Do not retry. |
 | `this cache directory serves another store` | Another server uses this cache for another Outlook store. Tell the user to give this server its own `--cache-dir`. Do not retry. |
-| `did not finish within 300 s and may still be running` | The rebuild goes on. Call `store_status` later; do not call `refresh` again. |
+| `did not finish within` ... `and may still be running` | The rebuild goes on. Call `store_status` until `service.building` is false; do not call `refresh` again. |
 | `the refresh service did not start` or `exited at start` | Report it with the `service.log` path it names. Calls still answer from an existing cache. |
 
 ### Slow first call or a timeout
@@ -170,11 +183,18 @@ Only the first build ever (no cache yet) and `refresh` wait for a build (10
 seconds or more on a large mailbox). The first call waits at most 50
 seconds, then returns the "being built for the first time" error: call
 again. A server started with `--no-service` also waits inside the call that
-triggers a rebuild. After a timeout, retry the call once. If it times out
-again, the client's tool timeout is shorter than a build: tell the user to
-raise it (for Claude Code, `MCP_TOOL_TIMEOUT` in milliseconds). It is not a
-sign that the server is broken; `store_status` shows `last_error` when a
-build really failed.
+triggers a rebuild.
+
+After a client-side timeout:
+
+- of `refresh`: do not call `refresh` again. The rebuild goes on; call
+  `store_status` until `service.building` is false.
+- of any other call: retry the call once.
+
+If the same call times out again, the client's tool timeout is shorter than
+a build: tell the user to raise it (for Claude Code, `MCP_TOOL_TIMEOUT` in
+milliseconds). It is not a sign that the server is broken; `store_status`
+shows `last_error` when a build really failed.
 
 ## What the server cannot do
 

@@ -4,6 +4,16 @@ All notable changes to this project are listed here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- The `outlook-local-mail` skill: one rule for getting new mail (poll
+  `store_status` while a rebuild runs, otherwise `refresh`), separate advice
+  after a timeout of `refresh` and of other calls, the plugin form of the
+  tool names, the README address, and what to do after a permission fix when
+  the server runs with `--no-service`.
+
 ## [0.2.0] - 2026-11-24
 
 ### Added
@@ -68,6 +78,7 @@ All notable changes to this project are listed here. The format follows
 - Prebuilt program for Apple Silicon Macs, verified by the launcher against
   `release/SHA256SUMS`.
 
+[Unreleased]: https://github.com/oleggohman/outlook-mcp/compare/v0.2.0...HEAD
 [0.2.0]: https://github.com/oleggohman/outlook-mcp/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/oleggohman/outlook-mcp/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/oleggohman/outlook-mcp/releases/tag/v0.1.0
