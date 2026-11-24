@@ -1,6 +1,6 @@
 {
   "name": "outlook",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Local, read-only MCP server and skill for the mail, contacts and calendar cached by New Outlook for Mac",
   "author": {
     "name": "oleggohman"

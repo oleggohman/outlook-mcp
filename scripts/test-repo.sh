@@ -40,6 +40,8 @@ profile="$repo/$profile_rel"
 launcher="$repo/scripts/run-mcp.sh"
 signer="$repo/scripts/release-sign.sh"
 cargo_toml="$repo/hxprobe/Cargo.toml"
+cargo_lock="$repo/hxprobe/Cargo.lock"
+plugin_json="$repo/.claude-plugin/plugin.json"
 pb=/usr/libexec/PlistBuddy
 # The one Full Disk Access entry of the profile.
 entry=PayloadContent:0:Services:SystemPolicyAllFiles:0
@@ -162,6 +164,29 @@ check_team_alone() {
     done
 }
 
+# The version in the [package] section of Cargo.toml $1.
+cargo_version() {
+    awk '/^\[/ { p = ($0 == "[package]") } p && /^version *= *"/ { split($0, v, "\""); print v[2]; exit }' "$1"
+}
+
+# The version of package hxprobe in Cargo.lock $1.
+lock_version() {
+    awk '/^\[\[package\]\]/ { p = 0 } $0 == "name = \"hxprobe\"" { p = 1 }
+        p && /^version *= *"/ { split($0, v, "\""); print v[2]; exit }' "$1"
+}
+
+# The version in hxprobe/Cargo.toml $1, the hxprobe package of Cargo.lock
+# $2 and the plugin manifest $3 are one and the same.
+check_versions() {
+    local toml lock plugin
+    toml=$(cargo_version "$1")
+    lock=$(lock_version "$2")
+    plugin=$(plutil -extract version raw -o - "$3" 2>/dev/null) || plugin=''
+    [ -n "$toml" ] || { why='no version in hxprobe/Cargo.toml'; return 1; }
+    [ "$toml" = "$lock" ] && [ "$toml" = "$plugin" ] \
+        || { why="Cargo.toml '$toml', Cargo.lock '$lock', plugin.json '$plugin'"; return 1; }
+}
+
 # Checksum file $1 lists hxprobe-$2-macos-arm64 with a 64-digit sum. Read
 # as the launcher reads it: `#` comments and blank lines are skipped, and an
 # optional `*` before the name is the binary-mode marker of shasum.
@@ -213,7 +238,8 @@ with_req() {
 # The inputs are tracked files.
 t='inputs are tracked'
 missing=''
-for f in "$profile_rel" scripts/run-mcp.sh scripts/release-sign.sh hxprobe/Cargo.toml; do
+for f in "$profile_rel" scripts/run-mcp.sh scripts/release-sign.sh hxprobe/Cargo.toml \
+    hxprobe/Cargo.lock .claude-plugin/plugin.json; do
     git -C "$repo" ls-files --error-unmatch -- "$f" >/dev/null 2>&1 || missing="$missing $f"
 done
 if [ -z "$missing" ]; then pass "$t"; else fail "$t" "not tracked:$missing"; fi
@@ -301,11 +327,20 @@ done
 expect_fail 'self-test: no team value' check_team_alone \
     "$(with_req no-team-value "identifier \"$ident\" and anchor apple generic")" "$tmp/clean.txt"
 
+# The versions of the program, its lock file and the plugin agree.
+expect_pass 'versions: Cargo.toml, Cargo.lock and plugin.json agree' \
+    check_versions "$cargo_toml" "$cargo_lock" "$plugin_json"
+sed 's/"version": *"[^"]*"/"version": "0.0.1"/' "$plugin_json" > "$tmp/plugin.json"
+expect_fail 'self-test: another plugin version' check_versions "$cargo_toml" "$cargo_lock" "$tmp/plugin.json"
+awk '$0 == "name = \"hxprobe\"" { print; getline; print "version = \"0.0.1\""; next } { print }' \
+    "$cargo_lock" > "$tmp/Cargo.lock"
+expect_fail 'self-test: another version in Cargo.lock' check_versions "$cargo_toml" "$tmp/Cargo.lock" "$plugin_json"
+
 # The release gate (only with --release): the checksum file lists the arm64
 # program of the version in hxprobe/Cargo.toml, with a 64-digit sum.
 if [ "$release" = 1 ]; then
     sums=${HXPROBE_SUMS:-$repo/release/SHA256SUMS}
-    version=$(awk '/^\[/ { p = ($0 == "[package]") } p && /^version *= *"/ { split($0, v, "\""); print v[2]; exit }' "$cargo_toml")
+    version=$(cargo_version "$cargo_toml")
     t='release: version found in hxprobe/Cargo.toml'
     if [ -n "$version" ]; then pass "$t"; else fail "$t" 'no version in [package]'; fi
     expect_pass "release: $(basename "$sums") lists hxprobe-$version-macos-arm64" \

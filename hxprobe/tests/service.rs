@@ -338,14 +338,14 @@ fn version_flag_prints_the_version() {
 
 /// The release version, as a literal: a forgotten bump fails here.
 #[test]
-fn version_is_0_2_0() {
+fn version_is_0_2_2() {
     let _s = serial();
     let (st, out, err) = run(&["--version"]);
     assert_eq!(st.code(), Some(0), "{err}");
-    assert_eq!(out, "hxprobe 0.2.0\n");
+    assert_eq!(out, "hxprobe 0.2.2\n");
     let d = Dir::new();
     let _svc = spawn_service(&d, &[], &[]);
-    assert_eq!(answering(&d)["version"], "0.2.0");
+    assert_eq!(answering(&d)["version"], "0.2.2");
 }
 
 // --- exit codes ---

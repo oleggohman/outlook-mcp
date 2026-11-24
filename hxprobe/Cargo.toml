@@ -1,6 +1,6 @@
 [package]
 name = "hxprobe"
-version = "0.2.0"
+version = "0.2.2"
 edition = "2021"
 # `<[u8]>::as_chunks` (item.rs) is the newest std API in use.
 rust-version = "1.88"
