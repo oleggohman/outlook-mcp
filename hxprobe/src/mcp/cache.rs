@@ -29,7 +29,7 @@ use crate::header;
 use crate::item;
 use crate::kv::Store;
 use crate::mcp::log;
-use crate::mcp::proto::{self, Refresher, ServiceStatus};
+use crate::mcp::proto::{self, Denied, Refresher, Remedy, ServiceStatus};
 use crate::mcp::text::{cap, html_to_text, iso, lossy};
 use crate::props_gen::TYPES;
 
@@ -223,6 +223,9 @@ pub struct Cache {
     /// How long a call without a database waits for the service's first
     /// build, and how often it looks.
     first_build_wait: (Duration, Duration),
+    /// What the error of a build denied the store names (see
+    /// [`Cache::with_remedy`]).
+    remedy: Remedy,
     /// Called at the start of every build, with the lock held.
     #[cfg(test)]
     pub(crate) build_hook: Option<fn()>,
@@ -327,6 +330,7 @@ impl Cache {
             refresher: None,
             service: None,
             first_build_wait: (proto::FIRST_BUILD_WAIT, proto::FIRST_BUILD_POLL),
+            remedy: Remedy::default(),
             #[cfg(test)]
             build_hook: None,
             #[cfg(test)]
@@ -375,6 +379,14 @@ impl Cache {
             r.set_store(&self.store);
         }
         self.rejected_id = None;
+    }
+
+    /// What the error of a build that was denied the store names (see
+    /// [`proto::denied_text`]); without a refresher only, where this value
+    /// builds.
+    pub fn with_remedy(mut self, remedy: Remedy) -> Cache {
+        self.remedy = remedy;
+        self
     }
 
     /// Set the shortest time between two builds of a changed store; 0
@@ -651,7 +663,9 @@ impl Cache {
 
     /// One build attempt at `now`, recorded in `last_attempt_unix` and
     /// `last_error`. `reuse`: accept an up-to-date `mail.db` found after
-    /// taking the lock instead of building.
+    /// taking the lock instead of building. A build that failed because
+    /// the store is denied gives the denial text with the remedy, its own
+    /// error as the cause.
     fn attempt(&mut self, now: i64, reuse: bool) -> Result<(), String> {
         self.last_attempt_unix = Some(now);
         // Set first, so a build that panics is recorded as failed too and
@@ -664,6 +678,11 @@ impl Cache {
             }
             Err(e) => {
                 log(&format!("cache build failed: {e}"));
+                let e = if store_denied(&self.store) {
+                    proto::denied_text(Denied::Server { cause: &e }, &self.remedy, &self.dir)
+                } else {
+                    e
+                };
                 self.last_error = Some(e.clone());
                 Err(e)
             }
@@ -2156,6 +2175,74 @@ mod tests {
         let denied = store_denied(&store);
         std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o600)).unwrap();
         assert!(denied);
+    }
+
+    /// A remedy that names a program file in `t`, and that file's
+    /// canonical path as the denial text shows it.
+    fn remedy_in(t: &TestDir) -> (Remedy, PathBuf) {
+        let program = t.0.join("hxprobe");
+        std::fs::write(&program, b"program").unwrap();
+        let shown = std::fs::canonicalize(&program).unwrap();
+        let remedy = Remedy {
+            program: Some(program),
+            note: None,
+        };
+        (remedy, shown)
+    }
+
+    /// `e` is the server form of the denial text for `program`.
+    fn assert_server_denial(e: &str, program: &Path) {
+        assert!(
+            e.starts_with("this server cannot read the store: permission denied"),
+            "{e}"
+        );
+        assert!(e.contains(&format!("\"{}\"", program.display())), "{e}");
+        assert!(e.contains("restart the MCP client"), "{e}");
+        assert!(!e.contains("--stop"), "{e}");
+        let cause = e.split_once(" Cause: ").map(|(_, c)| c).unwrap_or("");
+        assert!(cause.to_lowercase().contains("permission denied"), "{e}");
+    }
+
+    #[test]
+    fn denied_first_build_fails_with_the_server_form() {
+        if is_root() {
+            return;
+        }
+        let t = TestDir::new("deniedfirst");
+        let (remedy, program) = remedy_in(&t);
+        let store = t.store(&mail_store());
+        let mut c = Cache::new(&t.cache_dir(), &store)
+            .unwrap()
+            .with_remedy(remedy);
+        let e = {
+            let _l = Locked::new(&store, 0o000);
+            c.connection_at(NOW_I).unwrap_err()
+        };
+        assert_server_denial(&e, &program);
+        assert_eq!(c.status().last_error, Some(e.as_str()));
+        // Inside the interval the same text is returned.
+        assert_eq!(c.connection_at(NOW_I + 10).unwrap_err(), e);
+    }
+
+    #[test]
+    fn denied_rebuild_keeps_serving_and_records_the_server_form() {
+        if is_root() {
+            return;
+        }
+        let t = TestDir::new("deniedrebuild");
+        let (remedy, program) = remedy_in(&t);
+        let mut c = lazy(&t, 900).with_remedy(remedy);
+        assert_eq!(messages(&mut c, NOW_I), 4);
+        let store = c.store_path().to_path_buf();
+        touch(&store, 1_000);
+        let n = {
+            let _l = Locked::new(&store, 0o000);
+            messages(&mut c, NOW_I + 1000)
+        };
+        assert_eq!(n, 4);
+        assert_eq!(c.builds, 2);
+        let e = c.status().last_error.expect("last_error is set");
+        assert_server_denial(e, &program);
     }
 
     #[test]

@@ -923,9 +923,11 @@ fn cmd_mcp(args: &[String]) {
         .or_else(|| env::var_os("HOME").map(|h| Path::new(&h).join("Library/Caches/hxprobe-mcp")))
         .unwrap_or_else(|| fail("HOME is not set; pass --cache-dir".into()));
     let refresh_secs = opts.refresh_secs.unwrap_or(cache::DEFAULT_REFRESH_SECS);
+    let remedy = install_remedy();
     let mut cache = cache::Cache::new(&cache_dir, &store)
         .unwrap_or_else(|e| fail(format!("cache directory {}: {e}", cache_dir.display())))
-        .with_refresh_secs(refresh_secs);
+        .with_refresh_secs(refresh_secs)
+        .with_remedy(remedy.clone());
     if denied_default {
         cache = cache.with_denied_default();
     }
@@ -934,7 +936,6 @@ fn cmd_mcp(args: &[String]) {
         cache.store_path().display(),
         cache_dir.display()
     ));
-    let remedy = install_remedy();
     let service = if opts.no_service {
         Err("--no-service".to_string())
     } else if env::var_os("HXPROBE_SERVICE").is_some_and(|v| v == "0") {
@@ -1272,7 +1273,12 @@ fn cmd_service(args: &[String]) {
         refresh_secs,
         idle_secs,
         clock(),
-    );
+    )
+    .with_denied_text(proto::denied_text(
+        proto::Denied::Service,
+        &install_remedy(),
+        &dir,
+    ));
     let exit = service::serve(core, listener, &socket, clock, proto::TICK, stop);
     // The socket goes first; `service.lock` is released when the process
     // ends. A build still running is abandoned: its temporary files go

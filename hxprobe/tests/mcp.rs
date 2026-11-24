@@ -402,6 +402,77 @@ fn mcp_keeps_serving_when_stderr_is_closed() {
     assert_eq!(lines[2]["result"], json!({}));
 }
 
+/// Whether the tests run as root, for whom mode 000 does not deny.
+fn is_root() -> bool {
+    // SAFETY: geteuid() has no preconditions and cannot fail.
+    unsafe { libc::geteuid() == 0 }
+}
+
+/// Sets the mode of a file and gives it mode 0600 back on drop, also when
+/// the test fails.
+struct Mode(PathBuf);
+
+impl Mode {
+    fn set(p: &Path, mode: u32) -> Mode {
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).unwrap();
+        Mode(p.to_path_buf())
+    }
+}
+
+impl Drop for Mode {
+    fn drop(&mut self) {
+        let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o600));
+    }
+}
+
+#[test]
+fn mcp_fallback_on_an_unreadable_store_names_the_remedy() {
+    if is_root() {
+        return;
+    }
+    let program = std::fs::canonicalize(env!("CARGO_BIN_EXE_hxprobe")).unwrap();
+    let note = "the shared program was not used";
+    for with_note in [false, true] {
+        let d = Dir::new(if with_note { "deniednote" } else { "denied" });
+        let store = d.path("HxStore.hxd");
+        std::fs::write(&store, empty_store()).unwrap();
+        let cache = d.path("cache");
+        let args = [
+            Path::new("--store"),
+            &store,
+            Path::new("--cache-dir"),
+            &cache,
+        ];
+        let input = request(1, "tools/call", json!({"name": "list_messages"}));
+        let (status, out, err) = {
+            let _m = Mode::set(&store, 0o000);
+            mcp_with(&args, input.as_bytes(), true, |cmd| {
+                cmd.env("HOME", &d.0);
+                if with_note {
+                    cmd.env("HXPROBE_INSTALL_NOTE", note);
+                } else {
+                    cmd.env_remove("HXPROBE_INSTALL_NOTE");
+                }
+            })
+        };
+        assert_eq!(status.code(), Some(0), "stderr: {err}");
+        let lines = responses(&out);
+        assert_eq!(lines[0]["result"]["isError"], true, "{}", lines[0]);
+        let e = lines[0]["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            e.starts_with("this server cannot read the store: permission denied"),
+            "{e}"
+        );
+        assert!(e.contains(&format!("\"{}\"", program.display())), "{e}");
+        assert!(!e.contains("--stop"), "{e}");
+        if with_note {
+            assert!(e.ends_with(&format!(" Note: {note}")), "{e}");
+        } else {
+            assert!(!e.contains(" Note: "), "{e}");
+        }
+    }
+}
+
 /// Run a `store_status` call in fallback mode (`configure` chooses how) and
 /// check that no refresh service was started or asked.
 fn assert_fallback(name: &str, args: &[&Path], configure: impl FnOnce(&mut Command)) {

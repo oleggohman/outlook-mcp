@@ -226,6 +226,9 @@ pub struct Core<B> {
     /// The `mail.db` examined last: its identity (`None`: no file) and its
     /// build information (`None`: not usable).
     db_cache: Option<(Option<FileId>, Option<DbInfo>)>,
+    /// The error of a build that failed because the store was denied (see
+    /// [`Core::with_denied_text`]).
+    denied_text: String,
 }
 
 impl<B: Backend> Core<B> {
@@ -253,7 +256,16 @@ impl<B: Backend> Core<B> {
             last_result: None,
             stopping: None,
             db_cache: None,
+            denied_text: format!("the refresh service {}", proto::DENIED),
         }
+    }
+
+    /// The error recorded and replied for a build that failed because the
+    /// store was denied, instead of the raw text of the build (default:
+    /// the refresh service and [`proto::DENIED`]).
+    pub fn with_denied_text(mut self, text: String) -> Core<B> {
+        self.denied_text = text;
+        self
     }
 
     /// The backend, to run a build outside the policy's lock.
@@ -345,13 +357,17 @@ impl<B: Backend> Core<B> {
     }
 
     /// Record the end of a build. A failure for lack of permission on the
-    /// store ends the service.
+    /// store ends the service; its error is the denial text.
     pub fn build_finished(&mut self, result: Result<(), String>, now: i64) {
         self.building = false;
+        let result = match result {
+            Err(_) if self.backend.store_denied() => {
+                self.stopping.get_or_insert(Exit::Permission);
+                Err(self.denied_text.clone())
+            }
+            r => r,
+        };
         self.last_error = result.as_ref().err().cloned();
-        if result.is_err() && self.stopping.is_none() && self.backend.store_denied() {
-            self.stopping = Some(Exit::Permission);
-        }
         self.last_result = Some(result);
         self.generation += 1;
         self.last_activity_unix = now;
@@ -1479,21 +1495,39 @@ pub(crate) mod tests {
 
     #[test]
     fn store_permission_error_exits_after_a_failed_build() {
-        let mut c = core(900, 0);
-        c.backend()
-            .set(|s| s.fail = Some("permission denied".into()));
-        assert_eq!(c.poll(NOW), Action::Build(BuildReason::First));
-        c.build_started(NOW);
-        c.backend().set(|s| s.denied = true);
-        let r = c.backend().build(NOW);
-        c.build_finished(r, NOW + 1);
-        assert_eq!(c.poll(NOW + 1), Action::Exit(Exit::Permission));
+        // The error is the denial text, not the raw text of the build;
+        // without one given, the stable phrase.
+        let raw = "copy the store /s/HxStore.hxd: Permission denied (os error 13)";
+        for (c, want) in [
+            (
+                core(900, 0).with_denied_text("the denial text".into()),
+                "the denial text",
+            ),
+            (
+                core(900, 0),
+                "the refresh service cannot read the store: permission denied",
+            ),
+        ] {
+            let mut c = c;
+            c.backend().set(|s| s.fail = Some(raw.into()));
+            assert_eq!(c.poll(NOW), Action::Build(BuildReason::First));
+            c.build_started(NOW);
+            c.backend().set(|s| s.denied = true);
+            let r = c.backend().build(NOW);
+            c.build_finished(r, NOW + 1);
+            assert_eq!(c.poll(NOW + 1), Action::Exit(Exit::Permission));
+            assert_eq!(c.status().last_error.as_deref(), Some(want));
+            assert_eq!(c.refresh_reply()["error"], want);
+        }
 
-        // A failure for another reason does not end the service.
-        let mut c = core(900, 0);
+        // A failure for another reason does not end the service and keeps
+        // its raw text.
+        let mut c = core(900, 0).with_denied_text("the denial text".into());
         c.backend().set(|s| s.fail = Some("boom".into()));
         run_build(&mut c, NOW, NOW + 1);
         assert_eq!(c.poll(NOW + 1), Action::Wait);
+        assert_eq!(c.status().last_error.as_deref(), Some("boom"));
+        assert_eq!(c.refresh_reply()["error"], "boom");
     }
 
     #[test]
