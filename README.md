@@ -394,11 +394,35 @@ JSON-RPC error.
 ### Install as a Claude Code plugin
 
 The repository is also a Claude Code plugin. It provides the `outlook` MCP
-server and the `outlook-local-mail` skill (`skills/`), which tells Claude Code
-how to use the tools. The plugin starts the server through
-`scripts/run-mcp.sh`, which finds or installs the `hxprobe` program for the
-version in `hxprobe/Cargo.toml` and then runs `hxprobe mcp`. For Claude
-Desktop see "Claude Desktop" below.
+server and the `outlook-local-mail` skill. The plugin starts the server
+through `scripts/run-mcp.sh`, which finds or installs the `hxprobe` program
+for the version in `hxprobe/Cargo.toml` and then runs `hxprobe mcp`. For
+Claude Desktop see "Claude Desktop" below.
+
+#### The skill
+
+`skills/outlook-local-mail/SKILL.md` tells the assistant how to use the
+tools. It covers:
+
+* which call answers which question, the argument rules, and how the search
+  matches;
+* triage and threads: which mail is important, urgent or waiting on the
+  user, the analysis of a whole thread, and whether the user already
+  replied. The server has no thread id, no recipients and no "replied"
+  flag, so these answers are built from several calls; the steps are in
+  `skills/outlook-local-mail/references/triage-and-threads.md`;
+* freshness: when to call `store_status` and `refresh`, and what a `warning`
+  in a result means;
+* the error texts and what to do for each. For a permission error the skill
+  gives the user the whole error text, which names the steps; the steps
+  themselves are in "Full Disk Access" below, not in the skill;
+* what the server cannot do.
+
+The skill carries its version twice: `metadata.version` in its front matter
+and a `Skill version:` line under its title. It is the version of the
+program and the plugin, and the assistant reports it when asked which
+version of the skill is in use. The version of the running server is
+`service.version` in the result of `store_status`.
 
 The program is installed at one stable path for every version:
 
@@ -1175,8 +1199,9 @@ outside it.
 The launcher and the release script have shell tests with stub programs on
 `PATH`, no network and no signing identity. A third script checks the
 repository itself: the device profile, the versions in `hxprobe/Cargo.toml`,
-its lock file and the plugin manifest, the changelog, and phrases that the
-skill and this file must contain:
+its lock file, the plugin manifest and the skill (front matter and body),
+the changelog, the quoted description of the skill, the reference files the
+skill names, and phrases that the skill and this file must contain:
 
 ```sh
 bash scripts/test-run-mcp.sh
@@ -1216,6 +1241,13 @@ python3 tools/gen_props.py schema/layout.json hxprobe/src/props_gen.rs
 Do not edit `names.rs` or `props_gen.rs` by hand.
 
 ## Releases (maintainers)
+
+A release has one version in five places, and `bash scripts/test-repo.sh`
+fails when they differ: `hxprobe/Cargo.toml`, `hxprobe/Cargo.lock`,
+`.claude-plugin/plugin.json`, and in `skills/outlook-local-mail/SKILL.md`
+both `metadata.version` and the `Skill version:` line. A change to the skill
+alone is a release too, with a new version and its own section in
+`CHANGELOG.md`.
 
 Build the release program for each architecture from the tagged commit
 (`cargo build --release --locked`), then sign it on a Mac that has the
