@@ -18,8 +18,9 @@ All notable changes to this project are listed here. The format follows
 - The README section "For administrators: Full Disk Access by device
   profile".
 - `scripts/release-sign.sh --compare <signed program>` checks the designated
-  requirement of a signed program against the profile; signing does the
-  same check and stops on a difference.
+  requirement of a signed program against the profile and verifies its
+  signature against the profile's requirement; signing compares the
+  requirements too and stops on a difference.
 - `scripts/test-repo.sh`: checks of the profile, the versions and the
   documents; `--release` also requires the checksum line of the version.
 
@@ -43,9 +44,16 @@ All notable changes to this project are listed here. The format follows
   `~/Library/Application Support/hxprobe` and the permission errors say why.
   A root-owned program is only run when its SHA-256 is listed.
 - The launcher checks the SHA-256 of the installed program at every start; a
-  release program that changed after its install is not run.
-- While the service a server started is denied access, an older service
-  that works is kept in use instead of being stopped.
+  release program that changed after its install is not run. The install
+  lock has mode `0600`.
+- A server whose program is denied the store keeps an older service that
+  works in use, from the first contact, instead of stopping it.
+- A server started without `--store` whose lookup of the default store is
+  denied starts too and answers with the permission error; when the lookup
+  is allowed and finds no store, its calls return
+  `no Outlook store found under the default profile directory; pass --store`.
+- The stop command in the permission error has its paths in single quotes,
+  for a shell: `'<program>' service --stop --cache-dir '<cache dir>'`.
 - The `outlook-local-mail` skill covers Claude Desktop as well as Claude
   Code, the new error text, the `warning`, the shared path and the fallback
   path, and gives client-neutral advice on tool timeouts.

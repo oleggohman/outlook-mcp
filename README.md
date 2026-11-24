@@ -626,11 +626,13 @@ result and the `last_error` of `store_status` say so, name the program to
 add and the next step. In service mode:
 
 ```
-the refresh service cannot read the store: permission denied. Fix: open System Settings, Privacy & Security, Full Disk Access, add "<program>" and turn it on; then call again after 10 seconds. If the error stays, stop the service so that the next call starts a fresh one: "<program>" service --stop --cache-dir "<cache dir>". Log: <cache dir>/service.log
+the refresh service cannot read the store: permission denied. Fix: open System Settings, Privacy & Security, Full Disk Access, add "<program>" and turn it on; then call again after 10 seconds. If the error stays, stop the service so that the next call starts a fresh one: '<program>' service --stop --cache-dir '<cache dir>'. Log: <cache dir>/service.log
 ```
 
-`<program>` is the real path of the running program. Errors of earlier
-versions say `Operation not permitted` or `permission denied` for the store.
+`<program>` is the real path of the running program; the stop command has
+both paths in single quotes, so that it can be pasted into a shell as it
+is. Errors of earlier versions say `Operation not permitted (os error 1)`
+for the store instead.
 To give the program Full Disk Access:
 
 1. Open System Settings, Privacy & Security, Full Disk Access and click
@@ -778,11 +780,16 @@ hxprobe mcp [--store <file>] [--cache-dir <dir>] [--refresh-secs <n>]
   server exits with status 1 and a message on stderr before it reads any
   request. A store that cannot be examined because macOS denies the access
   is not such a failure: the server logs it, starts, and its tool calls
-  return the permission error (see "Full Disk Access"). The path is resolved
-  at start to an absolute path without symbolic links; `store_status` shows
-  that path, and the cache is kept for it. When the access is denied at
-  start, the server resolves the path again at every call until that
-  succeeds, so it recovers after the grant without a restart.
+  return the permission error (see "Full Disk Access"). The same holds when
+  the lookup of the default store itself is denied: the server starts, its
+  calls return the permission error, and once the lookup is allowed and
+  finds no default store they return
+  `no Outlook store found under the default profile directory; pass --store`.
+  The path is resolved at start to an absolute path without symbolic links;
+  `store_status` shows that path, and the cache is kept for it. When the
+  access is denied at start, the server resolves the path again at every
+  call until that succeeds, so it recovers after the grant without a
+  restart.
 * `--cache-dir`: default `~/Library/Caches/hxprobe-mcp`. The directory must
   be on a filesystem that keeps Unix permissions (not exFAT or a network
   share without them).
@@ -818,13 +825,17 @@ again when the service replaced it, and answer from it.
 * **Idle exit.** The service exits after `--idle-secs` (default 30 minutes)
   without a request; the next tool call starts it again.
 * **Upgrades.** A server that finds an older service stops it and starts its
-  own; a newer service is used as it is. One exception: while the service
-  this server started was denied access to the store, an older service that
-  answers is used as it is and not stopped. After an upgrade the new program
-  path may not have Full Disk Access yet while the old one has; mail then
-  stays fresh through the older service of another client, and nothing
-  warns. The server tries its own service again when no service answers
-  (after the idle exit, or `service --stop`).
+  own; a newer service is used as it is. One exception: a server that
+  cannot open the store itself because macOS denies its program (the
+  service it would start is the same program), or whose own service was
+  denied, uses an older service that answers as it is, from the first
+  contact, and does not stop it. It logs
+  `keeping refresh service <version> (pid <n>): this program is denied the store`
+  on stderr. After an upgrade the new program path may not have Full Disk
+  Access yet while the old one has; mail then stays fresh through the older
+  service of another client, and nothing warns. The server tries its own
+  service again when no service answers (after the idle exit, or
+  `service --stop`).
 * **Another store.** A cache directory serves one store at a time: the store
   of the server that started the service. A server with another `--store` gets
   the error `this cache directory serves another store: <path>; use another
@@ -887,13 +898,23 @@ Errors of the tools in service mode:
 | `the rebuild did not finish within 300 s and may still be running; call store_status later` | `refresh` stopped waiting; the build goes on. Check `store_status` later. |
 | `the refresh service did not start; see <cache dir>/service.log` | No service answered within 10 s. See the log; a new start is tried after 30 s. |
 | `the refresh service exited at start (<status>); see <cache dir>/service.log` | The service failed at start. See the log. |
-| `the refresh service cannot read the store: permission denied. Fix: open System Settings, Privacy & Security, Full Disk Access, add "<program>" and turn it on; then call again after 10 seconds. If the error stays, stop the service so that the next call starts a fresh one: "<program>" service --stop --cache-dir "<cache dir>". Log: <cache dir>/service.log` | macOS denies the program access to the store. See "Full Disk Access". |
+| `the refresh service cannot read the store: permission denied. Fix: open System Settings, Privacy & Security, Full Disk Access, add "<program>" and turn it on; then call again after 10 seconds. If the error stays, stop the service so that the next call starts a fresh one: '<program>' service --stop --cache-dir '<cache dir>'. Log: <cache dir>/service.log` | macOS denies the program access to the store. See "Full Disk Access". |
 | `this server cannot read the store: permission denied. Fix: open System Settings, Privacy & Security, Full Disk Access, add "<program>" and turn it on; then restart the MCP client (quit the app that uses these tools and open it again). Cause: <error of the build>` | The same in fallback mode, where the server builds the cache itself. Grant the access, then restart the MCP client. |
+| `no Outlook store found under the default profile directory; pass --store` | The server was started without `--store` while macOS denied the lookup of the default store; the lookup is allowed now and finds no store (or several profiles hold one). Register the server with `--store <file>` and restart the MCP client. |
+
+Both permission errors are also given, in the same words, when the server
+was started without `--store` and macOS denies the lookup of the default
+store; in fallback mode the cause is then
+`the Outlook profiles in <directory> cannot be examined: permission denied`.
+These errors and the one for a missing default store can be a tool error
+or the `last_error` of `store_status`.
 
 Both permission errors end with ` Note: <text>` when the plugin launcher did
 not use the shared directory (see "When the shared directory is not used").
-When the program path is not known, they say `the hxprobe program` instead
-of a quoted path, and the service form leaves out the stop command.
+The note is one line of at most 300 characters; a control character in it
+is shown as a space. When the program path is not known, they say
+`the hxprobe program` instead of a quoted path, and the service form leaves
+out the stop command.
 
 When a usable `mail.db` exists, a service that is not available does not
 stop the tools: calls are answered from the database on disk, the reason

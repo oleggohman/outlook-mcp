@@ -36,8 +36,9 @@ the Outlook store by other means.
 
 If a tool error, a `warning` or the top-level `last_error` of `store_status`
 contains `cannot read the store: permission denied`, macOS blocked the
-hxprobe program. Errors of earlier versions say `Operation not permitted` or
-`os error 1` for the Outlook store instead. Retrying at once does not help,
+hxprobe program. Errors of earlier versions say
+`Operation not permitted (os error 1)` for the store instead. Retrying at
+once does not help,
 and nothing you run can fix it: stop and give the user these steps.
 
 macOS checks the permission of the hxprobe program itself, not the MCP
@@ -50,7 +51,7 @@ The error names the program and the next steps. With the background
 service (the usual case) it reads:
 
 ```
-the refresh service cannot read the store: permission denied. Fix: open System Settings, Privacy & Security, Full Disk Access, add "<program>" and turn it on; then call again after 10 seconds. If the error stays, stop the service so that the next call starts a fresh one: "<program>" service --stop --cache-dir "<cache dir>". Log: <cache dir>/service.log
+the refresh service cannot read the store: permission denied. Fix: open System Settings, Privacy & Security, Full Disk Access, add "<program>" and turn it on; then call again after 10 seconds. If the error stays, stop the service so that the next call starts a fresh one: '<program>' service --stop --cache-dir '<cache dir>'. Log: <cache dir>/service.log
 ```
 
 A server started with `--no-service` (`service` is `null` in
@@ -77,8 +78,8 @@ used").
    gone, repeat what the user asked for.
 4. Only if the same error stays: give the user the stop command from the
    error text, copied exactly
-   (`"<program>" service --stop --cache-dir "<cache dir>"`), to run in
-   Terminal; then call `store_status` again.
+   (`'<program>' service --stop --cache-dir '<cache dir>'`, with the
+   single quotes), to run in Terminal; then call `store_status` again.
 5. With `--no-service` there is no service to stop: after the grant the user
    restarts the MCP client (see "Restarting the MCP client").
 
@@ -232,7 +233,8 @@ and say the full text is not cached.
 | `this cache directory serves another store` | Another server uses this cache for another Outlook store. Tell the user to give this server its own `--cache-dir`. Do not retry. |
 | `did not finish within` ... `and may still be running` | The rebuild goes on. Call `store_status` until `service.building` is false; do not call `refresh` again. |
 | `the refresh service did not start` or `exited at start` | Report it with the `service.log` path it names. Calls still answer from an existing cache. |
-| `cannot read the store: permission denied` | Follow "Permission errors". Do not retry before the user has granted the access. |
+| `cannot read the store: permission denied` | Follow "Permission errors". Do not retry before the user has granted the access. Also given when the default store cannot be looked up. |
+| `no Outlook store found under the default profile directory; pass --store` | The server has no `--store` and found no default store. Tell the user to register it with `--store <path of HxStore.hxd>` and restart the MCP client. Do not retry. |
 | `mail data is from` ... `and is not being refreshed` (a `warning`) | Tell the user the data is old and why, call `store_status`, and act on its `last_error`. |
 
 ### Slow first call or a timeout
