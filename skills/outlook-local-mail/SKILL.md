@@ -38,61 +38,6 @@ server is not registered in this client: say so and point the user to the
 (https://github.com/oleggohman/outlook-mcp#mcp-server). Do not try to read
 the Outlook store by other means.
 
-## Permission errors (macOS Full Disk Access)
-
-If a tool error, a `warning` or the top-level `last_error` of `store_status`
-contains `cannot read the store: permission denied`, macOS blocked the
-hxprobe program. Errors of earlier versions say
-`Operation not permitted (os error 1)` for the store instead. Retrying at
-once does not help, and nothing you run can fix it: stop and give the user
-the steps below.
-
-Full Disk Access for either of two things lets the server read the store:
-the hxprobe program the error names, or the app that starts the server (the
-MCP client, or the terminal app it runs in). Give the steps for the program
-first; when the error stays after them, the same steps for the app are the
-next thing to try.
-
-The error names the program and the next steps. With the background
-service (the usual case) it reads:
-
-```
-the refresh service cannot read the store: permission denied. Fix: open System Settings, Privacy & Security, Full Disk Access, add "<program>" and turn it on; then call again after 10 seconds. If the error stays, stop the service so that the next call starts a fresh one: '<program>' service --stop --cache-dir '<cache dir>'. Log: <cache dir>/service.log
-```
-
-A server started with `--no-service` (`service` is `null` in
-`store_status`) says
-`this server cannot read the store: permission denied`, names the program
-the same way, and ends with `restart the MCP client` and the cause. Either
-text may end with ` Note: ...`: pass it on to the user unchanged.
-
-1. Find the program path: copy it from the error, the quoted path after
-   `add`. By default it is `/Users/Shared/hxprobe/bin/hxprobe`. There is no
-   version in the name. Give the user the full absolute path.
-2. Tell the user: open System Settings → Privacy & Security → Full Disk
-   Access and click **+**. Press Cmd+Shift+G, paste the path, click Open and
-   make sure its toggle is on. If it is already listed, remove it with **–**
-   and add it again. Changing this list needs an administrator password of
-   the Mac.
-3. After the user confirms, wait 10 seconds and call `store_status`. No
-   restart and no Terminal step is needed: that call starts a fresh
-   background service, which now has the permission. When `last_error` is
-   gone, repeat what the user asked for.
-4. Only if the same error stays: give the user the stop command from the
-   error text, copied exactly
-   (`'<program>' service --stop --cache-dir '<cache dir>'`, with the
-   single quotes), to run in Terminal; then call `store_status` again.
-5. With `--no-service` there is no service to stop: after the grant the user
-   restarts the MCP client (quits the app completely and opens it again).
-6. If the error is still there, repeat step 2 for the app that starts the
-   server (Claude Desktop, or the terminal app Claude Code runs in), then
-   have the user restart that app.
-
-Upgrading from hxprobe 0.2.1 or earlier: those versions kept the program in
-the user's own Library folder. A Full Disk Access entry for that program does
-not cover `/Users/Shared/hxprobe/bin/hxprobe`; the new path needs its own
-entry. Do not tell the user to add the old path.
-
 ## Argument rules that cause errors
 
 | Argument | Rule |
@@ -225,9 +170,8 @@ and say the full text is not cached.
   being served and the user has to act. The field reads `mail data is from
   <build time> and is not being refreshed: <error>` (`an earlier build` when
   the time is not known) and is absent when all is well. Tell the user that
-  the data is old, from when, and why; call `store_status` and give the
-  steps for its `last_error` (for a permission error, see "Permission
-  errors"). Do not present that mail as current. `store_status` and
+  the data is old, from when, and why; call `store_status` and report its
+  `last_error`. Do not present that mail as current. `store_status` and
   `refresh` never carry the field; they show `last_error`.
 
 | Error text contains | Do |
@@ -237,7 +181,7 @@ and say the full text is not cached.
 | `this cache directory serves another store` | Another server uses this cache for another Outlook store. Tell the user to give this server its own `--cache-dir`. Do not retry. |
 | `did not finish within` ... `and may still be running` | The rebuild goes on. Call `store_status` until `service.building` is false; do not call `refresh` again. |
 | `the refresh service did not start` or `exited at start` | Report it with the `service.log` path it names. Calls still answer from an existing cache. |
-| `cannot read the store: permission denied` | Follow "Permission errors". Do not retry before the user has granted the access. Also given when the default store cannot be looked up. |
+| `cannot read the store: permission denied` | macOS denied the server the Outlook store. Give the user the whole error text unchanged: it names what to do. Do not retry before the user says it is done. |
 | `no Outlook store found under the default profile directory; pass --store` | The server has no `--store` and found no default store. Tell the user to register it with `--store <path of HxStore.hxd>` and restart the MCP client. Do not retry. |
 | `mail data is from` ... `and is not being refreshed` (a `warning`) | Tell the user the data is old and why, call `store_status`, and act on its `last_error`. |
 
@@ -311,12 +255,9 @@ back to the user's zone. If two senders match "dana", show both and ask.
   local midnight. Use the full `...Z` form for local day boundaries.
 - Calling `search_people` only to get an address for `from`.
 - Reporting `unread_count` as the number of messages that can be listed.
-- On "cannot read the store: permission denied" or "Operation not
-  permitted": retrying before anything changed.
+- On "cannot read the store: permission denied": retrying before anything
+  changed, or shortening the error text, which names the fix.
 - Ignoring a `warning`, or presenting the mail of a result that carries one
   as current.
-- After the update to 0.2.2, telling the user to add the program path of
-  an earlier version (in their own Library folder) instead of the path the
-  error quotes, which is `/Users/Shared/hxprobe/bin/hxprobe` by default.
 - Retrying on "restart the MCP client" or "serves another store": only the
   user can fix those.

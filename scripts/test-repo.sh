@@ -485,16 +485,15 @@ expect_fail 'self-test: skill description with a colon and no quotes' \
 # The skill: both clients, the shared program path, the denial and the
 # warning; the per-user path only under the heading that explains it.
 skill="$repo/skills/outlook-local-mail/SKILL.md"
-skill_phrases=(warning 'cannot read the store: permission denied' "$program" \
-    'Claude Desktop' 'Claude Code')
+skill_phrases=(warning 'cannot read the store: permission denied')
 skill_fallback='When the shared directory is not used'
 expect_pass 'skill: required phrases' check_phrases "$skill" "${skill_phrases[@]}"
 expect_pass 'skill: description names a warning' check_skill_description "$skill"
 expect_pass 'skill: per-user path only under its heading' \
     check_lines_under "$skill" 'Application Support/hxprobe' "$skill_fallback"
-grep -vF -e 'Claude Desktop' "$skill" > "$tmp/skill-no-desktop.md"
-expect_fail 'self-test: skill without Claude Desktop' \
-    check_phrases "$tmp/skill-no-desktop.md" "${skill_phrases[@]}"
+grep -vF -e 'permission denied' "$skill" > "$tmp/skill-no-denial.md"
+expect_fail 'self-test: skill without the denial text' \
+    check_phrases "$tmp/skill-no-denial.md" "${skill_phrases[@]}"
 sed '/^description:/s/warning/notice/g' "$skill" > "$tmp/skill-description.md"
 expect_fail 'self-test: skill description without a warning' \
     check_skill_description "$tmp/skill-description.md"
@@ -545,12 +544,11 @@ expect_fail 'self-test: README per-user program under another heading' \
 # shape where the skill and the README quote the denial text.
 proto="$repo/hxprobe/src/mcp/proto.rs"
 expect_pass 'stop command: single quotes in the server source' check_stop_in_code "$proto"
-expect_pass 'stop command: single quotes in the skill' check_stop_command "$skill"
 expect_pass 'stop command: single quotes in the README' check_stop_command "$readme"
 sed "s/'\\([^' ]*\\)' service --stop --cache-dir '\\([^' ]*\\)'/\"\\1\" service --stop --cache-dir \"\\2\"/" \
     "$proto" > "$tmp/proto-double.rs"
 expect_fail 'self-test: server source with double quotes' check_stop_in_code "$tmp/proto-double.rs"
-for f in "$skill" "$readme"; do
+for f in "$readme"; do
     n=$(basename "$f")
     sed "s/'<program>' service --stop --cache-dir '<cache dir>'/\"<program>\" service --stop --cache-dir \"<cache dir>\"/" \
         "$f" > "$tmp/double-$n"

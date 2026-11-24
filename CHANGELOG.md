@@ -32,12 +32,13 @@ The hxprobe program has no functional change; its version follows the plugin.
 
 ### Removed
 
-- Four sections of the skill: "On a Mac managed by an organisation", "For
-  administrators", "When the shared directory is not used" and "Restarting
-  the MCP client". On a permission error the skill gives the Full Disk
-  Access steps again without asking which kind of Mac it is. The README
-  keeps the material for administrators; a note at the end of an error is
-  passed on to the user unchanged.
+- The section "Permission errors (macOS Full Disk Access)" of the skill
+  with all its parts (managed Macs, administrators, the fallback directory,
+  restarting the client). On a permission error the skill now gives the user
+  the whole error text unchanged, which names the fix. The README keeps the
+  steps and the material for administrators. `scripts/test-repo.sh` no
+  longer requires the program path, the stop command or the client names in
+  the skill.
 
 ## [0.2.3] - 2026-11-24
 
