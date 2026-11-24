@@ -867,4 +867,8 @@ if command -v cargo >/dev/null 2>&1; then
 fi
 
 # f. Nothing worked.
-die "no prebuilt hxprobe $version is available for this machine and cargo is not on PATH. Install Rust from https://rustup.rs and restart the MCP server, or set HXPROBE_BIN to the path of an hxprobe program."
+why=''
+if [ "$changed" = 1 ]; then
+    why="the installed program was not run because it changed since its install; "
+fi
+die "${why}no prebuilt hxprobe $version is available for this machine and cargo is not on PATH. Install Rust from https://rustup.rs and restart the MCP server, or set HXPROBE_BIN to the path of an hxprobe program."

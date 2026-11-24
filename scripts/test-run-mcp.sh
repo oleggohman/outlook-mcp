@@ -1483,6 +1483,22 @@ for how in 'shared directory' 'install dir given' 'download fails' 'record of an
     else fail "$t" "rc=$rc out='$out' changed-run=$([ -e "$r/changed-ran" ] || [ -e "$r/changed-ran.asked" ] && echo yes || echo no) err='$err'"; fi
 done
 
+# Without a release program for the wanted version and without cargo, the
+# last message says why the installed program was not run.
+t='checksum: changed release file, no release listed, no cargo'
+r=$(make_repo)
+rm -rf "$root/home"
+d=$(shared_of "$r")
+make_fake "$r/changed" "$r/changed-ran" '' "$version"
+make_fake "$r/older" "$r/old-ran" '' 9.8.6
+put_program "$d" "$r/changed" "release $(sum_of "$r/older")"
+run "$r" HXPROBE_INSTALL_DIR= PATH="$nocargo_path" --
+if [ "$rc" = 1 ] && [ -z "$out" ] && [[ "$err" == *'https://rustup.rs'* ]] \
+    && [[ "${err##*$'\n'}" == *'the installed program was not run because it changed since its install'* ]] \
+    && [ ! -e "$r/changed-ran" ] && [ ! -e "$r/changed-ran.asked" ] \
+    && cmp -s "$d/bin/hxprobe" "$r/changed" && lock_free "$d"; then pass "$t"
+else fail "$t" "rc=$rc out='$out' err='$err'"; fi
+
 # Today's rules for a program that is not listed: one built here runs by its
 # --version answer; a newer one is kept and logged.
 for kind in built newer; do
