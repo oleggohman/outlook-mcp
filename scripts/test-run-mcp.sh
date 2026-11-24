@@ -1499,6 +1499,35 @@ if [ "$rc" = 1 ] && [ -z "$out" ] && [[ "$err" == *'https://rustup.rs'* ]] \
     && cmp -s "$d/bin/hxprobe" "$r/changed" && lock_free "$d"; then pass "$t"
 else fail "$t" "rc=$rc out='$out' err='$err'"; fi
 
+# A signal that arrives between the write of the origin record and the move
+# of the program (here: while the mode of the record is set) ends the
+# launcher only after the move: the record and the program agree, and the
+# server is not started.
+t='signal between the origin record and the move'
+r=$(make_repo)
+make_asset "$r"
+make_curl_probe "$r"
+rm -rf "$root/home"
+s=$(shared_of "$r")
+make_fake "$r/older" "$r/old-ran" '' 9.8.6
+put_program "$s" "$r/older" "release $(sum_of "$r/older")"
+cat > "$r/stub/chmod" <<EOF
+#!/bin/sh
+for a; do p=\$a; done
+if [ "\$p" = '$s/bin/.origin' ] && [ ! -e '$r/signalled' ]; then
+    : > '$r/signalled'
+    kill -TERM "\$PPID"
+fi
+exec /bin/chmod "\$@"
+EOF
+chmod 755 "$r/stub/chmod"
+run "$r" HXPROBE_INSTALL_DIR= HXPROBE_RELEASE_BASE="file://$r/rel" PATH="$r/stub:$nocargo_path" --
+if [ "$rc" = 143 ] && [ -z "$out" ] && [ -e "$r/signalled" ] && [ ! -e "$r/ran" ] && [ ! -e "$r/old-ran" ] \
+    && cmp -s "$s/bin/hxprobe" "$r/rel/v$version/$asset" \
+    && [ "$(origin_of "$s")" = "release $(sum_of "$s/bin/hxprobe")" ] \
+    && [ "$(leftovers "$s")" = 0 ] && lock_free "$s"; then pass "$t"
+else fail "$t" "rc=$rc out='$out' signalled=$([ -e "$r/signalled" ] && echo yes || echo no) origin='$(origin_of "$s")' program=$(sum_of "$s/bin/hxprobe") err='$err'"; fi
+
 # Today's rules for a program that is not listed: one built here runs by its
 # --version answer; a newer one is kept and logged.
 for kind in built newer; do

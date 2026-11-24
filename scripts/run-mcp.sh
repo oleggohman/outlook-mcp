@@ -722,9 +722,16 @@ install_and_run() {
     # program again, and stops while that download fails. Written after the
     # move, a build that replaces a release program would leave the old
     # `release` record next to the built program, which no download repairs.
+    # A signal must therefore not end the launcher between the two: with
+    # `starting` set on_signal only notes it, and it is acted on after the
+    # move. Only SIGKILL or a power loss can still separate them.
+    starting=1
     printf '%s\n' "$origin" > "$origin_file" || die "cannot write $origin_file"
     if [ -n "$origin_mode" ]; then
-        chmod "$origin_mode" "$origin_file" || die "cannot set the mode of $origin_file"
+        if ! chmod "$origin_mode" "$origin_file"; then
+            rm -f "$origin_file" 2>/dev/null || true
+            die "cannot set the mode of $origin_file"
+        fi
     fi
     if [ ! -e "$bin" ] && [ ! -L "$bin" ]; then first=1; fi
     if ! mv -f "$src" "$bin"; then
@@ -732,6 +739,8 @@ install_and_run() {
         die "cannot move $src to $bin"
     fi
     tmp_file=''
+    starting=0
+    if [ -n "$pending" ]; then on_signal "$pending"; fi
     rm -f "$backoff_file" 2>/dev/null || true
     if [ -n "$legacy" ]; then
         for f in "$legacy"/hxprobe-*; do
