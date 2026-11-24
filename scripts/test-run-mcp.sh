@@ -58,7 +58,8 @@ if ( : >&9 ) 2>/dev/null; then f9=open; fi'
 fds_closed='fd3=closed fd9=closed'
 
 # Fake program: answers `--version` with `hxprobe $4` (without $4 it fails
-# with a usage message and status 2, as 0.1.0 does). Otherwise it prints its
+# with a usage message and status 2, as 0.1.0 does) and leaves the file
+# `<marker>.asked` when it is asked that. Otherwise it prints its
 # arguments to stdout and leaves a marker file that holds the state of fd 3
 # and fd 9, the file `<marker>.path` with the path it was run as and the file
 # `<marker>.note` with HXPROBE_INSTALL_NOTE (`(unset)` when it is not set). $3
@@ -68,6 +69,7 @@ make_fake() {
     cat > "$1" <<EOF
 #!/bin/sh
 if [ "\$1" = --version ]; then
+    : > "$2.asked"
     if [ -n "${4:-}" ]; then echo "hxprobe ${4:-}"; exit 0; fi
     echo "usage: hxprobe <command>" >&2
     exit 2
@@ -1325,6 +1327,126 @@ if [ "$rc1" = 0 ] && [ "$out1" = 'FAKE mcp' ] && [ "$(cat "$r/ran.path")" = "$s/
     && [ "$rc" = 0 ] && [ "$out" = 'FAKE mcp' ] && [[ "$err" != *"$line"* ]] \
     && [ "$(tree_state "$own_dir")" = "$before" ] && [ ! -e "$r/old-ran" ]; then pass "$t"
 else fail "$t" "rc=$rc1/$rc out='$out1'/'$out' err='$err1' / '$err'"; fi
+rm -rf "$root/home"
+
+# (xx) The SHA-256 of the installed program is checked at every start. In
+# the shared directory (the user's own) and, for the changed file, in an
+# explicit install directory too.
+
+# Puts file $2 as the program into install directory $1 (mode 755) with the
+# origin record $3.
+put_program() {
+    mkdir -p "$1/bin"
+    chmod 755 "$1" "$1/bin"
+    cp "$2" "$1/bin/hxprobe"
+    chmod 755 "$1/bin/hxprobe"
+    printf '%s\n' "$3" > "$1/bin/.origin"
+}
+
+# The SHA-256 of file $1.
+sum_of() { shasum -a 256 "$1" | awk '{ print $1 }'; }
+
+# A program whose sum is listed for the wanted version runs without being
+# asked for its version and without a download.
+t='checksum: listed for the wanted version'
+r=$(make_repo)
+make_asset "$r"
+make_curl_probe "$r"
+rm -rf "$root/home"
+s=$(shared_of "$r")
+put_program "$s" "$r/rel/v$version/$asset" "release $(sum_of "$r/rel/v$version/$asset")"
+ino=$(inode "$s/bin/hxprobe")
+run "$r" HXPROBE_INSTALL_DIR= HXPROBE_RELEASE_BASE="file://$r/rel" PATH="$r/stub:$nocargo_path" --
+if [ "$rc" = 0 ] && [ "$out" = 'FAKE mcp' ] && [ -z "$err" ] && [ "$(cat "$r/ran.path")" = "$s/bin/hxprobe" ] \
+    && [ ! -e "$r/ran.asked" ] && [ ! -e "$r/curl-args" ] && [ "$(inode "$s/bin/hxprobe")" = "$ino" ]; then pass "$t"
+else fail "$t" "rc=$rc out='$out' asked=$([ -e "$r/ran.asked" ] && echo yes || echo no) err='$err'"; fi
+
+# One whose sum is listed for an older version is replaced, without being
+# asked either.
+t='checksum: listed for an older version'
+r=$(make_repo)
+make_asset "$r"
+make_curl_probe "$r"
+rm -rf "$root/home"
+s=$(shared_of "$r")
+make_fake "$r/older" "$r/old-ran" '' 9.8.6
+printf '%s  %s\n' "$(sum_of "$r/older")" "hxprobe-9.8.6-macos-$arch" >> "$r/release/SHA256SUMS"
+put_program "$s" "$r/older" "release $(sum_of "$r/older")"
+run "$r" HXPROBE_INSTALL_DIR= HXPROBE_RELEASE_BASE="file://$r/rel" PATH="$r/stub:$nocargo_path" --
+if [ "$rc" = 0 ] && [ "$out" = 'FAKE mcp' ] && [ "$(cat "$r/ran.path")" = "$s/bin/hxprobe" ] \
+    && cmp -s "$s/bin/hxprobe" "$r/rel/v$version/$asset" && [ ! -e "$r/old-ran" ] \
+    && [ ! -e "$r/old-ran.asked" ] && [ -e "$r/curl-args" ] \
+    && [ "$(origin_of "$s")" = "release $(sum_of "$r/rel/v$version/$asset")" ] && lock_free "$s"; then pass "$t"
+else fail "$t" "rc=$rc out='$out' err='$err'"; fi
+
+# A release program of the wanted version that changed after the install
+# (its sum is no longer the listed one) is not run, not even asked for its
+# version: the release program is downloaded again and run. When that
+# download fails the launcher stops and names the checksum.
+for how in 'shared directory' 'install dir given' 'download fails'; do
+    t="checksum: changed release file, $how"
+    r=$(make_repo)
+    make_asset "$r"
+    rm -rf "$root/home"
+    if [ "$how" = 'download fails' ]; then make_curl_fail "$r"; else make_curl_probe "$r"; fi
+    make_cargo_stub "$r" ''
+    if [ "$how" = 'install dir given' ]; then d="$r/inst"; inst_set="HXPROBE_INSTALL_DIR=$r/inst"
+    else d=$(shared_of "$r"); inst_set='HXPROBE_INSTALL_DIR='; fi
+    make_fake "$r/changed" "$r/changed-ran" '' "$version"
+    put_program "$d" "$r/changed" "release $(sum_of "$r/rel/v$version/$asset")"
+    run "$r" "$inst_set" HXPROBE_RELEASE_BASE="file://$r/rel" PATH="$r/stub:$nocargo_path" --
+    ok=0
+    if [ "$how" = 'download fails' ]; then
+        if [ "$rc" = 1 ] && [ -z "$out" ] && [ ! -e "$r/ran" ] && [[ "$err" == *checksum* ]] \
+            && cmp -s "$d/bin/hxprobe" "$r/changed"; then ok=1; fi
+    elif [ "$rc" = 0 ] && [ "$out" = 'FAKE mcp' ] && [ "$(cat "$r/ran.path" 2>/dev/null || true)" = "$d/bin/hxprobe" ] \
+        && cmp -s "$d/bin/hxprobe" "$r/rel/v$version/$asset" && [[ "$err" == *checksum* ]]; then ok=1; fi
+    if [ "$ok" = 1 ] && [ ! -e "$r/changed-ran" ] && [ ! -e "$r/changed-ran.asked" ] \
+        && [ ! -e "$r/builds" ] && [ "$(leftovers "$d")" = 0 ] && lock_free "$d"; then pass "$t"
+    else fail "$t" "rc=$rc out='$out' changed-run=$([ -e "$r/changed-ran" ] || [ -e "$r/changed-ran.asked" ] && echo yes || echo no) err='$err'"; fi
+done
+
+# Today's rules for a program that is not listed: one built here runs by its
+# --version answer; a newer one is kept and logged.
+for kind in built newer; do
+    t="checksum: not listed, $kind"
+    r=$(make_repo)
+    make_curl_probe "$r"
+    rm -rf "$root/home"
+    s=$(shared_of "$r")
+    if [ "$kind" = built ]; then
+        make_fake "$r/prog" "$r/prog-ran" '' "$version"
+        put_program "$s" "$r/prog" build
+    else
+        make_asset "$r"
+        make_fake "$r/prog" "$r/prog-ran" '' 9.10.0
+        put_program "$s" "$r/prog" "release $(sum_of "$r/prog")"
+    fi
+    run "$r" HXPROBE_INSTALL_DIR= HXPROBE_RELEASE_BASE="file://$r/rel" PATH="$r/stub:$nocargo_path" --
+    if [ "$kind" = built ]; then note_ok=$([ -z "$err" ] && echo 1 || echo 0)
+    else note_ok=$([[ "$err" == *'9.10.0'*'newer'* ]] && echo 1 || echo 0); fi
+    if [ "$rc" = 0 ] && [ "$out" = 'FAKE mcp' ] && [ -e "$r/prog-ran" ] && [ -e "$r/prog-ran.asked" ] \
+        && [ ! -e "$r/curl-args" ] && cmp -s "$s/bin/hxprobe" "$r/prog" && [ "$note_ok" = 1 ]; then pass "$t"
+    else fail "$t" "rc=$rc out='$out' err='$err'"; fi
+done
+
+# Without shasum on PATH the program counts as not listed: an own one runs by
+# its --version answer. PATH holds every program of /usr/bin but shasum.
+t='checksum: no shasum'
+r=$(make_repo)
+make_asset "$r"
+make_curl_probe "$r"
+rm -rf "$root/home"
+s=$(shared_of "$r")
+mkdir -p "$r/tools"
+for f in /usr/bin/*; do
+    case "${f##*/}" in shasum ) ;; * ) ln -s "$f" "$r/tools/${f##*/}" ;; esac
+done
+put_program "$s" "$r/rel/v$version/$asset" "release $(sum_of "$r/rel/v$version/$asset")"
+run "$r" HXPROBE_INSTALL_DIR= HXPROBE_RELEASE_BASE="file://$r/rel" PATH="$r/stub:$r/tools:/bin" --
+if [ "$rc" = 0 ] && [ "$out" = 'FAKE mcp' ] && [ "$(cat "$r/ran.path")" = "$s/bin/hxprobe" ] \
+    && [ -e "$r/ran.asked" ] && [ ! -e "$r/curl-args" ] && [ -z "$err" ]; then pass "$t"
+else fail "$t" "rc=$rc out='$out' err='$err'"; fi
 rm -rf "$root/home"
 
 # (last) No case reached the real shared directory: it is as it was before

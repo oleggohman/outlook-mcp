@@ -4,12 +4,23 @@
 # version in hxprobe/Cargo.toml and replaces itself with `hxprobe mcp`.
 #
 # The program lives at one stable path, <install dir>/bin/hxprobe, for every
-# version, so one Full Disk Access entry serves every client and upgrade. The
-# installed version is asked with `hxprobe --version`: the wanted version or
-# a newer one is run as it is (never downgrade); a missing or older program,
-# or one without an answer (0.1.0), is replaced by a rename under the install
-# lock. The server starts its refresh service from its own path, so it is
-# always started from the stable path.
+# version, so one Full Disk Access entry serves every client and upgrade. At
+# every start (unless HXPROBE_BIN is set) the SHA-256 of the installed
+# program is looked up in the checksum file among the assets of this
+# architecture: a listed program has the version of its asset name and is
+# not run to ask it. Only a program that is not listed (one built here, one
+# of a newer plugin, or any program when shasum is missing) is asked with
+# `hxprobe --version`. Either way the wanted version or a newer one is run
+# as it is (never downgrade); a missing or older program, or one without an
+# answer (0.1.0), is replaced by a rename under the install lock. A release
+# program of the wanted version whose sum is no longer the listed one changed
+# after the install: it is never run, the release program is downloaded
+# again, and the launcher stops when that fails. In a directory of the
+# user's own this finds a damaged or half-written file; it is not a security
+# boundary, since whoever can write the directory can write bin/.origin as
+# well: that boundary is the owner and mode of the directory. The server
+# starts its refresh service from its own path, so it is always started from
+# the stable path.
 #
 # The default install directory is /Users/Shared/hxprobe, the same path for
 # every account, so that one device profile can grant Full Disk Access to
@@ -120,6 +131,51 @@ case "$version" in
     '' ) die "no version found in the [package] table of $manifest" ;;
     *[!0-9A-Za-z.+-]* ) die "unexpected version '$version' in $manifest" ;;
 esac
+
+# The architecture of the release programs for this machine (arm64 or
+# x86_64); fails on another system or machine.
+release_arch() {
+    [ "$(uname -s)" = Darwin ] || return 1
+    case "$(uname -m)" in
+        arm64 | aarch64 ) echo arm64 ;;
+        x86_64 ) echo x86_64 ;;
+        * ) return 1 ;;
+    esac
+}
+
+# The checksum file: lines `<sha256>  <asset>`.
+sums_file=${HXPROBE_SUMS:-$repo/release/SHA256SUMS}
+
+# The SHA-256 of file $1 in lower case, or nothing (no shasum, unreadable).
+file_sum() {
+    command -v shasum >/dev/null 2>&1 || return 0
+    shasum -a 256 "$1" 2>/dev/null | awk 'NR == 1 && length($1) == 64 && $1 !~ /[^0-9a-fA-F]/ { print tolower($1) }' || true
+}
+
+# The version that the checksum file lists for program $1, from the name of
+# the asset of this architecture whose sum is the program's
+# (hxprobe-<version>-macos-<arch>), or nothing when it is not listed. The
+# program is not run. Without shasum nothing is listed.
+listed_version() {
+    local arch sum v
+    [ -f "$1" ] && [ -f "$sums_file" ] || return 0
+    arch=$(release_arch) || return 0
+    sum=$(file_sum "$1")
+    [ -n "$sum" ] || return 0
+    v=$(awk -v s="$sum" -v pre="hxprobe-" -v post="-macos-$arch" '
+        /^[[:space:]]*#/ || NF == 0 { next }
+        NF == 2 && tolower($1) == s {
+            n = $2; sub(/^\*/, "", n)
+            if (substr(n, 1, length(pre)) == pre && length(n) > length(pre) + length(post) \
+                && substr(n, length(n) - length(post) + 1) == post) {
+                print substr(n, length(pre) + 1, length(n) - length(pre) - length(post)); exit
+            }
+        }' "$sums_file")
+    case "$v" in
+        '' | *[!0-9A-Za-z.+-]* ) return 0 ;;
+    esac
+    printf '%s\n' "$v"
+}
 
 # The default install directory, shared by every account of the Mac, so that
 # one device profile can grant Full Disk Access to its program.
@@ -365,17 +421,11 @@ asset=''
 want=''
 sum_known=''
 release_sum() {
-    local arch sums
+    local arch sums=$sums_file
     if [ -n "$sum_known" ]; then [ "$sum_known" = yes ]; return; fi
     sum_known=no
-    [ "$(uname -s)" = Darwin ] || return 1
-    case "$(uname -m)" in
-        arm64 | aarch64 ) arch=arm64 ;;
-        x86_64 ) arch=x86_64 ;;
-        * ) return 1 ;;
-    esac
+    arch=$(release_arch) || return 1
     asset="hxprobe-$version-macos-$arch"
-    sums=${HXPROBE_SUMS:-$repo/release/SHA256SUMS}
     [ -f "$sums" ] || return 1
     # Lines are `<sha256>  <asset>` (an optional `*` before the name is the
     # binary-mode marker of shasum). Blank lines and `#` comments are skipped.
@@ -391,16 +441,46 @@ release_sum() {
     sum_known=yes
 }
 
-# Succeeds when the installed program is to be run: it reports the wanted
-# version or a newer one. A newer one is kept (never downgrade: clients with
-# different plugin versions would otherwise reinstall on every start). A
-# program of the wanted version that was built here is not run as it is while
-# a release program is listed for it: `upgrade` is then 1, and the release
-# program is tried first, unless that failed a short while ago.
+# The sum in the origin record (`release <sha256>`), or nothing.
+origin_sum() {
+    local o='' s=''
+    if [ -f "$origin_file" ]; then read -r o s _ < "$origin_file" || true; fi
+    if [ "$o" = release ]; then printf '%s\n' "$s"; fi
+}
+
+# Succeeds when the installed program is to be run. Its SHA-256 is looked up
+# first: a listed program has the version of its asset name and is not run to
+# ask it. Only a program that is not listed is asked with --version: it is to
+# be run when it reports the wanted version or a newer one. A newer one is
+# kept (never downgrade: clients with different plugin versions would
+# otherwise reinstall on every start). A program of the wanted version that
+# was built here is not run as it is while a release program is listed for
+# it: `upgrade` is then 1, and the release program is tried first, unless
+# that failed a short while ago. A release program of the wanted version
+# whose sum is no longer the listed one changed after the install: it is not
+# run at all, `changed` is then 1.
 upgrade=0
+changed=0
 installed_ok() {
-    local have
+    local have got
     upgrade=0
+    changed=0
+    [ -f "$bin" ] && [ -x "$bin" ] || return 1
+    have=$(listed_version "$bin")
+    if [ -n "$have" ]; then
+        case "$(version_cmp "$have" "$version")" in
+            0 ) return 0 ;;
+            1 ) log "hxprobe $have at $bin is newer than $version of this plugin; running it"
+                return 0 ;;
+        esac
+        return 1
+    fi
+    got=$(file_sum "$bin")
+    if [ -n "$got" ] && [ "$(installed_origin)" = release ] && release_sum \
+            && [ "$(origin_sum)" = "$want" ] && [ "$got" != "$want" ]; then
+        changed=1
+        return 1
+    fi
     have=$(installed_version)
     [ -n "$have" ] || return 1
     case "$(version_cmp "$have" "$version")" in
@@ -683,12 +763,17 @@ try_download() {
 if [ "$upgrade" = 1 ]; then
     log "hxprobe $version at $bin was built here and a release program is listed; replacing it"
 fi
+if [ "$changed" = 1 ]; then
+    log "hxprobe $version at $bin does not match the checksum of $asset it was installed with; it changed since the install and is not run. Downloading it again"
+fi
 # The install itself runs outside the `if` condition, where set -e applies.
 downloaded=0
 try_download || downloaded=$?
 if [ "$downloaded" = 0 ]; then
     install_and_run "$tmp_file" "release $want" ${1+"$@"}
 fi
+# A changed release file is never run, also not when the download failed.
+[ "$changed" = 0 ] || die "the installed hxprobe $version at $bin does not match its checksum in $sums_file and the release program could not be downloaded again; the changed file was not run. Remove it and start again, or set HXPROBE_BIN."
 if [ "$downloaded" = 2 ] || [ "$upgrade" = 1 ]; then
     # Not a reason to build while a program that answers is installed. With
     # `upgrade` this is the built program of the wanted version.
