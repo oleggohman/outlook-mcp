@@ -595,6 +595,20 @@ if [ "$rc" = 1 ] && [[ "$err" == *'https://rustup.rs'* ]] && [[ "$err" != *'with
     && [ -f "$r/inst/install.lock" ] && lock_free "$r/inst"; then pass "$t"
 else fail "$t" "rc=$rc out='$out' err='$err'"; fi
 
+# A link in the place of the lock file is not followed: the file it names
+# keeps its mode and is not opened.
+t='lock file is a link'
+r=$(make_repo)
+mkdir -p "$r/inst"
+: > "$r/elsewhere"
+chmod 644 "$r/elsewhere"
+ln -s "$r/elsewhere" "$r/inst/install.lock"
+run "$r" PATH="$nocargo_path" --
+if [ "$rc" = 1 ] && [ -z "$out" ] && [[ "$err" == *"$r/inst/install.lock is a symbolic link"* ]] \
+    && [[ "$err" != *'https://rustup.rs'* ]] && [ -L "$r/inst/install.lock" ] \
+    && [ "$(mode_of "$r/elsewhere")" = 644 ] && [ ! -s "$r/elsewhere" ]; then pass "$t"
+else fail "$t" "rc=$rc out='$out' target mode=$(mode_of "$r/elsewhere") err='$err'"; fi
+
 t='live lock'
 r=$(make_repo)
 mkdir -p "$r/inst/bin"

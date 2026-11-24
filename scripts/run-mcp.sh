@@ -628,6 +628,8 @@ acquire_lock() {
         log "neither lockf nor flock found; installing without a lock"
         return 0
     fi
+    # chmod and the redirection below would follow a link to another file.
+    [ ! -L "$lock" ] || die "$lock is a symbolic link; remove it and start again"
     # An earlier launcher used a directory of this name holding a `pid` file.
     if [ -d "$lock" ]; then
         rm -f "$lock/pid" 2>/dev/null || true
