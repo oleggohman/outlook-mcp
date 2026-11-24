@@ -3,8 +3,10 @@
 # and the program is a small shell script that prints its arguments.
 # Each case runs against a temporary copy of the repository layout, so the
 # real release/SHA256SUMS is never touched, and with HOME, the install
-# directory (HXPROBE_INSTALL_DIR) and the plugin data directory
-# (CLAUDE_PLUGIN_DATA) in a temporary directory.
+# directory (HXPROBE_INSTALL_DIR), the shared directory (HXPROBE_SHARED_DIR)
+# and the plugin data directory (CLAUDE_PLUGIN_DATA) in a temporary
+# directory. Every start of the launcher goes through `guard_shared`, so no
+# case can reach the real shared directory.
 
 set -euo pipefail
 
@@ -14,6 +16,27 @@ version=9.8.7
 
 root=$(mktemp -d "${TMPDIR:-/tmp}/test-run-mcp.XXXXXX")
 trap 'rm -rf "$root"' EXIT
+
+# The real shared directory of the launcher. The tests must leave it as they
+# found it (absent, or the same inode and times); checked at the end.
+real_shared=$(sed -n 's/^shared_default=//p' "$launcher")
+[ -n "$real_shared" ] || real_shared=/Users/Shared/hxprobe
+real_state() { stat -f '%i %m %c' "$real_shared" 2>/dev/null || echo none; }
+real_before=$(real_state)
+
+# The shared directory of the case in repo $1: inside the case, with a space
+# in the path (the real default has none, the fallback under HOME has one).
+shared_of() { printf '%s\n' "$1/Shared Folder/hxprobe"; }
+
+# Stops the whole test unless $1, the HXPROBE_SHARED_DIR a launcher is about
+# to get, lies inside the test's temp directory.
+guard_shared() {
+    case "$1" in
+        "$root"/?* ) ;;
+        * ) printf 'FATAL: HXPROBE_SHARED_DIR=%s is not inside %s; no launcher is started\n' "$1" "$root"
+            exit 2 ;;
+    esac
+}
 
 case "$(uname -m)" in
     arm64 | aarch64 ) arch=arm64 ;;
@@ -91,7 +114,10 @@ EOF
 make_repo() {
     local r
     r=$(mktemp -d "$root/repo.XXXXXX")
-    mkdir -p "$r/scripts" "$r/hxprobe" "$r/release"
+    mkdir -p "$r/scripts" "$r/hxprobe" "$r/release" "$(dirname "$(shared_of "$r")")"
+    # The parent of the shared directory, like /Users/Shared: the user's own,
+    # not writable by others.
+    chmod 755 "$(dirname "$(shared_of "$r")")"
     cp "$launcher" "$r/scripts/run-mcp.sh"
     cat > "$r/hxprobe/Cargo.toml" <<EOF
 [package]
@@ -109,23 +135,33 @@ EOF
 # Runs the launcher of repo $1 with the remaining arguments as `env` settings
 # followed by `--` and launcher arguments. Sets out, err, rc. The launcher
 # starts with fd 9 open, as it would under a parent that leaks one. The
-# install directory is $1/inst and the plugin data directory $1/data unless
-# the settings say otherwise (an empty value selects the default). The
-# setting NOHOME runs it without HOME in the environment.
+# install directory is $1/inst, the shared directory `shared_of $1` and the
+# plugin data directory $1/data unless the settings say otherwise (an empty
+# value selects the default; HXPROBE_SHARED_DIR must stay inside the test's
+# temp directory). The setting NOHOME runs it without HOME in the
+# environment.
 run() {
     local r=$1
     shift
-    local envs='' home="$root/home" nohome=''
+    local envs='' home="$root/home" nohome='' shared
+    shared=$(shared_of "$r")
+    guard_shared "$shared"
     while [ "$1" != -- ]; do
-        if [ "$1" = NOHOME ]; then nohome='-u HOME'; home=''; else envs="$envs $1"; fi
+        case "$1" in
+            NOHOME ) nohome='-u HOME'; home='' ;;
+            # Kept apart from the other settings: its value may hold a space.
+            HXPROBE_SHARED_DIR=* ) shared=${1#HXPROBE_SHARED_DIR=}; guard_shared "$shared" ;;
+            * ) envs="$envs $1" ;;
+        esac
         shift
     done
     shift
     rc=0
     # shellcheck disable=SC2086
     env -u HXPROBE_BIN -u HXPROBE_RELEASE_BASE -u HXPROBE_SUMS -u CLAUDE_PLUGIN_DATA \
-        -u HXPROBE_INSTALL_DIR $nohome \
-        ${home:+HOME="$home"} HXPROBE_INSTALL_DIR="$r/inst" CLAUDE_PLUGIN_DATA="$r/data" $envs \
+        -u HXPROBE_INSTALL_DIR -u HXPROBE_SHARED_DIR $nohome \
+        ${home:+HOME="$home"} HXPROBE_INSTALL_DIR="$r/inst" HXPROBE_SHARED_DIR="$shared" \
+        CLAUDE_PLUGIN_DATA="$r/data" $envs \
         bash "$r/scripts/run-mcp.sh" "$@" > "$root/out" 2> "$root/err" 9> "$root/fd9" || rc=$?
     out=$(cat "$root/out")
     err=$(cat "$root/err")
@@ -151,6 +187,27 @@ make_curl_fail() {
     mkdir -p "$1/stub"
     printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "%s/curl-args"\nexit 22\n' "$1" > "$1/stub/curl"
     chmod 755 "$1/stub/curl"
+}
+
+# An ls stub in $1/stub that shows uid $2 as the owner (third column of the
+# first line) of every path at or under the shared directory of repo $1, and
+# runs /bin/ls unchanged for everything else. It simulates a directory of
+# another account (or of root, uid 0) without one.
+make_ls_owner() {
+    local s
+    s=$(shared_of "$1")
+    mkdir -p "$1/stub"
+    cat > "$1/stub/ls" <<EOF
+#!/bin/sh
+for a; do p=\$a; done
+case "\$p" in
+    '$s' | '$s'/* )
+        out=\$(/bin/ls "\$@") || exit \$?
+        printf '%s\n' "\$out" | awk -v u='$2' 'NR == 1 { \$3 = u } { print }' ;;
+    * ) exec /bin/ls "\$@" ;;
+esac
+EOF
+    chmod 755 "$1/stub/ls"
 }
 
 # The pid of a process that has ended.
@@ -203,12 +260,15 @@ EOF
 # Sets bad to the number that failed or printed something else than the
 # server output.
 run_many() {
-    local r=$1 n=$2 path=$3 i pids='' p
+    local r=$1 n=$2 path=$3 i pids='' p shared
+    shared=$(shared_of "$r")
+    guard_shared "$shared"
     bad=0
     i=0
     while [ "$i" -lt "$n" ]; do
-        env -u HXPROBE_BIN -u HXPROBE_RELEASE_BASE -u HXPROBE_SUMS \
+        env -u HXPROBE_BIN -u HXPROBE_RELEASE_BASE -u HXPROBE_SUMS -u HXPROBE_SHARED_DIR \
             HOME="$root/home" HXPROBE_INSTALL_DIR="$r/inst" CLAUDE_PLUGIN_DATA="$r/data" \
+            HXPROBE_SHARED_DIR="$shared" \
             PATH="$path" bash "$r/scripts/run-mcp.sh" > "$r/out.$i" 2> "$r/err.$i" &
         pids="$pids $!"
         i=$((i + 1))
@@ -255,18 +315,20 @@ if [ "$rc" = 0 ] && [ "$out" = 'FAKE mcp' ] && [ -z "$err" ] \
     && [ ! -e "$r/curl-args" ] && [ -e "$r/data/bin/hxprobe-0.1.0" ]; then pass "$t"
 else fail "$t" "rc=$rc out='$out' err='$err' curl='$(cat "$r/curl-args" 2>/dev/null || true)'"; fi
 
-# (ii-b) Default install directory under HOME: the program is installed as
-# $HOME/Library/Application Support/hxprobe/bin/hxprobe, the directories
-# with mode 0700, and run from there.
+# (ii-b) Default install directory: the shared directory (HXPROBE_SHARED_DIR
+# stands in for /Users/Shared/hxprobe). The program is installed as
+# <shared>/bin/hxprobe and run from there, and nothing is created under HOME.
 t='default install dir'
 r=$(make_repo)
 make_asset "$r"
-d="$root/home/Library/Application Support/hxprobe"
+d=$(shared_of "$r")
+rm -rf "$root/home"
 run "$r" HXPROBE_INSTALL_DIR= HXPROBE_RELEASE_BASE="file://$r/rel" PATH="$nocargo_path" -- a b
-if [ "$rc" = 0 ] && [ "$out" = 'FAKE mcp a b' ] && [ "$(mode_of "$d")" = 700 ] \
-    && [ "$(mode_of "$d/bin")" = 700 ] && [ "$(mode_of "$d/bin/hxprobe")" = 700 ] \
-    && [ "$(cat "$r/ran.path")" = "$d/bin/hxprobe" ] && [ ! -e "$r/inst" ]; then pass "$t"
-else fail "$t" "rc=$rc out='$out' modes=$(mode_of "$d")/$(mode_of "$d/bin") err='$err'"; fi
+if [ "$rc" = 0 ] && [ "$out" = 'FAKE mcp a b' ] && [ "$(cat "$r/ran.path")" = "$d/bin/hxprobe" ] \
+    && cmp -s "$d/bin/hxprobe" "$r/rel/v$version/$asset" \
+    && [[ "$(origin_of "$d")" == 'release '* ]] && [[ "$err" != *'was not used'* ]] \
+    && [ ! -e "$root/home" ] && [ ! -e "$r/inst" ] && lock_free "$d"; then pass "$t"
+else fail "$t" "rc=$rc out='$out' ran='$(cat "$r/ran.path" 2>/dev/null || true)' err='$err'"; fi
 rm -rf "$root/home"
 
 # (iii) Download with a matching checksum: installed as <install dir>/bin/hxprobe
@@ -567,7 +629,9 @@ r=$(make_repo)
 mkdir -p "$r/rel/v$version"
 make_fake "$r/rel/v$version/$asset" "$r/ran" 'sleep 2' "$version"
 printf '%s  %s\n' "$(shasum -a 256 "$r/rel/v$version/$asset" | awk '{print $1}')" "$asset" > "$r/release/SHA256SUMS"
-env -u HXPROBE_BIN -u HXPROBE_SUMS HOME="$root/home" HXPROBE_INSTALL_DIR="$r/inst" \
+guard_shared "$(shared_of "$r")"
+env -u HXPROBE_BIN -u HXPROBE_SUMS -u HXPROBE_SHARED_DIR HOME="$root/home" HXPROBE_INSTALL_DIR="$r/inst" \
+    HXPROBE_SHARED_DIR="$(shared_of "$r")" \
     CLAUDE_PLUGIN_DATA="$r/data" HXPROBE_RELEASE_BASE="file://$r/rel" PATH="$nocargo_path" \
     bash "$r/scripts/run-mcp.sh" > "$r/out" 2> "$r/err" 9> "$root/fd9" &
 pid=$!
@@ -631,9 +695,10 @@ sleep 30
 EOF
     fi
     chmod 755 "$r/stub"/*
-    env -u HXPROBE_BIN -u HXPROBE_RELEASE_BASE -u HXPROBE_SUMS \
+    guard_shared "$(shared_of "$r")"
+    env -u HXPROBE_BIN -u HXPROBE_RELEASE_BASE -u HXPROBE_SUMS -u HXPROBE_SHARED_DIR \
         HOME="$root/home" HXPROBE_INSTALL_DIR="$r/inst" CLAUDE_PLUGIN_DATA="$r/data" \
-        PATH="$r/stub:$nocargo_path" \
+        HXPROBE_SHARED_DIR="$(shared_of "$r")" PATH="$r/stub:$nocargo_path" \
         bash "$r/scripts/run-mcp.sh" > "$r/out" 2> "$r/err" &
     pid=$!
     i=0
@@ -675,9 +740,10 @@ chmod 755 "$r/stub/lockf"
 holder=$!
 i=0
 while lock_free "$r/inst" && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
-env -u HXPROBE_BIN -u HXPROBE_RELEASE_BASE -u HXPROBE_SUMS \
+guard_shared "$(shared_of "$r")"
+env -u HXPROBE_BIN -u HXPROBE_RELEASE_BASE -u HXPROBE_SUMS -u HXPROBE_SHARED_DIR \
     HOME="$root/home" HXPROBE_INSTALL_DIR="$r/inst" CLAUDE_PLUGIN_DATA="$r/data" \
-    PATH="$r/stub:$nocargo_path" \
+    HXPROBE_SHARED_DIR="$(shared_of "$r")" PATH="$r/stub:$nocargo_path" \
     bash "$r/scripts/run-mcp.sh" > "$r/out" 2> "$r/err" &
 pid=$!
 # Two lockf runs: the attempt that fails at once and the one that waits.
@@ -705,7 +771,9 @@ wait "$holder" 2>/dev/null || true
 
 # (x) HOME unset or empty. With an install directory given the launcher
 # needs no HOME (the plugin data directory then has no default, so no legacy
-# programs are looked for); without one it says what to set.
+# programs are looked for). Without one the shared directory is used, which
+# needs no HOME either; when that cannot be used, the launcher stops and says
+# what to set.
 for how in unset empty; do
     t="HOME $how"
     if [ "$how" = unset ]; then nohome=NOHOME; else nohome='HOME='; fi
@@ -716,11 +784,20 @@ for how in unset empty; do
     r2=$(make_repo)
     make_asset "$r2"
     run "$r2" "$nohome" HXPROBE_INSTALL_DIR= HXPROBE_RELEASE_BASE="file://$r2/rel" PATH="$nocargo_path" --
+    rc2=$rc; out2=$out; err2=$err
+    r3=$(make_repo)
+    make_asset "$r3"
+    run "$r3" "$nohome" HXPROBE_INSTALL_DIR= HXPROBE_SHARED_DIR="$r3/missing/hxprobe" \
+        HXPROBE_RELEASE_BASE="file://$r3/rel" PATH="$nocargo_path" --
     if [ "$rc1" = 0 ] && [ "$out1" = 'FAKE mcp a' ] && [ "$(cat "$r/ran.path")" = "$r/inst/bin/hxprobe" ] \
         && [[ "$err1" != *'unbound variable'* ]] \
-        && [ "$rc" = 1 ] && [ -z "$out" ] && [ ! -e "$r2/ran" ] \
+        && [ "$rc2" = 0 ] && [ "$out2" = 'FAKE mcp' ] \
+        && [ "$(cat "$r2/ran.path" 2>/dev/null || true)" = "$(shared_of "$r2")/bin/hxprobe" ] \
+        && [[ "$err2" != *'unbound variable'* ]] \
+        && [ "$rc" = 1 ] && [ -z "$out" ] && [ ! -e "$r3/ran" ] && [ ! -e "$r3/missing" ] \
+        && [[ "$err" == *'was not used'* ]] \
         && [[ "$err" == *'HOME is not set; set HXPROBE_INSTALL_DIR'* ]]; then pass "$t"
-    else fail "$t" "rc=$rc1/$rc out='$out1' err='$err1' / '$err'"; fi
+    else fail "$t" "rc=$rc1/$rc2/$rc out='$out1'/'$out2' err='$err1' / '$err2' / '$err'"; fi
 done
 
 # (xi) The install directory must belong to the user, and its mode must be
@@ -1022,20 +1099,151 @@ if [ "$rc" = 0 ] && [ "$out" = 'FAKE mcp' ] && [ -z "$err" ] && [ ! -e "$r/curl-
     && [ ! -e "$r/builds" ]; then pass "$t"
 else fail "$t" "rc=$rc out='$out' err='$err'"; fi
 
-# (xviii) The cargo build with a space in the install path (the default one
-# under HOME has one): the build directory is passed to cargo in one piece
-# and the program is installed and run from that path.
+# (xviii) The cargo build with a space in the install path (the shared
+# directory of the tests has one, the fallback under HOME too): the build
+# directory is passed to cargo in one piece and the program is installed and
+# run from that path.
 t='cargo build, space in the install path'
 r=$(make_repo)
 make_cargo_stub "$r" 'for a; do printf "%s\n" "$a"; done > "'"$r"'/cargo-argv"'
-d="$root/home/Library/Application Support/hxprobe"
+d=$(shared_of "$r")
+rm -rf "$root/home"
 run "$r" HXPROBE_INSTALL_DIR= PATH="$r/stub:$nocargo_path" -- 'a b'
 target=$(awk 'prev == "--target-dir" { print; exit } { prev = $0 }' "$r/cargo-argv" 2>/dev/null || true)
 if [ "$rc" = 0 ] && [ "$out" = 'BUILT mcp a b' ] && [ -x "$d/bin/hxprobe" ] \
     && [[ "$target" == "$d/target."* ]] && [ "$(origin_of "$d")" = build ] \
-    && [ "$(leftovers "$d")" = 0 ] && lock_free "$d" && [ ! -e "$r/inst" ]; then pass "$t"
+    && [ "$(leftovers "$d")" = 0 ] && lock_free "$d" && [ ! -e "$r/inst" ] \
+    && [ ! -e "$root/home" ]; then pass "$t"
 else fail "$t" "rc=$rc out='$out' target='$target' err='$err'"; fi
 rm -rf "$root/home"
+
+# (xix) Which shared directory is used. A chain that is not the user's own
+# (or root's, from a later step) is never used: the launcher falls back to
+# $HOME/Library/Application Support/hxprobe, says why, and writes nothing
+# through or into the shared path.
+own_dir="$root/home/Library/Application Support/hxprobe"
+
+# A listing of everything at and below $1 (not following links): name, mode,
+# inode, modification time and size, or `none`.
+tree_state() {
+    if [ -e "$1" ] || [ -L "$1" ]; then
+        find "$1" -exec stat -f '%N %p %i %m %z' {} + 2>/dev/null || true
+    else
+        echo none
+    fi
+}
+
+# Succeeds when the last run fell back from shared directory $1 of repo $r:
+# the release program was installed into and run from the per-user
+# directory, and stderr names the shared program and a reason with $2.
+fell_back() {
+    [ "$rc" = 0 ] && [ "$out" = 'FAKE mcp' ] \
+        && [ "$(cat "$r/ran.path" 2>/dev/null || true)" = "$own_dir/bin/hxprobe" ] \
+        && [[ "$err" == *"the shared program $1/bin/hxprobe was not used ("*"$2"*"); a device profile for that path does not cover this program"* ]]
+}
+
+# Another uid than the one running the tests.
+other_uid=4242
+if [ "$(id -u)" = "$other_uid" ]; then other_uid=4243; fi
+
+for kind in 'a link to a directory' 'a regular file' 'bin is a link' 'the program is a link' \
+        'mode 775' 'mode 777' 'an access list' 'the parent is missing' \
+        'the parent is writable by others' 'another owner' 'root owner'; do
+    t="shared directory not used: $kind"
+    r=$(make_repo)
+    make_asset "$r"
+    rm -rf "$root/home"
+    s=$(shared_of "$r")
+    mkdir -p "$r/elsewhere"
+    phrase=''
+    case "$kind" in
+        'a link to a directory' ) ln -s "$r/elsewhere" "$s"; phrase="$s is a symbolic link" ;;
+        'a regular file' ) printf 'x\n' > "$s"; phrase="$s is not a directory" ;;
+        'bin is a link' ) mkdir -m 755 "$s"; ln -s "$r/elsewhere" "$s/bin"; phrase="$s/bin is a symbolic link" ;;
+        'the program is a link' )
+            mkdir -m 755 "$s" "$s/bin"
+            make_fake "$r/elsewhere/hxprobe" "$r/link-ran" '' "$version"
+            ln -s "$r/elsewhere/hxprobe" "$s/bin/hxprobe"
+            phrase="$s/bin/hxprobe is a symbolic link" ;;
+        'mode 775' | 'mode 777' )
+            mkdir "$s"; chmod "${kind#mode }" "$s"; phrase="$s is writable by group or others" ;;
+        'an access list' )
+            mkdir -m 755 "$s"
+            chmod +a 'group:everyone allow list' "$s"
+            phrase="$s has an access control list" ;;
+        'the parent is missing' ) s="$r/missing/hxprobe"; phrase="$r/missing does not exist" ;;
+        'the parent is writable by others' )
+            chmod 777 "$(dirname "$s")"; phrase="$(dirname "$s") is writable by others and not sticky" ;;
+        'another owner' | 'root owner' )
+            # A chain of another account with the release program, whatever
+            # its checksum: the ls stub shows another owner.
+            mkdir -m 755 "$s" "$s/bin"
+            cp "$r/rel/v$version/$asset" "$s/bin/hxprobe"
+            echo "release $(awk '{ print $1 }' "$r/release/SHA256SUMS")" > "$s/bin/.origin"
+            if [ "$kind" = 'root owner' ]; then
+                make_ls_owner "$r" 0; phrase="$s is owned by root"
+            else
+                make_ls_owner "$r" "$other_uid"; phrase="$s is owned by another account (uid $other_uid)"
+            fi ;;
+    esac
+    before=$(tree_state "$s"; tree_state "$r/elsewhere")
+    run "$r" HXPROBE_INSTALL_DIR= HXPROBE_SHARED_DIR="$s" HXPROBE_RELEASE_BASE="file://$r/rel" \
+        PATH="$r/stub:$nocargo_path" --
+    after=$(tree_state "$s"; tree_state "$r/elsewhere")
+    if fell_back "$s" "$phrase" && [ "$after" = "$before" ] && [ ! -e "$r/link-ran" ] \
+        && [ "$(origin_of "$own_dir")" != none ] && lock_free "$own_dir"; then pass "$t"
+    else fail "$t" "rc=$rc out='$out' ran='$(cat "$r/ran.path" 2>/dev/null || true)' changed=$([ "$after" = "$before" ] && echo no || echo yes) err='$err'"; fi
+done
+rm -rf "$root/home"
+
+# A parent that everyone may write to but that is sticky, as /Users/Shared
+# is (mode 1777), is safe: the shared directory is created and used.
+t='shared directory in a sticky parent'
+r=$(make_repo)
+make_asset "$r"
+s=$(shared_of "$r")
+chmod 1777 "$(dirname "$s")"
+run "$r" HXPROBE_INSTALL_DIR= HXPROBE_RELEASE_BASE="file://$r/rel" PATH="$nocargo_path" --
+if [ "$rc" = 0 ] && [ "$out" = 'FAKE mcp' ] && [ "$(cat "$r/ran.path")" = "$s/bin/hxprobe" ] \
+    && [ ! -e "$root/home" ]; then pass "$t"
+else fail "$t" "rc=$rc out='$out' err='$err'"; fi
+
+# The second look after mkdir: what is on disk decides, not what mkdir
+# reported. A mkdir stub that makes the shared directory and then fails (as
+# when another start made it in between) leads to the install there; one
+# that puts a link at the shared path and fails leads to the fallback.
+for kind in 'made it' 'left a link'; do
+    t="mkdir fails and $kind"
+    r=$(make_repo)
+    make_asset "$r"
+    rm -rf "$root/home"
+    s=$(shared_of "$r")
+    mkdir -p "$r/elsewhere" "$r/stub"
+    if [ "$kind" = 'made it' ]; then act='/bin/mkdir "$@"'; else act="ln -s '$r/elsewhere' '$s'"; fi
+    cat > "$r/stub/mkdir" <<EOF
+#!/bin/sh
+for a; do p=\$a; done
+if [ "\$p" = '$s' ]; then $act; exit 1; fi
+exec /bin/mkdir "\$@"
+EOF
+    chmod 755 "$r/stub/mkdir"
+    run "$r" HXPROBE_INSTALL_DIR= HXPROBE_RELEASE_BASE="file://$r/rel" PATH="$r/stub:$nocargo_path" --
+    if [ "$kind" = 'made it' ]; then
+        if [ "$rc" = 0 ] && [ "$out" = 'FAKE mcp' ] && [ "$(cat "$r/ran.path")" = "$s/bin/hxprobe" ] \
+            && [[ "$err" != *'was not used'* ]] && [ ! -e "$root/home" ]; then pass "$t"
+        else fail "$t" "rc=$rc out='$out' err='$err'"; fi
+    else
+        if fell_back "$s" "$s is a symbolic link" && [ "$(tree_state "$r/elsewhere" | wc -l | tr -d ' ')" = 1 ]; then pass "$t"
+        else fail "$t" "rc=$rc out='$out' err='$err'"; fi
+    fi
+done
+rm -rf "$root/home"
+
+# (last) No case reached the real shared directory: it is as it was before
+# the run (absent, or the same inode and times).
+t='real shared directory untouched'
+if [ "$(real_state)" = "$real_before" ]; then pass "$t"
+else fail "$t" "$real_shared was '$real_before' before the run and is '$(real_state)' now"; fi
 
 if [ "$failures" -ne 0 ]; then
     printf '%d case(s) failed\n' "$failures"

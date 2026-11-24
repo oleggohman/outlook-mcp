@@ -11,6 +11,29 @@
 # lock. The server starts its refresh service from its own path, so it is
 # always started from the stable path.
 #
+# The default install directory is /Users/Shared/hxprobe, the same path for
+# every account, so that one device profile can grant Full Disk Access to
+# /Users/Shared/hxprobe/bin/hxprobe. The server starts its service from that
+# file on every service start, for as long as it runs, so only a directory
+# that nobody else can change is used. Its parent must be owned by root or
+# the current user and be sticky or closed to group and others. The chain
+# directory, bin, program is then read with `ls -ldn` and classified:
+#   absent  the directory does not exist: it is made (umask 022) and the
+#           chain is classified again from what is on disk;
+#   own     every element a real directory or regular file of the current
+#           user, not writable by group or others, without an access list:
+#           used with all of the rules below;
+#   root    the same, owned by root: not used yet;
+#   other   anything else (a link anywhere, another file type, a write bit
+#           for group or others, an access list, another account, mixed
+#           owners): not used. An own directory that is or was open to
+#           others is not tightened, since its content can no longer be
+#           vouched for.
+# When the shared directory is not used, the launcher says why on stderr and
+# falls back to $HOME/Library/Application Support/hxprobe, the user's own
+# directory with mode 0700. An explicit HXPROBE_INSTALL_DIR follows the rules
+# of that fallback directory.
+#
 # Where the installed program came from is recorded next to it in
 # bin/.origin: `release <sha256>` for a verified download, `build` for a
 # cargo build (no record counts as `build`). A built program of the wanted
@@ -29,9 +52,12 @@
 #
 # Environment:
 #   HXPROBE_BIN           run this program instead of installing one
-#   HXPROBE_INSTALL_DIR   install directory (default:
-#                         $HOME/Library/Application Support/hxprobe; required
-#                         when HOME is not set)
+#   HXPROBE_INSTALL_DIR   install directory (default: the shared directory,
+#                         or $HOME/Library/Application Support/hxprobe when
+#                         that is not used; required when neither can be
+#                         used)
+#   HXPROBE_SHARED_DIR    replaces the shared directory /Users/Shared/hxprobe;
+#                         meant for tests
 #   CLAUDE_PLUGIN_DATA    plugin data directory (set by Claude Code); only
 #                         what earlier launchers left there is removed after
 #                         an install: bin/hxprobe-<version>, target,
@@ -82,12 +108,143 @@ case "$version" in
     *[!0-9A-Za-z.+-]* ) die "unexpected version '$version' in $manifest" ;;
 esac
 
-# HOME is only needed for the defaults; it may be unset or empty.
+# The default install directory, shared by every account of the Mac, so that
+# one device profile can grant Full Disk Access to its program.
+shared_default=/Users/Shared/hxprobe
+# The effective uid, which `-O` compares with too; from bash, not `id`.
+myuid=$EUID
+
+# Reads the owner uid, the mode string and the access-list mark of path $1
+# (not following a link) from `ls -ldn`: sets pi_type (`d`, `-`, `l`, ...),
+# pi_mode (the 10 characters `drwxr-xr-x`), pi_acl (yes or no) and pi_uid.
+# Fails when nothing exists at $1. On macOS `-e` also lists the entries of an
+# access list on lines of their own: the `+` mark is not shown for a file
+# that has extended attributes as well (`@` takes its place).
+path_info() {
+    local out first m uid
+    out=$(ls -ldne "$1" 2>/dev/null) || out=$(ls -ldn "$1" 2>/dev/null) || return 1
+    first=${out%%$'\n'*}
+    read -r m _ uid _ <<< "$first"
+    pi_type=${m:0:1}
+    pi_mode=${m:0:10}
+    pi_uid=$uid
+    pi_acl=no
+    if [ "${m:10:1}" = + ] || [ "$first" != "$out" ]; then pi_acl=yes; fi
+    case "$pi_uid" in
+        '' | *[!0-9]* ) return 1 ;;
+    esac
+}
+
+# Succeeds when the mode in pi_mode has a write bit for group or others.
+pi_open() { [ "${pi_mode:5:1}" != - ] || [ "${pi_mode:8:1}" != - ]; }
+
+# Succeeds when directory $1, the parent of the shared directory, is safe: a
+# real directory owned by root or the current user, and either sticky (as
+# /Users/Shared, mode 1777) or not writable by group and others. Otherwise
+# `reason` says why.
+parent_safe() {
+    if ! path_info "$1"; then reason="$1 does not exist"; return 1; fi
+    if [ "$pi_type" != d ]; then reason="$1 is not a directory"; return 1; fi
+    case "$pi_uid" in
+        0 | "$myuid" ) ;;
+        * ) reason="$1 is owned by another account (uid $pi_uid)"; return 1 ;;
+    esac
+    case "${pi_mode:9:1}" in
+        t | T ) return 0 ;;
+    esac
+    if pi_open; then reason="$1 is writable by others and not sticky"; return 1; fi
+}
+
+# Classifies the chain <dir>, <dir>/bin, <dir>/bin/hxprobe for shared
+# directory $1 from what is on disk. Sets `chain` to
+#   absent  <dir> does not exist;
+#   own     every element that exists is a real directory (the program a
+#           regular file), owned by the current user, not writable by group
+#           or others and without an access list; `bin` and the program may
+#           be missing;
+#   root    the same, owned by root;
+#   bad     anything else (a link anywhere, another file type, a write bit
+#           for group or others, an access list, another account, mixed
+#           owners); `reason` says why.
+classify_shared() {
+    local p kind owner=''
+    for p in "$1" "$1/bin" "$1/bin/hxprobe"; do
+        kind=d
+        if [ "$p" = "$1/bin/hxprobe" ]; then kind=-; fi
+        if ! path_info "$p"; then
+            if [ "$p" = "$1" ]; then chain=absent; return 0; fi
+            break
+        fi
+        chain=bad
+        if [ "$pi_type" = l ]; then reason="$p is a symbolic link"; return 0; fi
+        if [ "$pi_type" != "$kind" ]; then
+            if [ "$kind" = d ]; then reason="$p is not a directory"; else reason="$p is not a regular file"; fi
+            return 0
+        fi
+        if pi_open; then reason="$p is writable by group or others"; return 0; fi
+        if [ "$pi_acl" = yes ]; then reason="$p has an access control list"; return 0; fi
+        case "$pi_uid" in
+            0 | "$myuid" ) ;;
+            * ) reason="$p is owned by another account (uid $pi_uid)"; return 0 ;;
+        esac
+        if [ -z "$owner" ]; then
+            owner=$pi_uid
+        elif [ "$pi_uid" != "$owner" ]; then
+            reason="$p and $1 have different owners"
+            return 0
+        fi
+    done
+    if [ "$owner" = "$myuid" ]; then chain=own; else chain=root; fi
+}
+
+# Succeeds when shared directory $1 is to be used as the install directory:
+# its parent is safe and the chain is the user's own. An absent directory
+# (and a missing `bin` in it) is made with mkdir under umask 022, and the
+# chain is then classified again from what is on disk, whether mkdir
+# succeeded or not: a directory or link that another account put there in
+# between is judged like any other. Otherwise `reason` says why it is not
+# used. A root chain is not used yet.
+shared_usable() {
+    case "$1" in
+        /?* ) ;;
+        * ) reason="$1 is not an absolute path"; return 1 ;;
+    esac
+    parent_safe "$(dirname "$1")" || return 1
+    classify_shared "$1"
+    if [ "$chain" = absent ]; then
+        (umask 022 && mkdir "$1") 2>/dev/null || true
+        classify_shared "$1"
+        if [ "$chain" = absent ]; then reason="cannot create $1"; return 1; fi
+    fi
+    if [ "$chain" = own ] && ! [ -e "$1/bin" ] && ! [ -L "$1/bin" ]; then
+        (umask 022 && mkdir "$1/bin") 2>/dev/null || true
+        classify_shared "$1"
+    fi
+    case "$chain" in
+        own ) return 0 ;;
+        root ) reason="$1 is owned by root" ;;
+    esac
+    return 1
+}
+
+# HOME is only needed for the per-user defaults; it may be unset or empty.
 home=${HOME:-}
 inst=${HXPROBE_INSTALL_DIR:-}
+# Why the shared directory was not used; empty when it was, or when an
+# install directory was given.
+install_note=''
 if [ -z "$inst" ]; then
-    [ -n "$home" ] || die "HOME is not set; set HXPROBE_INSTALL_DIR"
-    inst="$home/Library/Application Support/hxprobe"
+    shared=${HXPROBE_SHARED_DIR:-$shared_default}
+    reason=''
+    if shared_usable "$shared"; then
+        inst=$shared
+    else
+        # Fall back to the user's own directory, with today's rules.
+        install_note="the shared program $shared/bin/hxprobe was not used ($reason); a device profile for that path does not cover this program"
+        [ -n "$home" ] || die "$install_note. HOME is not set; set HXPROBE_INSTALL_DIR"
+        inst="$home/Library/Application Support/hxprobe"
+        log "$install_note; using $inst/bin/hxprobe"
+    fi
 fi
 bindir="$inst/bin"
 bin="$bindir/hxprobe"
