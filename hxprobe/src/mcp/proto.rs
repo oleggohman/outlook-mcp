@@ -483,7 +483,8 @@ const MAX_NOTE_CHARS: usize = 300;
 
 /// The error for a store denied by the system, with the steps that fix it:
 /// the program to add under Full Disk Access (canonical when it can be
-/// resolved), then what to do after the grant. A note, as one line (see
+/// resolved), then what to do after the grant; the paths of the stop
+/// command are quoted for a shell (see [`shell_quoted`]). A note, as one line (see
 /// [`one_line`]), ends the text.
 pub fn denied_text(who: Denied, remedy: &Remedy, cache_dir: &Path) -> String {
     let program = remedy
@@ -506,9 +507,9 @@ pub fn denied_text(who: Denied, remedy: &Remedy, cache_dir: &Path) -> String {
             if let Some(p) = &program {
                 t.push_str(&format!(
                     " If the error stays, stop the service so that the next call starts a \
-                     fresh one: \"{}\" service --stop --cache-dir \"{}\".",
-                    p.display(),
-                    cache_dir.display()
+                     fresh one: {} service --stop --cache-dir {}.",
+                    shell_quoted(p),
+                    shell_quoted(cache_dir)
                 ));
             }
             t.push_str(&format!(" Log: {}", cache_dir.join(LOG_NAME).display()));
@@ -524,6 +525,12 @@ pub fn denied_text(who: Denied, remedy: &Remedy, cache_dir: &Path) -> String {
         text.push_str(&format!(" Note: {note}"));
     }
     text
+}
+
+/// `path` as one word of a shell command: in single quotes, where a shell
+/// takes every character as it is; a single quote in it is written `'\\''`.
+fn shell_quoted(path: &Path) -> String {
+    format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
 }
 
 /// `note` as one line of at most [`MAX_NOTE_CHARS`] characters: control
@@ -1005,14 +1012,13 @@ mod tests {
             "{t}"
         );
         assert!(t.contains(DENIED), "{t}");
-        assert_eq!(
-            t.matches("\"/nonexistent-hx/bin/hxprobe\"").count(),
-            2,
-            "{t}"
-        );
+        assert_eq!(t.matches("/nonexistent-hx/bin/hxprobe").count(), 2, "{t}");
+        assert!(t.contains("add \"/nonexistent-hx/bin/hxprobe\""), "{t}");
         assert!(t.contains("Full Disk Access"), "{t}");
         assert!(
-            t.contains("service --stop --cache-dir \"/nonexistent-hx/cache\""),
+            t.contains(
+                "'/nonexistent-hx/bin/hxprobe' service --stop --cache-dir '/nonexistent-hx/cache'"
+            ),
             "{t}"
         );
         assert!(t.contains("/nonexistent-hx/cache/service.log"), "{t}");
@@ -1022,8 +1028,8 @@ mod tests {
             "the refresh service cannot read the store: permission denied. Fix: open System \
              Settings, Privacy & Security, Full Disk Access, add \"/nonexistent-hx/bin/hxprobe\" \
              and turn it on; then call again after 10 seconds. If the error stays, stop the \
-             service so that the next call starts a fresh one: \"/nonexistent-hx/bin/hxprobe\" \
-             service --stop --cache-dir \"/nonexistent-hx/cache\". Log: \
+             service so that the next call starts a fresh one: '/nonexistent-hx/bin/hxprobe' \
+             service --stop --cache-dir '/nonexistent-hx/cache'. Log: \
              /nonexistent-hx/cache/service.log"
         );
     }
@@ -1062,10 +1068,39 @@ mod tests {
             denied_text(Denied::Service, &none, dir),
             denied_text(Denied::Server { cause: "x" }, &none, dir),
         ] {
-            assert!(!t.contains('"'), "{t}");
+            assert!(!t.contains(['"', '\'']), "{t}");
             assert!(t.contains("add the hxprobe program and turn it on"), "{t}");
             assert!(!t.contains("--stop"), "{t}");
         }
+    }
+
+    #[test]
+    fn stop_command_quotes_its_paths_for_a_shell() {
+        let r = Remedy {
+            program: Some(PathBuf::from("/nonexistent-hx/a \"b\" $c `d` e's/hxprobe")),
+            note: None,
+        };
+        let t = denied_text(Denied::Service, &r, Path::new("/nonexistent-hx/it's $HOME"));
+        // In single quotes a shell takes every character as it is; a single
+        // quote of the path ends them, stands escaped, and opens them again.
+        assert!(
+            t.contains(
+                "fresh one: '/nonexistent-hx/a \"b\" $c `d` e'\\''s/hxprobe' service --stop \
+                 --cache-dir '/nonexistent-hx/it'\\''s $HOME'. Log: "
+            ),
+            "{t}"
+        );
+        let out = std::process::Command::new("sh")
+            .args([
+                "-c",
+                &format!(
+                    "printf '%s\\n' {}",
+                    shell_quoted(Path::new("a \"b\" $c `d` e's"))
+                ),
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "a \"b\" $c `d` e's\n");
     }
 
     #[test]
@@ -1080,6 +1115,10 @@ mod tests {
         };
         let s = denied_text(Denied::Service, &r, &t.0);
         assert!(s.contains(&format!("\"{}\"", canonical.display())), "{s}");
+        assert!(
+            s.contains(&format!("'{}' service", canonical.display())),
+            "{s}"
+        );
     }
 
     #[test]

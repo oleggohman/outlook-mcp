@@ -1425,7 +1425,7 @@ fn assert_remedy(d: &Dir, e: &str) {
     assert!(e.contains("Full Disk Access"), "{e}");
     assert!(e.contains(&format!("\"{}\"", program.display())), "{e}");
     assert!(
-        e.contains(&format!("--cache-dir \"{}\"", d.cache().display())),
+        e.contains(&format!("--cache-dir '{}'", d.cache().display())),
         "{e}"
     );
 }
