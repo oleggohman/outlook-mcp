@@ -1171,15 +1171,28 @@ fn spawn_mcp_with(
     args: &[&str],
     configure: impl FnOnce(&mut Command),
 ) -> Mcp {
+    spawn_mcp_on(d, Some(store), cache, args, configure)
+}
+
+/// [`spawn_mcp_with`]; without a `store` there is no `--store`, and the
+/// server looks up the default store under `HOME`, which is `d`.
+fn spawn_mcp_on(
+    d: &Dir,
+    store: Option<&std::path::Path>,
+    cache: &std::path::Path,
+    args: &[&str],
+    configure: impl FnOnce(&mut Command),
+) -> Mcp {
     use std::io::BufRead;
     static N: AtomicUsize = AtomicUsize::new(0);
     let err =
         d.0.join(format!("mcp-{}.err", N.fetch_add(1, Ordering::Relaxed)));
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_hxprobe"));
-    cmd.arg("mcp")
-        .arg("--store")
-        .arg(store)
-        .arg("--cache-dir")
+    cmd.arg("mcp");
+    if let Some(store) = store {
+        cmd.arg("--store").arg(store);
+    }
+    cmd.arg("--cache-dir")
         .arg(cache)
         .args(args)
         .env_remove("HXPROBE_SERVICE")
@@ -1570,6 +1583,52 @@ fn server_serves_a_store_that_cannot_be_examined_and_names_the_remedy() {
         m.log()
     );
     assert_remedy(&d, &e);
+}
+
+#[test]
+fn server_whose_default_lookup_is_denied_names_the_remedy_and_starts_no_service() {
+    if is_root() {
+        return;
+    }
+    let _s = serial();
+    let d = Dir::new();
+    // The only profile is not the one the lookup guesses, and the profiles
+    // directory cannot be listed: the guess names no file.
+    let profiles =
+        d.0.join("Library/Group Containers/UBF8T346G9.Office/Outlook/Outlook 15 Profiles");
+    let store = profiles.join("Work").join("HxStore.hxd");
+    std::fs::create_dir_all(store.parent().unwrap()).unwrap();
+    std::fs::write(&store, empty_store()).unwrap();
+    let lock = Locked::new(&profiles, 0o300);
+    let mut m = spawn_mcp_on(&d, None, &d.cache(), &[], |_| {});
+    let e = m.tool_error("list_messages");
+    assert!(
+        e.starts_with("the refresh service cannot read the store: permission denied"),
+        "{e}\n{}",
+        m.log()
+    );
+    assert_remedy(&d, &e);
+    let st = m.tool("store_status");
+    assert_eq!(st["last_error"], e.as_str(), "{st}");
+    assert_eq!(st["service"]["running"], false, "{st}");
+    // No service was started on the guess.
+    assert_eq!(service_log(&d), "");
+    assert!(!d.sock().exists());
+    assert!(
+        !m.log().contains("starting the refresh service"),
+        "{}",
+        m.log()
+    );
+    // After the grant the next call is answered: no start was blocked.
+    drop(lock);
+    let list = m.tool("list_messages");
+    assert_eq!(list["total"], 0, "{list}");
+    assert!(list.get("warning").is_none(), "{list}");
+    let st = m.tool("store_status");
+    let canonical = std::fs::canonicalize(&store).unwrap();
+    assert_eq!(st["store_path"], canonical.to_str().unwrap(), "{st}");
+    assert_eq!(st["service"]["running"], true, "{st}");
+    assert_eq!(st["last_error"], Value::Null, "{st}");
 }
 
 #[test]

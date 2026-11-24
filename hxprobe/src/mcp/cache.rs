@@ -74,6 +74,11 @@ pub const FIRST_BUILD_PENDING: &str =
 /// server still has the database of before open).
 pub const OLDER_SERVER: &str = "this server is older than the mail cache; restart the MCP client";
 
+/// Error when no `--store` was given and the default lookup finds no store,
+/// or several (see [`find_default_store_in`]).
+pub const NO_DEFAULT_STORE: &str =
+    "no Outlook store found under the default profile directory; pass --store";
+
 /// Longest body text put in the search index, in chars.
 const MAX_FTS_BODY: usize = 200_000;
 
@@ -360,17 +365,48 @@ impl Cache {
     /// is told, and a `mail.db` refused under the old path may be tried
     /// again (it may be the one built for this path). A resolved path is
     /// never looked at again, so the store cannot change while it runs.
-    fn resolve_again(&mut self) {
-        let found = match &self.store_state {
-            StoreState::Resolved => return,
-            StoreState::Unresolved => std::fs::canonicalize(&self.store).ok(),
+    ///
+    /// Returns the error of this call when the default lookup failed again
+    /// and its guess names no file (the denial came from the profiles
+    /// directory or from another profile, or no profile is the default):
+    /// there is nothing to start a service or a build on, which would fail
+    /// with a text about a file that does not exist. The remedy for a
+    /// denial (see [`proto::denied_text`]), [`NO_DEFAULT_STORE`] otherwise.
+    /// A guess that is itself denied is left to the service or the build,
+    /// which report the denial (an older service may be allowed to read it).
+    fn resolve_again(&mut self) -> Option<String> {
+        let (found, lookup) = match &self.store_state {
+            StoreState::Resolved => return None,
+            StoreState::Unresolved => (std::fs::canonicalize(&self.store).ok(), None),
             StoreState::DeniedDefault(base) => match find_default_store_in(base) {
-                StoreLookup::Found(p) => std::fs::canonicalize(p).ok(),
-                StoreLookup::Missing | StoreLookup::Denied(_) => None,
+                StoreLookup::Found(p) => (std::fs::canonicalize(p).ok(), None),
+                StoreLookup::Missing => (None, Some((base, false))),
+                StoreLookup::Denied(_) => (None, Some((base, true))),
             },
         };
         let Some(store) = found else {
-            return;
+            let (base, denied) = lookup?;
+            let usable = match std::fs::metadata(&self.store) {
+                Ok(m) => m.is_file(),
+                Err(e) => e.kind() == ErrorKind::PermissionDenied,
+            };
+            if usable {
+                return None;
+            }
+            if !denied {
+                return Some(NO_DEFAULT_STORE.into());
+            }
+            return Some(if self.refresher.is_some() {
+                // As the client names the cache directory in this text.
+                let dir = std::path::absolute(&self.dir).unwrap_or_else(|_| self.dir.clone());
+                proto::denied_text(Denied::Service, &self.remedy, &dir)
+            } else {
+                let cause = format!(
+                    "the Outlook profiles in {} cannot be examined: permission denied",
+                    base.display()
+                );
+                proto::denied_text(Denied::Server { cause: &cause }, &self.remedy, &self.dir)
+            });
         };
         log(&format!("store path resolved: {}", store.display()));
         self.store = store;
@@ -379,11 +415,13 @@ impl Cache {
             r.set_store(&self.store);
         }
         self.rejected_id = None;
+        None
     }
 
-    /// What the error of a build that was denied the store names (see
-    /// [`proto::denied_text`]); without a refresher only, where this value
-    /// builds.
+    /// What the error of a denied store names (see [`proto::denied_text`]):
+    /// of a build that was denied it, without a refresher, where this value
+    /// builds; and of a default lookup that was denied (see
+    /// [`Cache::resolve_again`]).
     pub fn with_remedy(mut self, remedy: Remedy) -> Cache {
         self.remedy = remedy;
         self
@@ -451,11 +489,16 @@ impl Cache {
     ///
     /// First of all, a store path that is not resolved yet is tried again
     /// (see [`Cache::resolve_again`]); so is it in
-    /// [`Cache::force_refresh_at`].
+    /// [`Cache::force_refresh_at`]. While the default store is not known,
+    /// its error stands for the reply of the service (which is not asked,
+    /// so none is started), and nothing is built.
     pub fn connection_at(&mut self, now: i64) -> Result<&Connection, String> {
-        self.resolve_again();
+        let unknown = self.resolve_again();
         if let Some(r) = self.refresher.as_mut() {
-            let reply = r.touch(now);
+            let reply = match unknown {
+                Some(e) => Err(e),
+                None => r.touch(now),
+            };
             self.service = Some(ServiceView::of(&reply));
             self.reopen_if_replaced();
             if self.db.is_none() {
@@ -472,6 +515,10 @@ impl Cache {
                 .as_ref()
                 .map(|(c, _)| c)
                 .ok_or_else(|| "no database".to_string());
+        }
+        if let Some(e) = unknown {
+            self.last_error = Some(e.clone());
+            return Err(e);
         }
         if self.reopen_if_replaced() {
             if let Some((_, meta)) = &self.db {
@@ -524,16 +571,24 @@ impl Cache {
     /// the service's status is asked so that [`Cache::status`] shows the
     /// failure.
     pub fn force_refresh_at(&mut self, now: i64) -> Result<(), String> {
-        self.resolve_again();
+        let unknown = self.resolve_again();
         let Some(r) = self.refresher.as_mut() else {
+            if let Some(e) = unknown {
+                self.last_error = Some(e.clone());
+                return Err(e);
+            }
             return self.attempt(now, false);
         };
-        let reply = r.refresh(now);
+        let asked = unknown.is_none();
+        let reply = match unknown {
+            Some(e) => Err(e),
+            None => r.refresh(now),
+        };
         // The error of a failed refresh does not say how the service is
         // (a failed build, or no service): ask, so the status shows it.
         let view = match &reply {
-            Ok(_) => ServiceView::of(&reply),
-            Err(_) => ServiceView::of(&r.status(now)),
+            Err(_) if asked => ServiceView::of(&r.status(now)),
+            _ => ServiceView::of(&reply),
         };
         self.service = Some(view);
         self.reopen_if_replaced();
@@ -2007,6 +2062,144 @@ mod tests {
         let work = std::fs::canonicalize(base.join("Work").join("HxStore.hxd")).unwrap();
         assert_eq!(c.store_path(), work);
         assert_eq!(rec.stores(), [work]);
+    }
+
+    /// A profiles directory in `t` that cannot be listed (mode 0o300) with
+    /// the profiles `names`, each holding [`mail_store`]: the lookup is
+    /// denied and its guess, `Main Profile`, names no file.
+    fn unlisted_profiles(t: &TestDir, names: &[&str]) -> (PathBuf, PathBuf, Locked) {
+        let base = t.0.join("profiles");
+        for name in names {
+            profile(&base, name, false);
+            std::fs::write(base.join(name).join("HxStore.hxd"), mail_store()).unwrap();
+        }
+        let lock = Locked::new(&base, 0o300);
+        let StoreLookup::Denied(guess) = find_default_store_in(&base) else {
+            panic!("not denied");
+        };
+        assert!(!guess.exists());
+        (base, guess, lock)
+    }
+
+    #[test]
+    fn denied_default_with_a_missing_guess_is_the_remedy_and_asks_no_service() {
+        if is_root() {
+            return;
+        }
+        let t = TestDir::new("deniedguess");
+        let (base, guess, lock) = unlisted_profiles(&t, &["Work"]);
+        let (remedy, _) = remedy_in(&t);
+        let fake = FakeRefresher::new(Ok(fake_status(None)));
+        let mut c = Cache::new(&t.cache_dir(), &guess)
+            .unwrap()
+            .with_profiles_base(Some(base.clone()))
+            .with_remedy(remedy.clone())
+            .with_refresher(Box::new(fake.clone()))
+            .with_first_build_wait(WAIT, Duration::from_millis(10));
+        let text = proto::denied_text(Denied::Service, &remedy, &t.cache_dir());
+        assert_eq!(c.connection_at(NOW_I).unwrap_err(), text);
+        assert_eq!(c.force_refresh_at(NOW_I).unwrap_err(), text);
+        // No service was asked, so none was started on the guess.
+        assert_eq!(fake.counts(), (0, 0, 0));
+        let st = c.status();
+        assert_eq!(st.last_error, Some(text.as_str()));
+        assert!(!st.service.unwrap().running);
+        assert_eq!(c.store_path(), guess);
+
+        // Another profile directory that cannot be examined: the same.
+        drop(lock);
+        let lock = Locked::new(&base.join("Work"), 0o000);
+        assert_eq!(c.connection_at(NOW_I + 1).unwrap_err(), text);
+        assert_eq!(fake.counts(), (0, 0, 0));
+
+        // After the grant the store is found and the service is asked.
+        drop(lock);
+        assert_eq!(c.connection_at(NOW_I + 2).unwrap_err(), FIRST_BUILD_PENDING);
+        let work = std::fs::canonicalize(base.join("Work").join("HxStore.hxd")).unwrap();
+        assert_eq!(c.store_path(), work);
+        assert_eq!(fake.counts().0, 1);
+    }
+
+    #[test]
+    fn denied_default_that_is_missing_after_the_grant_says_so_and_asks_no_service() {
+        if is_root() {
+            return;
+        }
+        let t = TestDir::new("deniedmissing");
+        let (base, guess, lock) = unlisted_profiles(&t, &["Work", "Home"]);
+        let fake = FakeRefresher::new(Ok(fake_status(None)));
+        let mut c = Cache::new(&t.cache_dir(), &guess)
+            .unwrap()
+            .with_profiles_base(Some(base.clone()))
+            .with_refresher(Box::new(fake.clone()))
+            .with_first_build_wait(WAIT, Duration::from_millis(10));
+        assert!(c.connection_at(NOW_I).unwrap_err().contains(proto::DENIED));
+        // Two profiles hold a store: none is the default.
+        drop(lock);
+        for now in [NOW_I + 1, NOW_I + 100] {
+            assert_eq!(c.connection_at(now).unwrap_err(), NO_DEFAULT_STORE);
+        }
+        assert_eq!(
+            c.force_refresh_at(NOW_I + 101).unwrap_err(),
+            NO_DEFAULT_STORE
+        );
+        assert_eq!(fake.counts(), (0, 0, 0));
+        assert_eq!(c.status().last_error, Some(NO_DEFAULT_STORE));
+        // It is still looked up at every call.
+        std::fs::remove_file(base.join("Home").join("HxStore.hxd")).unwrap();
+        assert_eq!(
+            c.connection_at(NOW_I + 102).unwrap_err(),
+            FIRST_BUILD_PENDING
+        );
+        let work = std::fs::canonicalize(base.join("Work").join("HxStore.hxd")).unwrap();
+        assert_eq!(c.store_path(), work);
+    }
+
+    #[test]
+    fn denied_default_whose_guess_is_the_denied_path_asks_the_service() {
+        if is_root() {
+            return;
+        }
+        let t = TestDir::new("deniedmain");
+        let base = t.0.join("profiles");
+        profile(&base, "Main Profile", true);
+        let _lock = Locked::new(&base.join("Main Profile"), 0o000);
+        let StoreLookup::Denied(guess) = find_default_store_in(&base) else {
+            panic!("not denied");
+        };
+        // The service, perhaps an older one with access, answers for it.
+        let fake = FakeRefresher::new(Err("the service says".into()));
+        let mut c = Cache::new(&t.cache_dir(), &guess)
+            .unwrap()
+            .with_profiles_base(Some(base))
+            .with_refresher(Box::new(fake.clone()));
+        assert_eq!(c.connection_at(NOW_I).unwrap_err(), "the service says");
+        assert_eq!(fake.counts(), (1, 0, 0));
+    }
+
+    #[test]
+    fn denied_default_with_a_missing_guess_in_fallback_mode_builds_nothing() {
+        if is_root() {
+            return;
+        }
+        let t = TestDir::new("deniedguessfallback");
+        let (base, guess, lock) = unlisted_profiles(&t, &["Work"]);
+        let (remedy, program) = remedy_in(&t);
+        let mut c = Cache::new(&t.cache_dir(), &guess)
+            .unwrap()
+            .with_profiles_base(Some(base.clone()))
+            .with_remedy(remedy);
+        let e = c.connection_at(NOW_I).unwrap_err();
+        assert_server_denial(&e, &program);
+        assert!(e.contains(&base.display().to_string()), "{e}");
+        assert_eq!(c.force_refresh_at(NOW_I).unwrap_err(), e);
+        assert_eq!(c.builds, 0);
+        assert_eq!(c.status().last_error, Some(e.as_str()));
+        // After the grant the next call builds at once, whatever the interval.
+        drop(lock);
+        assert_eq!(messages(&mut c, NOW_I + 1), 4);
+        assert_eq!(c.builds, 1);
+        assert_eq!(c.status().last_error, None);
     }
 
     #[test]

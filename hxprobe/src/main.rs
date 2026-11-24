@@ -900,9 +900,7 @@ fn cmd_mcp(args: &[String]) {
         None => match cache::find_default_store() {
             cache::StoreLookup::Found(p) => (p, false),
             cache::StoreLookup::Denied(p) => (p, true),
-            cache::StoreLookup::Missing => fail(
-                "no Outlook store found under the default profile directory; pass --store".into(),
-            ),
+            cache::StoreLookup::Missing => fail(cache::NO_DEFAULT_STORE.into()),
         },
     };
     let examined = if denied_default {
@@ -912,6 +910,12 @@ fn cmd_mcp(args: &[String]) {
     };
     match examined {
         Ok(m) if m.is_file() => check_store_header(&store),
+        // The guess may name no file: the denial may be of another profile.
+        Err(_) if denied_default => log(&format!(
+            "the default store cannot be looked up: permission denied; serving anyway, \
+             guessing {}",
+            store.display()
+        )),
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => log(&format!(
             "{} cannot be examined: permission denied; serving anyway",
             store.display()
@@ -1192,9 +1196,7 @@ fn cmd_service(args: &[String]) {
         None => match cache::find_default_store() {
             cache::StoreLookup::Found(p) => p,
             cache::StoreLookup::Denied(p) => denied(&p),
-            cache::StoreLookup::Missing => fail(
-                "no Outlook store found under the default profile directory; pass --store".into(),
-            ),
+            cache::StoreLookup::Missing => fail(cache::NO_DEFAULT_STORE.into()),
         },
     };
     match std::fs::metadata(&store) {
