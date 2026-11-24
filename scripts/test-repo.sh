@@ -19,8 +19,9 @@
 # has that version on top with a compare link. The skill and README.md
 # name the warning, the shared program path, the denial and the clients,
 # and name the per-user program path only under the headings that explain
-# it. Every check is a
-# function that takes the file to check; each one also runs on a changed
+# it; both quote the stop command of the denial text with its paths in
+# single quotes, the shape that the server's own test expects. Every check
+# is a function that takes the file to check; each one also runs on a changed
 # copy in a temp directory, where it must fail. The release gate stays out
 # of the plain run, so the tree is green before the program is signed.
 #
@@ -242,6 +243,26 @@ check_lines_under() {
     [ -z "$bad" ] || { why="line $bad of $(basename "$f") names '$s' outside the allowed headings"; return 1; }
 }
 
+# The stop command of the denial text as the documents quote it: both paths
+# in single quotes, as the server writes them for a shell.
+stop_command="'<program>' service --stop --cache-dir '<cache dir>'"
+
+# Document $1 quotes the stop command in that shape, and nowhere with the
+# double quotes of before.
+check_stop_command() {
+    grep -qF -e "$stop_command" "$1" \
+        || { why="$(basename "$1") lacks the stop command with single quotes"; return 1; }
+    ! grep -qF -e '"<program>" service --stop' "$1" \
+        || { why="$(basename "$1") quotes the stop command with double quotes"; return 1; }
+}
+
+# Server source $1 expects that shape in its own test of the denial text: a
+# program path and a cache directory, each in single quotes.
+check_stop_in_code() {
+    grep -Eq "'[^' ]*/hxprobe' service --stop --cache-dir '[^' ]+'" "$1" \
+        || { why="$(basename "$1") has no stop command with both paths in single quotes"; return 1; }
+}
+
 # Changelog $1: the newest section is `## [$2] - <date>`, the next one is the
 # previous version, and a link `[$2]: .../compare/v<previous>...v$2` exists.
 check_changelog() {
@@ -309,7 +330,7 @@ t='inputs are tracked'
 missing=''
 for f in "$profile_rel" scripts/run-mcp.sh scripts/release-sign.sh hxprobe/Cargo.toml \
     hxprobe/Cargo.lock .claude-plugin/plugin.json skills/outlook-local-mail/SKILL.md \
-    README.md CHANGELOG.md; do
+    README.md CHANGELOG.md hxprobe/src/mcp/proto.rs; do
     git -C "$repo" ls-files --error-unmatch -- "$f" >/dev/null 2>&1 || missing="$missing $f"
 done
 if [ -z "$missing" ]; then pass "$t"; else fail "$t" "not tracked:$missing"; fi
@@ -464,6 +485,26 @@ expect_fail 'self-test: README without Claude Code' \
     > "$tmp/readme-path.md"
 expect_fail 'self-test: README per-user program under another heading' \
     check_lines_under "$tmp/readme-path.md" 'Application Support/hxprobe/bin/hxprobe' "${readme_headings[@]}"
+
+# The stop command: single quotes in the server's source, and the same
+# shape where the skill and the README quote the denial text.
+proto="$repo/hxprobe/src/mcp/proto.rs"
+expect_pass 'stop command: single quotes in the server source' check_stop_in_code "$proto"
+expect_pass 'stop command: single quotes in the skill' check_stop_command "$skill"
+expect_pass 'stop command: single quotes in the README' check_stop_command "$readme"
+sed "s/'\\([^' ]*\\)' service --stop --cache-dir '\\([^' ]*\\)'/\"\\1\" service --stop --cache-dir \"\\2\"/" \
+    "$proto" > "$tmp/proto-double.rs"
+expect_fail 'self-test: server source with double quotes' check_stop_in_code "$tmp/proto-double.rs"
+for f in "$skill" "$readme"; do
+    n=$(basename "$f")
+    sed "s/'<program>' service --stop --cache-dir '<cache dir>'/\"<program>\" service --stop --cache-dir \"<cache dir>\"/" \
+        "$f" > "$tmp/double-$n"
+    expect_fail "self-test: $n with the stop command in double quotes" check_stop_command "$tmp/double-$n"
+    { grep -vF -e "$stop_command" "$f" || true; } > "$tmp/none-$n"
+    expect_fail "self-test: $n without the stop command" check_stop_command "$tmp/none-$n"
+    { cat "$f"; printf '\n"<program>" service --stop --cache-dir "<cache dir>"\n'; } > "$tmp/both-$n"
+    expect_fail "self-test: $n with both shapes" check_stop_command "$tmp/both-$n"
+done
 
 # The release gate (only with --release): the checksum file lists the arm64
 # program of the version in hxprobe/Cargo.toml, with a 64-digit sum.
