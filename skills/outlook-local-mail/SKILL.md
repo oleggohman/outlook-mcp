@@ -95,8 +95,7 @@ A server started with `--no-service` (`service` is `null` in
 `store_status`) says
 `this server cannot read the store: permission denied`, names the program
 the same way, and ends with `restart the MCP client` and the cause. Either
-text may end with ` Note: ...` (see "When the shared directory is not
-used").
+text may end with ` Note: ...`: pass it on to the user unchanged.
 
 1. Find the program path: copy it from the error, the quoted path after
    `add`. By default it is `/Users/Shared/hxprobe/bin/hxprobe`. There is no
@@ -115,7 +114,7 @@ used").
    (`'<program>' service --stop --cache-dir '<cache dir>'`, with the
    single quotes), to run in Terminal; then call `store_status` again.
 5. With `--no-service` there is no service to stop: after the grant the user
-   restarts the MCP client (see "Restarting the MCP client").
+   restarts the MCP client (quits the app completely and opens it again).
 6. If the error is still there, repeat step 2 for the app that starts the
    server (Claude Desktop, or the terminal app Claude Code runs in), then
    have the user restart that app.
@@ -124,49 +123,6 @@ Upgrading from hxprobe 0.2.1 or earlier: those versions kept the program in
 the user's own Library folder. A Full Disk Access entry for that program does
 not cover `/Users/Shared/hxprobe/bin/hxprobe`; the new path needs its own
 entry. Do not tell the user to add the old path.
-
-### For administrators
-
-The device profile is `mdm/hxprobe-full-disk-access.mobileconfig` in the
-hxprobe repository
-(https://github.com/oleggohman/outlook-mcp/blob/main/mdm/hxprobe-full-disk-access.mobileconfig).
-It grants Full Disk Access to `/Users/Shared/hxprobe/bin/hxprobe` only, and
-is delivered by the device management service; it cannot be installed by
-opening the file. When the user says they administer the Macs, tell them to
-upload it there as a device-level profile and assign it to the Macs that
-show the error.
-
-### When the shared directory is not used
-
-When the program in the error is
-`~/Library/Application Support/hxprobe/bin/hxprobe` (in full,
-`$HOME/Library/Application Support/hxprobe/bin/hxprobe`), the plugin could
-not use the shared directory `/Users/Shared/hxprobe` and fell back to the
-user's own one. The error then ends with a note of this form:
-
-```
-Note: the shared program /Users/Shared/hxprobe/bin/hxprobe was not used (<reason>); a device profile for that path does not cover this program
-```
-
-Read the note to the user, reason included. The note comes from the
-plugin's launcher: a server that the client runs directly (registered with
-the program path, not as the plugin) never has one.
-
-- On the user's own Mac: add the path the error names, as in the steps
-  above.
-- On a Mac managed by an organisation: the profile does not cover this
-  program, and the user cannot fix that alone. Tell them to pass the whole
-  error, note included, to their administrator, who either removes or
-  repairs `/Users/Shared/hxprobe`, or creates it as root with the release
-  program. After that the user restarts the MCP client, so that the plugin
-  chooses the program again.
-
-### Restarting the MCP client
-
-"Restart the MCP client" means: in Claude Desktop (or another desktop app),
-quit the app completely with Cmd+Q, not only its window, and open it again.
-In Claude Code, end the session and start a new one. You cannot do either
-for the user: tell them what to do and wait.
 
 ## Argument rules that cause errors
 

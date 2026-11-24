@@ -30,6 +30,13 @@ The hxprobe program has no functional change; its version follows the plugin.
   `scripts/test-repo.sh` checks the quotes and that every reference file the
   skill names exists.
 
+### Removed
+
+- Three sections of the skill: "For administrators", "When the shared
+  directory is not used" and "Restarting the MCP client". The README keeps
+  that material; a note at the end of an error is passed on to the user
+  unchanged.
+
 ## [0.2.3] - 2026-11-24
 
 The hxprobe program has no functional change; its version follows the plugin.
