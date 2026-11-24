@@ -257,8 +257,8 @@ check_changelog() {
 }
 
 # Checksum file $1 lists hxprobe-$2-macos-arm64 with a 64-digit sum. Read
-# as the launcher reads it: `#` comments and blank lines are skipped, and an
-# optional `*` before the name is the binary-mode marker of shasum.
+# as the launcher reads it: `#` comments and blank lines are skipped, and
+# the `*` that shasum may put before a name is not part of the name.
 check_release_sums() {
     local a="hxprobe-$2-macos-arm64" got
     [ -f "$1" ] || { why="no checksum file $1"; return 1; }
@@ -445,10 +445,10 @@ grep -v '^\[[0-9.]*\]: ' "$changelog" > "$tmp/changelog-links.md"
 expect_fail 'self-test: changelog without compare links' \
     check_changelog "$tmp/changelog-links.md" "$(cargo_version "$cargo_toml")"
 
-# The README: the warning, the shared program and the profile, Claude
-# Desktop and the denial; the per-user program only under its two headings.
+# The README: the warning, the shared program and the profile, both
+# clients and the denial; the per-user program only under its two headings.
 readme="$repo/README.md"
-readme_phrases=(warning "$program" "$profile_rel" 'Claude Desktop' \
+readme_phrases=(warning "$program" "$profile_rel" 'Claude Desktop' 'Claude Code' \
     'the refresh service cannot read the store: permission denied')
 readme_headings=('When the shared directory is not used' 'Upgrading from 0.2.0 and 0.2.1')
 expect_pass 'readme: required phrases' check_phrases "$readme" "${readme_phrases[@]}"
@@ -457,6 +457,9 @@ expect_pass 'readme: per-user program only under its headings' \
 grep -vF -e "$profile_rel" "$readme" > "$tmp/readme-no-profile.md"
 expect_fail 'self-test: README without the profile' \
     check_phrases "$tmp/readme-no-profile.md" "${readme_phrases[@]}"
+grep -vF -e 'Claude Code' "$readme" > "$tmp/readme-no-code.md"
+expect_fail 'self-test: README without Claude Code' \
+    check_phrases "$tmp/readme-no-code.md" "${readme_phrases[@]}"
 { cat "$readme"; printf '\n### Elsewhere\n\n"$HOME/Library/Application Support/hxprobe/bin/hxprobe" service --stop\n'; } \
     > "$tmp/readme-path.md"
 expect_fail 'self-test: README per-user program under another heading' \
