@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>PayloadContent</key>
+	<array>
+		<dict>
+			<key>PayloadDisplayName</key>
+			<string>hxprobe Full Disk Access</string>
+			<key>PayloadIdentifier</key>
+			<string>io.github.oleggohman.hxprobe.fda.tcc</string>
+			<key>PayloadType</key>
+			<string>com.apple.TCC.configuration-profile-policy</string>
+			<key>PayloadUUID</key>
+			<string>8ACDCBDE-04A9-4711-BEF4-D912896FF805</string>
+			<key>PayloadVersion</key>
+			<integer>1</integer>
+			<key>Services</key>
+			<dict>
+				<key>SystemPolicyAllFiles</key>
+				<array>
+					<dict>
+						<key>Authorization</key>
+						<string>Allow</string>
+						<key>CodeRequirement</key>
+						<string>identifier "io.github.oleggohman.hxprobe" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = "6QYNDF2363"</string>
+						<key>Comment</key>
+						<string>hxprobe reads the local Outlook for Mac store</string>
+						<key>Identifier</key>
+						<string>/Users/Shared/hxprobe/bin/hxprobe</string>
+						<key>IdentifierType</key>
+						<string>path</string>
+						<key>StaticCode</key>
+						<false/>
+					</dict>
+				</array>
+			</dict>
+		</dict>
+	</array>
+	<key>PayloadDescription</key>
+	<string>Grants Full Disk Access to the signed hxprobe program at /Users/Shared/hxprobe/bin/hxprobe so it can read the local Outlook for Mac store.</string>
+	<key>PayloadDisplayName</key>
+	<string>hxprobe Full Disk Access</string>
+	<key>PayloadIdentifier</key>
+	<string>io.github.oleggohman.hxprobe.fda</string>
+	<key>PayloadScope</key>
+	<string>System</string>
+	<key>PayloadType</key>
+	<string>Configuration</string>
+	<key>PayloadUUID</key>
+	<string>DFB7F712-4F29-4379-97C8-1020338EC1BA</string>
+	<key>PayloadVersion</key>
+	<integer>1</integer>
+</dict>
+</plist>
