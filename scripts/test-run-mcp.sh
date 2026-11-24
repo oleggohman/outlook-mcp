@@ -311,7 +311,7 @@ make_asset "$r"
 make_curl_probe "$r"
 mkdir -p "$r/inst/bin" "$r/data/bin"
 make_fake "$r/inst/bin/hxprobe" "$r/inst-ran" '' "$version"
-echo "release $(printf '0%.0s' $(seq 64))" > "$r/inst/bin/.origin"
+echo "release $(shasum -a 256 "$r/inst/bin/hxprobe" | awk '{ print $1 }')" > "$r/inst/bin/.origin"
 make_fake "$r/data/bin/hxprobe-0.1.0" "$r/old-ran"
 run "$r" HXPROBE_RELEASE_BASE="file://$r/rel" PATH="$r/stub:$nocargo_path" --
 if [ "$rc" = 0 ] && [ "$out" = 'FAKE mcp' ] && [ -z "$err" ] \
@@ -846,7 +846,7 @@ for have in 9.8.7-rc1 9.8.7+b5 9.8.8-rc1; do
     make_curl_probe "$r"
     mkdir -p "$r/inst/bin"
     make_fake "$r/inst/bin/hxprobe" "$r/old-ran" '' "$have"
-    echo "release $(printf '0%.0s' $(seq 64))" > "$r/inst/bin/.origin"
+    echo "release $(shasum -a 256 "$r/inst/bin/hxprobe" | awk '{ print $1 }')" > "$r/inst/bin/.origin"
     run "$r" HXPROBE_RELEASE_BASE="file://$r/rel" PATH="$r/stub:$nocargo_path" --
     ok=0
     case "$have" in
@@ -1375,11 +1375,15 @@ if [ "$rc" = 0 ] && [ "$out" = 'FAKE mcp' ] && [ "$(cat "$r/ran.path")" = "$s/bi
     && [ "$(origin_of "$s")" = "release $(sum_of "$r/rel/v$version/$asset")" ] && lock_free "$s"; then pass "$t"
 else fail "$t" "rc=$rc out='$out' err='$err'"; fi
 
-# A release program of the wanted version that changed after the install
-# (its sum is no longer the listed one) is not run, not even asked for its
+# A release program that changed after the install (its sum is no longer
+# the one recorded in bin/.origin) is not run, not even asked for its
 # version: the release program is downloaded again and run. When that
-# download fails the launcher stops and names the checksum.
-for how in 'shared directory' 'install dir given' 'download fails'; do
+# download fails the launcher stops and names the checksum. The record
+# decides, whatever version it was written for: after a plugin upgrade the
+# record of the older release program counts the same. Without a release
+# program for the wanted version the changed file is replaced by a build.
+for how in 'shared directory' 'install dir given' 'download fails' 'record of an older version' \
+        'no release listed'; do
     t="checksum: changed release file, $how"
     r=$(make_repo)
     make_asset "$r"
@@ -1389,16 +1393,27 @@ for how in 'shared directory' 'install dir given' 'download fails'; do
     if [ "$how" = 'install dir given' ]; then d="$r/inst"; inst_set="HXPROBE_INSTALL_DIR=$r/inst"
     else d=$(shared_of "$r"); inst_set='HXPROBE_INSTALL_DIR='; fi
     make_fake "$r/changed" "$r/changed-ran" '' "$version"
-    put_program "$d" "$r/changed" "release $(sum_of "$r/rel/v$version/$asset")"
+    record="release $(sum_of "$r/rel/v$version/$asset")"
+    case "$how" in
+        'record of an older version' | 'no release listed' )
+            make_fake "$r/older" "$r/old-ran" '' 9.8.6
+            record="release $(sum_of "$r/older")" ;;
+    esac
+    if [ "$how" = 'no release listed' ]; then printf '# comment\n\n' > "$r/release/SHA256SUMS"; fi
+    put_program "$d" "$r/changed" "$record"
     run "$r" "$inst_set" HXPROBE_RELEASE_BASE="file://$r/rel" PATH="$r/stub:$nocargo_path" --
     ok=0
     if [ "$how" = 'download fails' ]; then
         if [ "$rc" = 1 ] && [ -z "$out" ] && [ ! -e "$r/ran" ] && [[ "$err" == *checksum* ]] \
-            && cmp -s "$d/bin/hxprobe" "$r/changed"; then ok=1; fi
+            && [ ! -e "$r/builds" ] && cmp -s "$d/bin/hxprobe" "$r/changed"; then ok=1; fi
+    elif [ "$how" = 'no release listed' ]; then
+        if [ "$rc" = 0 ] && [ "$out" = 'BUILT mcp' ] && [ "$(origin_of "$d")" = build ] \
+            && [ ! -e "$r/curl-args" ] && [[ "$err" == *checksum* ]]; then ok=1; fi
     elif [ "$rc" = 0 ] && [ "$out" = 'FAKE mcp' ] && [ "$(cat "$r/ran.path" 2>/dev/null || true)" = "$d/bin/hxprobe" ] \
-        && cmp -s "$d/bin/hxprobe" "$r/rel/v$version/$asset" && [[ "$err" == *checksum* ]]; then ok=1; fi
+        && cmp -s "$d/bin/hxprobe" "$r/rel/v$version/$asset" && [[ "$err" == *checksum* ]] \
+        && [ ! -e "$r/builds" ]; then ok=1; fi
     if [ "$ok" = 1 ] && [ ! -e "$r/changed-ran" ] && [ ! -e "$r/changed-ran.asked" ] \
-        && [ ! -e "$r/builds" ] && [ "$(leftovers "$d")" = 0 ] && lock_free "$d"; then pass "$t"
+        && [ "$(leftovers "$d")" = 0 ] && lock_free "$d"; then pass "$t"
     else fail "$t" "rc=$rc out='$out' changed-run=$([ -e "$r/changed-ran" ] || [ -e "$r/changed-ran.asked" ] && echo yes || echo no) err='$err'"; fi
 done
 

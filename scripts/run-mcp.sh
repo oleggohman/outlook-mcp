@@ -13,9 +13,11 @@
 # `hxprobe --version`. Either way the wanted version or a newer one is run
 # as it is (never downgrade); a missing or older program, or one without an
 # answer (0.1.0), is replaced by a rename under the install lock. A release
-# program of the wanted version whose sum is no longer the listed one changed
-# after the install: it is never run, the release program is downloaded
-# again, and the launcher stops when that fails. In a directory of the
+# program whose sum is no longer the one recorded at its install (see
+# bin/.origin below), whatever version that was, changed after the install:
+# it is never run, not even to ask it, the release program is downloaded
+# again, and the launcher stops when that fails (without a release program
+# for this version it is replaced by a build). In a directory of the
 # user's own this finds a damaged or half-written file; it is not a security
 # boundary, since whoever can write the directory can write bin/.origin as
 # well: that boundary is the owner and mode of the directory. The server
@@ -492,13 +494,13 @@ origin_sum() {
 # otherwise reinstall on every start). A program of the wanted version that
 # was built here is not run as it is while a release program is listed for
 # it: `upgrade` is then 1, and the release program is tried first, unless
-# that failed a short while ago. A release program of the wanted version
-# whose sum is no longer the listed one changed after the install: it is not
-# run at all, `changed` is then 1.
+# that failed a short while ago. A release program whose sum is no longer
+# the one in its origin record changed after the install, whatever version
+# the record was written for: it is not run at all, `changed` is then 1.
 upgrade=0
 changed=0
 installed_ok() {
-    local have got
+    local have got was
     upgrade=0
     changed=0
     [ -f "$bin" ] && [ -x "$bin" ] || return 1
@@ -512,8 +514,8 @@ installed_ok() {
         return 1
     fi
     got=$(file_sum "$bin")
-    if [ -n "$got" ] && [ "$(installed_origin)" = release ] && release_sum \
-            && [ "$(origin_sum)" = "$want" ] && [ "$got" != "$want" ]; then
+    was=$(origin_sum)
+    if [ -n "$got" ] && [ -n "$was" ] && [ "$got" != "$was" ]; then
         changed=1
         return 1
     fi
@@ -701,11 +703,11 @@ install_and_run() {
     # Written before the move. A launcher killed between the two commands
     # leaves the new record next to the old program. For most pairs that
     # costs one more download or nothing (an older program is replaced at
-    # the next start anyway). The accepted exception: a release program that
-    # was to replace a build of the same version leaves `release` next to
-    # the built program, which is then run as it is until the next version.
-    # Written after the move, the same would hold for a build that replaces
-    # an older release program.
+    # the next start anyway). A `release` record next to another program
+    # makes that program a changed one: the next start downloads the release
+    # program again, and stops while that download fails. Written after the
+    # move, a build that replaces a release program would leave the old
+    # `release` record next to the built program, which no download repairs.
     printf '%s\n' "$origin" > "$origin_file" || die "cannot write $origin_file"
     if [ -n "$origin_mode" ]; then
         chmod "$origin_mode" "$origin_file" || die "cannot set the mode of $origin_file"
@@ -800,7 +802,7 @@ if [ "$upgrade" = 1 ]; then
     log "hxprobe $version at $bin was built here and a release program is listed; replacing it"
 fi
 if [ "$changed" = 1 ]; then
-    log "hxprobe $version at $bin does not match the checksum of $asset it was installed with; it changed since the install and is not run. Downloading it again"
+    log "the release program at $bin does not match the checksum it was installed with; it changed since the install and is not run. Replacing it"
 fi
 # The install itself runs outside the `if` condition, where set -e applies.
 downloaded=0
@@ -809,7 +811,9 @@ if [ "$downloaded" = 0 ]; then
     install_and_run "$tmp_file" "release $want" ${1+"$@"}
 fi
 # A changed release file is never run, also not when the download failed.
-[ "$changed" = 0 ] || die "the installed hxprobe $version at $bin does not match its checksum in $sums_file and the release program could not be downloaded again; the changed file was not run. Remove it and start again, or set HXPROBE_BIN."
+# Without a release program for this version (status 1) it is replaced by a
+# build below.
+[ "$changed" = 0 ] || [ "$downloaded" = 1 ] || die "the installed release program at $bin does not match the checksum it was installed with and the release program could not be downloaded again; the changed file was not run. Remove it and start again, or set HXPROBE_BIN."
 if [ "$downloaded" = 2 ] || [ "$upgrade" = 1 ]; then
     # Not a reason to build while a program that answers is installed. With
     # `upgrade` this is the built program of the wanted version.

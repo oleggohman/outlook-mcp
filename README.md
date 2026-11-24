@@ -460,10 +460,12 @@ available) is asked with `hxprobe --version`. Then:
 
 * The version of the plugin, or a newer one: it is run as it is. The launcher
   never downgrades; with a newer program it logs that it runs it.
-* A release program of the plugin's version whose SHA-256 is no longer the
-  listed one has changed since it was installed: it is not run, and the
-  release program is downloaded again. When that fails, the launcher stops
-  with a message.
+* A release program whose SHA-256 is no longer the one recorded at its
+  install (in `bin/.origin`, see below), whatever version that was, has
+  changed since it was installed: it is not run, not even to ask it, and
+  the release program is downloaded again. When that fails, the launcher
+  stops with a message; when no release program is listed for the plugin's
+  version, it is replaced by a build.
 * Missing, older, or no answer: a new program is installed under the lock
   `<install dir>/install.lock`, by a rename over `bin/hxprobe`. A running
   server or service keeps its old file.
