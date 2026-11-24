@@ -1,2 +1,3 @@
 # SHA-256 of each prebuilt program, one per line: "<sha256>  hxprobe-<version>-macos-<arm64|x86_64>". Lines starting with # are ignored.
 4412b182bb00cb3db27940c432a8a9f59a30efa9e1b48d97c358eedfb58d167b  hxprobe-0.1.0-macos-arm64
+40e9d1572e38dc28c0844c381d172f7170a7294baa315914f049c413d3221dbc  hxprobe-0.2.0-macos-arm64
