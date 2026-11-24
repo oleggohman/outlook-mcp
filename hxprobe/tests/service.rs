@@ -1452,7 +1452,7 @@ fn unreadable_store_without_a_database_is_a_tool_error() {
 }
 
 #[test]
-fn server_whose_own_service_is_denied_keeps_an_older_service() {
+fn server_denied_the_store_keeps_an_older_service_from_the_first_contact() {
     if is_root() {
         return;
     }
@@ -1470,16 +1470,11 @@ fn server_whose_own_service_is_denied_keeps_an_older_service() {
     store_mode(&d, 0o000);
     let _readable = Readable(&d);
     let mut m = spawn_mcp(&d);
-    // The older service is replaced at first contact; the own one is denied.
-    let list = m.tool("list_messages");
-    let w = list["warning"].as_str().unwrap_or_else(|| panic!("{list}"));
-    assert!(w.contains(proto::DENIED), "{w}");
-    assert_eq!(played.requests(), [Request::Touch, old_shutdown()]);
-    drop(played);
-    // Another client starts the older service again: it is kept.
-    let played = Played::start(&d, "0.0.1", OnShutdown::Exit);
+    // This program cannot read the store, so its own service could not
+    // either: the working older service is not stopped, not even once.
     let list = m.tool("list_messages");
     assert!(list.get("warning").is_none(), "{list}\n{}", m.log());
+    assert_eq!(played.requests(), [Request::Touch]);
     m.tool("list_messages");
     let st = m.tool("store_status");
     assert_eq!(st["service"]["running"], true, "{st}");
@@ -1499,6 +1494,8 @@ fn server_whose_own_service_is_denied_keeps_an_older_service() {
         "{}",
         m.log()
     );
+    // No service of this program was started.
+    assert_eq!(service_log(&d), "");
 }
 
 /// Sets the mode of a directory and gives it mode 0700 back on drop, also

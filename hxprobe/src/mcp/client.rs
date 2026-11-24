@@ -169,7 +169,8 @@ impl Client {
 
     /// The reply `v` to `req`: checked when it comes from a service not
     /// seen before (its store, then its version; an older one is replaced,
-    /// unless a service this process started was denied the store).
+    /// unless this program is denied the store, or a service this process
+    /// started was).
     fn accept(
         &mut self,
         req: &Request,
@@ -187,17 +188,21 @@ impl Client {
                 }
             }
             if proto::cmp_versions(&st.version, proto::VERSION) == Ordering::Less {
-                // This program was denied the store, while an older one
+                // This program is denied the store, while an older one
                 // (another file, perhaps with Full Disk Access) can read it:
                 // keep that one instead of stopping it for a start that
-                // fails. Safe only while the cache format is unchanged
-                // (`cache::FORMAT_VERSION` "3" since 0.2.0); a release that
-                // changes the format has to revisit this branch.
-                if !self.own_denied {
+                // fails. This process runs the program file its service
+                // would be started from, so its own attempt to open the
+                // store tells before any start; `own_denied` covers a
+                // service that was denied all the same. Safe only while the
+                // cache format is unchanged (`cache::FORMAT_VERSION` "3"
+                // since 0.2.0); a release that changes the format has to
+                // revisit this branch.
+                if !(self.own_denied || cache::store_denied(&self.store)) {
                     return self.replace_older(req, &st, now, round);
                 }
                 log(&format!(
-                    "keeping refresh service {} (pid {}): this program was denied the store",
+                    "keeping refresh service {} (pid {}): this program is denied the store",
                     st.version, st.pid
                 ));
             } else {
@@ -873,6 +878,53 @@ mod tests {
             .client(t.script("svc", "exit 3"))
             .with_timeouts(LONG, SHORT, SHORT);
         let e = c.call(&Request::Touch, NOW).unwrap_err();
+        assert!(e.contains("exit status: 3"), "{e}");
+        assert_eq!(played.requests(), [Request::Touch, shutdown("0.0.1")]);
+        assert_eq!(t.runs(), 1);
+    }
+
+    #[test]
+    fn older_service_is_kept_at_first_contact_while_the_store_is_denied() {
+        let _p = process_lock();
+        // SAFETY: geteuid() has no preconditions and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            // Mode 000 does not deny root.
+            return;
+        }
+        let t = TestDir::new();
+        let store = t.store();
+        let mode = |m| std::fs::set_permissions(&store, std::fs::Permissions::from_mode(m));
+        let reported = store.clone();
+        let played = Played::start(&t.sock(), move |r| match r {
+            Request::Shutdown { .. } => "{\"ok\":true,\"stopping\":true}\n".into(),
+            _ => status_line("0.0.1", 4242, &reported),
+        });
+        let mut c = t
+            .client(t.script("svc", "exit 3"))
+            .with_timeouts(LONG, SHORT, SHORT);
+        // This program cannot read the store: its own service could not
+        // either, so the older one is used as it is.
+        mode(0o000).unwrap();
+        let first = c.call(&Request::Touch, NOW);
+        let second = c.call(&Request::Status, NOW + 1);
+        mode(0o600).unwrap();
+        let st = first.unwrap();
+        assert_eq!((st.version.as_str(), st.pid), ("0.0.1", 4242));
+        assert_eq!(second.unwrap().pid, 4242);
+        assert_eq!(played.requests(), [Request::Touch, Request::Status]);
+        assert_eq!(t.runs(), 0);
+        assert!(!c.own_denied);
+        drop(played);
+        std::fs::remove_file(t.sock()).unwrap();
+
+        // The store can be read again: an older service not seen before is
+        // replaced as usual.
+        let (reported, gone) = (store.clone(), gone_pid());
+        let played = Played::start(&t.sock(), move |r| match r {
+            Request::Shutdown { .. } => "{\"ok\":true,\"stopping\":true}\n".into(),
+            _ => status_line("0.0.1", gone, &reported),
+        });
+        let e = c.call(&Request::Touch, NOW + 2).unwrap_err();
         assert!(e.contains("exit status: 3"), "{e}");
         assert_eq!(played.requests(), [Request::Touch, shutdown("0.0.1")]);
         assert_eq!(t.runs(), 1);
