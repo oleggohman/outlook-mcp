@@ -682,7 +682,8 @@ users do not need to add the entry themselves (a standard user cannot).
   `scripts/release-sign.sh --compare <signed program>` on a Mac with the
   repository. It needs no signing identity and writes nothing; exit status 0
   means that the program's designated requirement equals the profile's
-  `CodeRequirement`, 1 that it does not.
+  `CodeRequirement` and that its signature satisfies that requirement
+  (`codesign --verify --strict`), 1 that it does not.
 * If the signing identity changes, the code requirement has to change too
   (and every existing grant ends): take the line that
   `codesign -d -r- <signed program>` prints after `designated => `, put it

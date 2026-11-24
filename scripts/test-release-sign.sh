@@ -413,21 +413,34 @@ c=$(make_case)
 printf '%s\n%s\n' "$good_req" "$good_req" > "$c/req"
 check_stops 'two designated lines' "$c" 'designated => '
 
-# (viii) --compare <signed program>: only the comparison, with no identity,
-# no signing and no file written.
-for v in match difference; do
+# (viii) --compare <signed program>: the comparison, and a verification of
+# the signature against the profile's requirement (a program can carry the
+# text of a requirement that its signature does not satisfy), with no
+# identity, no signing and no file written.
+for v in match difference 'signature does not satisfy'; do
     t="compare only: $v"
     c=$(make_case)
     want_rc=0
-    if [ "$v" = difference ]; then
-        make_profile "$c/profile" "${req_body/STUBTEAM/OTHERTEAM}"
-        want_rc=1
-    fi
+    case "$v" in
+        difference )
+            make_profile "$c/profile" "${req_body/STUBTEAM/OTHERTEAM}"
+            want_rc=1 ;;
+        signature* )
+            echo 3 > "$c/verify-rc"
+            want_rc=1 ;;
+    esac
     run "$c" unset --compare "$c/prog"
+    ok=1
+    case "$v" in
+        match ) grep -qF -e "--verify --strict -R=$req_body $c/prog" "$c/codesign-args" \
+            && [[ "$err" == *matches* ]] || ok=0 ;;
+        signature* ) [[ "$err" == *'does not satisfy'* ]] && [[ "$err" != *matches* ]] \
+            && [[ "$err" != *'valid on disk'* ]] || ok=0 ;;
+    esac
     if [ "$rc" = "$want_rc" ] && [ -z "$out" ] && grep -q -e '-d -r-' "$c/codesign-args" \
         && ! grep -q -e '--sign' "$c/codesign-args" && [ "$(work_files "$c")" = 0 ] \
-        && cmp -s "$c/prog" "$c/prog.orig" && no_identity "$c" \
-        && [[ "$err" != *OTHERTEAM* ]]; then pass "$t"
+        && cmp -s "$c/prog" "$c/prog.orig" && no_identity "$c" && [ "$ok" = 1 ] \
+        && [[ "$err" != *OTHERTEAM* ]] && [[ "$err" != *'anchor apple generic'* ]]; then pass "$t"
     else fail "$t" "rc=$rc out='$out' err='$err' args='$(cat "$c/codesign-args" 2>/dev/null || true)'"; fi
 done
 t='compare only: usage'

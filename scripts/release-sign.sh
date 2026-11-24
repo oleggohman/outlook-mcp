@@ -30,8 +30,10 @@
 # `certificate leaf[subject.OU] = ` are removed; nothing else is changed.
 # The two must then be equal, character for character; on a difference the
 # script stops and prints neither. With --compare only this comparison runs,
-# on a program signed before: no identity, no signing, nothing written;
-# status 0 for a match and 1 otherwise.
+# on a program signed before, and then `codesign --verify --strict` with the
+# profile's requirement, since a program can carry the text of a requirement
+# that its signature does not satisfy: no identity, no signing, nothing
+# written; status 0 when both pass and 1 otherwise.
 #
 # Written for the macOS system bash (3.2).
 
@@ -90,7 +92,12 @@ if [ "${1:-}" = --compare ]; then
     preq=$(profile_requirement) || exit 1
     req=$(codesign -d -r- "$2" 2>&1) || die "cannot read the designated requirement"
     compare_with_profile "$req" "$preq"
-    log "the designated requirement of $2 matches the code requirement in $profile"
+    # The text alone proves nothing: any signature can carry it. The
+    # signature itself must satisfy the requirement (`-R=<text>` hands
+    # codesign the requirement as source text).
+    codesign --verify --strict -R="$preq" "$2" >/dev/null 2>&1 \
+        || die "the signature of $2 does not satisfy the code requirement in $profile"
+    log "the designated requirement of $2 matches the code requirement in $profile, and its signature satisfies it"
     exit 0
 fi
 
