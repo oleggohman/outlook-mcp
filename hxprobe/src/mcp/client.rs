@@ -462,6 +462,12 @@ impl proto::Refresher for Client {
     fn refresh(&mut self, now: i64) -> Result<ServiceStatus, String> {
         self.call(&Request::Refresh, now)
     }
+
+    /// The canonical store path the server resolved after it started: the
+    /// one a service is started with and must report from now on.
+    fn set_store(&mut self, store: &Path) {
+        self.store = store.to_path_buf();
+    }
 }
 
 /// The program to start the service from: this program's own file.
@@ -866,6 +872,39 @@ mod tests {
         assert!(c.call(&Request::Touch, NOW).is_err());
         assert_eq!(played.requests(), [Request::Touch, Request::Touch]);
         assert_eq!(t.runs(), 0);
+    }
+
+    #[test]
+    fn set_store_changes_the_store_a_service_must_report_and_is_started_with() {
+        use proto::Refresher;
+        let _p = process_lock();
+        let t = TestDir::new();
+        std::fs::write(t.0.join("Other.hxd"), b"store").unwrap();
+        let other = std::fs::canonicalize(t.0.join("Other.hxd")).unwrap();
+        let theirs = other.clone();
+        let played = Played::start(&t.sock(), move |_| {
+            status_line(proto::VERSION, 4242, &theirs)
+        });
+        let mut c = t.client(t.script("svc", "exit 3"));
+        let e = c.call(&Request::Touch, NOW).unwrap_err();
+        assert!(e.contains("serves another store"), "{e}");
+        c.set_store(&other);
+        assert_eq!(c.call(&Request::Touch, NOW).unwrap().pid, 4242);
+        drop(played);
+        assert_eq!(t.runs(), 0);
+
+        // A service started after `set_store` is given the new path.
+        let t = TestDir::new();
+        let mut c = t
+            .client(t.script("svc", "printf '%s\\n' \"$@\" > args\nexit 3"))
+            .with_timeouts(LONG, SHORT, SHORT);
+        c.set_store(&other);
+        let e = c.call(&Request::Touch, NOW).unwrap_err();
+        assert!(e.contains("exit status: 3"), "{e}");
+        let args = std::fs::read_to_string(t.cache().join("args")).unwrap();
+        let args: Vec<&str> = args.lines().collect();
+        let at = args.iter().position(|a| *a == "--store").unwrap();
+        assert_eq!(args[at + 1], other.to_str().unwrap());
     }
 
     #[test]

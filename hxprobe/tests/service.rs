@@ -1441,6 +1441,125 @@ fn unreadable_store_without_a_database_is_a_tool_error() {
     );
 }
 
+/// Sets the mode of a directory and gives it mode 0700 back on drop, also
+/// when the test fails, so the temp dir can be removed.
+struct Locked(PathBuf);
+
+impl Locked {
+    fn new(dir: &std::path::Path, mode: u32) -> Locked {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode)).unwrap();
+        Locked(dir.to_path_buf())
+    }
+}
+
+impl Drop for Locked {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
+    }
+}
+
+/// A store in the directory `s` of `d`, which the returned guard makes
+/// mode 000 (nothing in it can be examined).
+fn store_in_a_locked_directory(d: &Dir) -> (PathBuf, Locked) {
+    let s = d.0.join("s");
+    std::fs::create_dir(&s).unwrap();
+    std::fs::write(s.join("HxStore.hxd"), empty_store()).unwrap();
+    let lock = Locked::new(&s, 0o000);
+    (s.join("HxStore.hxd"), lock)
+}
+
+#[test]
+fn store_that_cannot_be_examined_makes_the_service_exit_77() {
+    if is_root() {
+        return;
+    }
+    let _s = serial();
+    let d = Dir::new();
+    let (store, _lock) = store_in_a_locked_directory(&d);
+    let cache = d.cache();
+    let (st, _, err) = run_with(
+        &[
+            "service",
+            "--store",
+            store.to_str().unwrap(),
+            "--cache-dir",
+            cache.to_str().unwrap(),
+        ],
+        |cmd| {
+            cmd.env("HOME", &d.0);
+        },
+    );
+    assert_eq!(st.code(), Some(77), "{err}");
+    assert_eq!(err.lines().count(), 1, "{err}");
+    assert!(err.contains("permission denied"), "{err}");
+    assert!(!d.sock().exists());
+}
+
+#[test]
+fn server_serves_a_store_that_cannot_be_examined_and_names_the_remedy() {
+    if is_root() {
+        return;
+    }
+    let _s = serial();
+    let d = Dir::new();
+    let (store, _lock) = store_in_a_locked_directory(&d);
+    let mut m = spawn_mcp_with(&d, &store, &d.cache(), &[], |_| {});
+    let e = m.tool_error("list_messages");
+    assert!(
+        e.starts_with("the refresh service cannot read the store: permission denied"),
+        "{e}\n{}",
+        m.log()
+    );
+    assert_remedy(&d, &e);
+}
+
+#[test]
+fn server_started_without_access_recovers_after_the_grant_without_a_restart() {
+    if is_root() {
+        return;
+    }
+    let _s = serial();
+    let d = Dir::new();
+    let (store, lock) = store_in_a_locked_directory(&d);
+    // The store is named through a symbolic link to its directory, so the
+    // path given differs from the one the service reports.
+    std::os::unix::fs::symlink(d.0.join("s"), d.0.join("l")).unwrap();
+    let linked = d.0.join("l").join("HxStore.hxd");
+    let mut m = spawn_mcp_with(&d, &linked, &d.cache(), &[], |_| {});
+    let e = m.tool_error("list_messages");
+    assert!(
+        e.contains("cannot read the store: permission denied"),
+        "{e}"
+    );
+    drop(lock);
+    // The start block of the server lasts 10 s on its own clock.
+    let started = Instant::now();
+    let result = loop {
+        m.send("list_messages");
+        let r = m.response();
+        if r["result"]["isError"] == false {
+            break r;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "{r}\n{}",
+            m.log()
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    };
+    let v: Value =
+        serde_json::from_str(result["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(v["total"], 0, "{v}");
+    assert!(v.get("warning").is_none(), "{v}");
+    let st = m.tool("store_status");
+    let canonical = std::fs::canonicalize(&store).unwrap();
+    assert_eq!(st["store_path"], canonical.to_str().unwrap(), "{st}");
+    assert_eq!(st["service"]["running"], true, "{st}");
+    assert_eq!(st["last_error"], Value::Null, "{st}");
+}
+
 #[test]
 fn too_long_socket_path_means_fallback_mode() {
     let _s = serial();

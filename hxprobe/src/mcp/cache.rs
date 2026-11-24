@@ -194,6 +194,9 @@ impl ServiceView {
 pub struct Cache {
     dir: PathBuf,
     store: PathBuf,
+    /// Whether `store` is resolved, or is looked at again (see
+    /// [`Cache::resolve_again`]).
+    store_state: StoreState,
     refresh_secs: i64,
     /// Read-only connection to `mail.db`, with its `mcp_meta`.
     db: Option<(Connection, Meta)>,
@@ -227,6 +230,18 @@ pub struct Cache {
     /// identity and opening it, with the cache directory.
     #[cfg(test)]
     reopen_hook: Option<fn(&Path)>,
+}
+
+/// How the store path of a [`Cache`] came about.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StoreState {
+    /// Canonical; never looked at again.
+    Resolved,
+    /// Given, but it could not be made canonical (made absolute only).
+    Unresolved,
+    /// A guess for the default store, whose lookup in the profiles
+    /// directory (here) was denied.
+    DeniedDefault(PathBuf),
 }
 
 /// Identity of a file, to notice that it was replaced: a new file put in
@@ -285,16 +300,22 @@ impl Cache {
     /// (see [`ensure_dir`]); builds nothing. The refresh interval is
     /// [`DEFAULT_REFRESH_SECS`].
     ///
-    /// `store` is resolved once, here, to an absolute path without symbolic
-    /// links (only made absolute when it does not exist yet), so the
-    /// `store_path` a database is kept under names one file whatever the
-    /// working directory.
+    /// `store` is resolved to an absolute path without symbolic links, so
+    /// the `store_path` a database is kept under names one file whatever
+    /// the working directory. When that fails (the store or a directory on
+    /// the way cannot be examined, or it does not exist yet) it is only
+    /// made absolute, and every call tries again until it succeeds (see
+    /// [`Cache::resolve_again`]).
     pub fn new(dir: &Path, store: &Path) -> Result<Cache, String> {
         ensure_dir(dir)?;
-        let store = resolve_store(store);
+        let (store, store_state) = match std::fs::canonicalize(store) {
+            Ok(p) => (p, StoreState::Resolved),
+            Err(_) => (resolve_store(store), StoreState::Unresolved),
+        };
         Ok(Cache {
             dir: dir.to_path_buf(),
             store,
+            store_state,
             refresh_secs: DEFAULT_REFRESH_SECS as i64,
             db: None,
             last_attempt_unix: None,
@@ -311,6 +332,49 @@ impl Cache {
             #[cfg(test)]
             reopen_hook: None,
         })
+    }
+
+    /// The store is the guess of a default lookup that was denied
+    /// ([`StoreLookup::Denied`]): every call looks up the default store
+    /// again until it is found (see [`Cache::resolve_again`]).
+    pub fn with_denied_default(self) -> Cache {
+        self.with_profiles_base(default_profiles_dir())
+    }
+
+    /// [`Cache::with_denied_default`] with the profiles directory `base`;
+    /// without one there is nothing to look up again.
+    fn with_profiles_base(mut self, base: Option<PathBuf>) -> Cache {
+        if let Some(base) = base {
+            self.store_state = StoreState::DeniedDefault(base);
+        }
+        self
+    }
+
+    /// While the store path is not resolved: try again (`canonicalize` of
+    /// the given path, or the default lookup after a denied one). On
+    /// success the canonical path is the store from now on, the refresher
+    /// is told, and a `mail.db` refused under the old path may be tried
+    /// again (it may be the one built for this path). A resolved path is
+    /// never looked at again, so the store cannot change while it runs.
+    fn resolve_again(&mut self) {
+        let found = match &self.store_state {
+            StoreState::Resolved => return,
+            StoreState::Unresolved => std::fs::canonicalize(&self.store).ok(),
+            StoreState::DeniedDefault(base) => match find_default_store_in(base) {
+                StoreLookup::Found(p) => std::fs::canonicalize(p).ok(),
+                StoreLookup::Missing | StoreLookup::Denied(_) => None,
+            },
+        };
+        let Some(store) = found else {
+            return;
+        };
+        log(&format!("store path resolved: {}", store.display()));
+        self.store = store;
+        self.store_state = StoreState::Resolved;
+        if let Some(r) = self.refresher.as_mut() {
+            r.set_store(&self.store);
+        }
+        self.rejected_id = None;
     }
 
     /// Set the shortest time between two builds of a changed store; 0
@@ -372,7 +436,12 @@ impl Cache {
     /// (see [`Cache::wait_for_first_build`]). When a newer service replaced
     /// the open database with one of another format version, the call
     /// fails with [`OLDER_SERVER`] instead of answering from the old one.
+    ///
+    /// First of all, a store path that is not resolved yet is tried again
+    /// (see [`Cache::resolve_again`]); so is it in
+    /// [`Cache::force_refresh_at`].
     pub fn connection_at(&mut self, now: i64) -> Result<&Connection, String> {
+        self.resolve_again();
         if let Some(r) = self.refresher.as_mut() {
             let reply = r.touch(now);
             self.service = Some(ServiceView::of(&reply));
@@ -443,6 +512,7 @@ impl Cache {
     /// the service's status is asked so that [`Cache::status`] shows the
     /// failure.
     pub fn force_refresh_at(&mut self, now: i64) -> Result<(), String> {
+        self.resolve_again();
         let Some(r) = self.refresher.as_mut() else {
             return self.attempt(now, false);
         };
@@ -748,30 +818,80 @@ pub fn store_denied(store: &Path) -> bool {
     File::open(store).is_err_and(|e| e.kind() == ErrorKind::PermissionDenied)
 }
 
-/// `HxStore.hxd` of the default Outlook profile: under the profiles
-/// directory of `$HOME` (see [`default_store_path_in`]).
-pub fn default_store_path() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    default_store_path_in(&Path::new(&home).join(PROFILES_DIR))
+/// What the lookup of the default store found (see [`find_default_store`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StoreLookup {
+    /// The store of the profile to use.
+    Found(PathBuf),
+    /// No store, or several candidates.
+    Missing,
+    /// The profiles could not be examined for lack of permission; the
+    /// first candidate (`Main Profile`) as a guess.
+    Denied(PathBuf),
+}
+
+/// Outlook's profiles directory under `$HOME`; `None` without `HOME`.
+fn default_profiles_dir() -> Option<PathBuf> {
+    Some(Path::new(&std::env::var_os("HOME")?).join(PROFILES_DIR))
+}
+
+/// The default store: under the profiles directory of `$HOME` (see
+/// [`find_default_store_in`]); [`StoreLookup::Missing`] without `HOME`.
+pub fn find_default_store() -> StoreLookup {
+    default_profiles_dir().map_or(StoreLookup::Missing, |base| find_default_store_in(&base))
 }
 
 /// `HxStore.hxd` of the profile to use in the profiles directory `base`:
 /// `Main Profile`, else `Main Identity`, else the only profile directory
-/// that holds a store. `None` when there is no store or several candidates.
-pub fn default_store_path_in(base: &Path) -> Option<PathBuf> {
+/// that holds a store. [`StoreLookup::Denied`] when a main candidate or
+/// the listing of `base` cannot be examined for lack of permission, and
+/// when no store was found while another profile directory could not be
+/// examined.
+pub fn find_default_store_in(base: &Path) -> StoreLookup {
+    let guess = || StoreLookup::Denied(base.join("Main Profile").join(STORE_NAME));
+    let denied = |e: &std::io::Error| e.kind() == ErrorKind::PermissionDenied;
     for name in ["Main Profile", "Main Identity"] {
         let p = base.join(name).join(STORE_NAME);
-        if p.is_file() {
-            return Some(p);
+        match std::fs::metadata(&p) {
+            Ok(m) if m.is_file() => return StoreLookup::Found(p),
+            Err(e) if denied(&e) => return guess(),
+            _ => {}
         }
     }
-    let mut found = std::fs::read_dir(base)
-        .ok()?
-        .flatten()
-        .map(|e| e.path().join(STORE_NAME))
-        .filter(|p| p.is_file());
-    let first = found.next()?;
-    found.next().is_none().then_some(first)
+    let entries = match std::fs::read_dir(base) {
+        Ok(entries) => entries,
+        Err(e) if denied(&e) => return guess(),
+        Err(_) => return StoreLookup::Missing,
+    };
+    let mut found = Vec::new();
+    let mut unexamined = false;
+    for p in entries.flatten().map(|e| e.path().join(STORE_NAME)) {
+        match std::fs::metadata(&p) {
+            Ok(m) if m.is_file() => found.push(p),
+            Err(e) if denied(&e) => unexamined = true,
+            _ => {}
+        }
+    }
+    match (found.len(), unexamined) {
+        (1, _) => StoreLookup::Found(found.remove(0)),
+        (0, true) => guess(),
+        _ => StoreLookup::Missing,
+    }
+}
+
+/// `HxStore.hxd` of the default Outlook profile: under the profiles
+/// directory of `$HOME` (see [`default_store_path_in`]).
+pub fn default_store_path() -> Option<PathBuf> {
+    default_store_path_in(&default_profiles_dir()?)
+}
+
+/// The store [`find_default_store_in`] found in `base`; `None` when there
+/// is no store, several candidates, or a denial.
+pub fn default_store_path_in(base: &Path) -> Option<PathBuf> {
+    match find_default_store_in(base) {
+        StoreLookup::Found(p) => Some(p),
+        StoreLookup::Missing | StoreLookup::Denied(_) => None,
+    }
 }
 
 /// Open `path` read-only and read its `mcp_meta`. Fails unless the database
@@ -1647,6 +1767,235 @@ mod tests {
         let base = t.0.join("profiles");
         profile(&base, "Empty", false);
         assert_eq!(default_store_path_in(&base), None);
+    }
+
+    /// Whether the tests run as root, for whom mode 000 does not deny.
+    fn is_root() -> bool {
+        // SAFETY: geteuid() has no preconditions and cannot fail.
+        unsafe { libc::geteuid() == 0 }
+    }
+
+    /// Sets the mode of a directory and gives it mode 0700 back on drop,
+    /// also when the test fails, so the temp dir can be removed.
+    struct Locked(PathBuf);
+
+    impl Locked {
+        fn new(dir: &Path, mode: u32) -> Locked {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode)).unwrap();
+            Locked(dir.to_path_buf())
+        }
+    }
+
+    impl Drop for Locked {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+
+    #[test]
+    fn find_default_store_reports_found_missing_and_denied() {
+        if is_root() {
+            return;
+        }
+        let t = TestDir::new("lookup");
+        let base = t.0.join("profiles");
+        let main = base.join("Main Profile").join("HxStore.hxd");
+        assert_eq!(find_default_store_in(&base), StoreLookup::Missing);
+        profile(&base, "Work", true);
+        assert_eq!(
+            find_default_store_in(&base),
+            StoreLookup::Found(base.join("Work").join("HxStore.hxd"))
+        );
+        // The profiles directory cannot be examined.
+        {
+            let _l = Locked::new(&base, 0o000);
+            assert_eq!(
+                find_default_store_in(&base),
+                StoreLookup::Denied(main.clone())
+            );
+        }
+        // The main profile directory cannot be examined: it comes first.
+        profile(&base, "Main Profile", false);
+        {
+            let _l = Locked::new(&base.join("Main Profile"), 0o000);
+            assert_eq!(
+                find_default_store_in(&base),
+                StoreLookup::Denied(main.clone())
+            );
+        }
+        // Another profile directory cannot be examined: it does not hide the
+        // only store found, but it is the answer when none is found.
+        profile(&base, "Other", false);
+        {
+            let _l = Locked::new(&base.join("Other"), 0o000);
+            assert_eq!(
+                find_default_store_in(&base),
+                StoreLookup::Found(base.join("Work").join("HxStore.hxd"))
+            );
+            std::fs::remove_file(base.join("Work").join("HxStore.hxd")).unwrap();
+            assert_eq!(
+                find_default_store_in(&base),
+                StoreLookup::Denied(main.clone())
+            );
+        }
+        assert_eq!(find_default_store_in(&base), StoreLookup::Missing);
+    }
+
+    /// A refresher that records the paths given to `set_store` and answers
+    /// every request with `reply`.
+    #[derive(Debug, Clone)]
+    struct StoreRecorder {
+        stores: std::sync::Arc<std::sync::Mutex<Vec<PathBuf>>>,
+        reply: Result<ServiceStatus, String>,
+    }
+
+    impl StoreRecorder {
+        fn new(reply: Result<ServiceStatus, String>) -> StoreRecorder {
+            StoreRecorder {
+                stores: Default::default(),
+                reply,
+            }
+        }
+
+        fn stores(&self) -> Vec<PathBuf> {
+            self.stores.lock().unwrap().clone()
+        }
+    }
+
+    impl Refresher for StoreRecorder {
+        fn touch(&mut self, _now: i64) -> Result<ServiceStatus, String> {
+            self.reply.clone()
+        }
+        fn status(&mut self, _now: i64) -> Result<ServiceStatus, String> {
+            self.reply.clone()
+        }
+        fn refresh(&mut self, _now: i64) -> Result<ServiceStatus, String> {
+            self.reply.clone()
+        }
+        fn set_store(&mut self, store: &Path) {
+            self.stores.lock().unwrap().push(store.to_path_buf());
+        }
+    }
+
+    /// `t/s/HxStore.hxd` holding [`mail_store`], and the same file named
+    /// through the symbolic link `t/l` to its directory.
+    fn linked_store(t: &TestDir) -> (PathBuf, PathBuf) {
+        let s = t.0.join("s");
+        std::fs::create_dir(&s).unwrap();
+        std::fs::write(s.join("HxStore.hxd"), mail_store()).unwrap();
+        std::os::unix::fs::symlink(&s, t.0.join("l")).unwrap();
+        (s, t.0.join("l").join("HxStore.hxd"))
+    }
+
+    #[test]
+    fn store_path_that_cannot_be_resolved_is_resolved_at_the_first_call_that_can() {
+        if is_root() {
+            return;
+        }
+        let t = TestDir::new("unresolved");
+        let (s, linked) = linked_store(&t);
+        let canonical = std::fs::canonicalize(&linked).unwrap();
+        let rec = StoreRecorder::new(Err("down".into()));
+        let lock = Locked::new(&s, 0o000);
+        let mut c = Cache::new(&t.cache_dir(), &linked)
+            .unwrap()
+            .with_refresher(Box::new(rec.clone()));
+        assert_eq!(c.store_path(), linked);
+        assert!(c.connection_at(NOW_I).is_err());
+        assert_eq!(c.store_path(), linked);
+        assert!(rec.stores().is_empty());
+        drop(lock);
+        assert!(c.connection_at(NOW_I + 1).is_err());
+        assert_eq!(c.store_path(), canonical);
+        assert_eq!(rec.stores(), std::slice::from_ref(&canonical));
+        // Resolved once: the link now names another directory, unseen.
+        let other = t.0.join("other");
+        std::fs::create_dir(&other).unwrap();
+        std::fs::write(other.join("HxStore.hxd"), mail_store()).unwrap();
+        std::fs::remove_file(t.0.join("l")).unwrap();
+        std::os::unix::fs::symlink(&other, t.0.join("l")).unwrap();
+        assert!(c.connection_at(NOW_I + 2).is_err());
+        c.force_refresh_at(NOW_I + 3).unwrap_err();
+        assert_eq!(c.store_path(), canonical);
+        assert_eq!(rec.stores(), [canonical]);
+    }
+
+    #[test]
+    fn refresh_resolves_the_store_path_too() {
+        if is_root() {
+            return;
+        }
+        let t = TestDir::new("unresolvedrefresh");
+        let (s, linked) = linked_store(&t);
+        let canonical = std::fs::canonicalize(&linked).unwrap();
+        let rec = StoreRecorder::new(Err("down".into()));
+        let lock = Locked::new(&s, 0o000);
+        let mut c = Cache::new(&t.cache_dir(), &linked)
+            .unwrap()
+            .with_refresher(Box::new(rec.clone()));
+        drop(lock);
+        c.force_refresh_at(NOW_I).unwrap_err();
+        assert_eq!(c.store_path(), canonical);
+        assert_eq!(rec.stores(), [canonical]);
+    }
+
+    #[test]
+    fn denied_default_store_is_looked_up_again_and_may_be_another_profile() {
+        if is_root() {
+            return;
+        }
+        let t = TestDir::new("denieddefault");
+        let base = t.0.join("profiles");
+        profile(&base, "Work", true);
+        profile(&base, "Main Profile", false);
+        let lock = Locked::new(&base.join("Main Profile"), 0o000);
+        let StoreLookup::Denied(guess) = find_default_store_in(&base) else {
+            panic!("not denied");
+        };
+        let rec = StoreRecorder::new(Err("down".into()));
+        let mut c = Cache::new(&t.cache_dir(), &guess)
+            .unwrap()
+            .with_profiles_base(Some(base.clone()))
+            .with_refresher(Box::new(rec.clone()));
+        assert!(c.connection_at(NOW_I).is_err());
+        assert_eq!(c.store_path(), guess);
+        assert!(rec.stores().is_empty());
+        drop(lock);
+        assert!(c.connection_at(NOW_I + 1).is_err());
+        let work = std::fs::canonicalize(base.join("Work").join("HxStore.hxd")).unwrap();
+        assert_eq!(c.store_path(), work);
+        assert_eq!(rec.stores(), [work]);
+    }
+
+    #[test]
+    fn database_refused_while_unresolved_is_used_at_once_after_the_grant() {
+        if is_root() {
+            return;
+        }
+        let t = TestDir::new("refused");
+        let (s, linked) = linked_store(&t);
+        let canonical = std::fs::canonicalize(&linked).unwrap();
+        // The service built it for the store's canonical path.
+        Cache::new(&t.cache_dir(), &canonical)
+            .unwrap()
+            .build(NOW_I)
+            .unwrap();
+        let fake = FakeRefresher::new(Ok(fake_status(Some(NOW_I))));
+        let lock = Locked::new(&s, 0o000);
+        let mut c = Cache::new(&t.cache_dir(), &linked)
+            .unwrap()
+            .with_refresher(Box::new(fake.clone()))
+            .with_first_build_wait(WAIT, Duration::from_millis(10));
+        assert!(c.connection_at(NOW_I).is_err());
+        assert!(c.rejected_id.is_some());
+        drop(lock);
+        let touches = fake.counts().0;
+        let started = Instant::now();
+        assert_eq!(messages(&mut c, NOW_I + 1), 4);
+        assert!(started.elapsed() < WAIT / 2, "{:?}", started.elapsed());
+        assert_eq!(fake.counts().0, touches + 1);
+        assert_eq!(c.builds, 0);
+        assert_eq!(built_unix(&c), Some(NOW_I));
     }
 
     // --- refresh policy ---

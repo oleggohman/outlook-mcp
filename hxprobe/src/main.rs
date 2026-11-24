@@ -892,30 +892,31 @@ fn cmd_mcp(args: &[String]) {
         let _ = writeln!(std::io::stderr(), "{e}\n\n{USAGE}");
         std::process::exit(2);
     });
-    let store = opts
-        .store
-        .or_else(cache::default_store_path)
-        .unwrap_or_else(|| {
-            fail("no Outlook store found under the default profile directory; pass --store".into())
-        });
-    if !std::fs::metadata(&store).is_ok_and(|m| m.is_file()) {
-        fail(format!("{} is not a store file", store.display()));
-    }
-    // Only the header: the store itself is read from a private copy.
-    let mut head = Vec::with_capacity(0x40);
-    let header = File::open(&store)
-        .and_then(|f| f.take(0x40).read_to_end(&mut head))
-        .map_err(|e| e.to_string())
-        .and_then(|_| header::check(&head));
-    match header {
-        Err(e) => log(&format!("warning: {}: {e}", store.display())),
-        Ok(h) if !h.known => log(&format!(
-            "warning: {}: store version {:?} (0x{:02x}) is untested",
-            store.display(),
-            h.version as char,
-            h.version
+    // A store that cannot be examined for lack of permission is served
+    // anyway, so that tool calls can say what to do; the path is resolved
+    // again at every call until the access is granted.
+    let (store, denied_default) = match opts.store {
+        Some(s) => (s, false),
+        None => match cache::find_default_store() {
+            cache::StoreLookup::Found(p) => (p, false),
+            cache::StoreLookup::Denied(p) => (p, true),
+            cache::StoreLookup::Missing => fail(
+                "no Outlook store found under the default profile directory; pass --store".into(),
+            ),
+        },
+    };
+    let examined = if denied_default {
+        Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+    } else {
+        std::fs::metadata(&store)
+    };
+    match examined {
+        Ok(m) if m.is_file() => check_store_header(&store),
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => log(&format!(
+            "{} cannot be examined: permission denied; serving anyway",
+            store.display()
         )),
-        Ok(_) => {}
+        _ => fail(format!("{} is not a store file", store.display())),
     }
     let cache_dir = opts
         .cache_dir
@@ -925,6 +926,9 @@ fn cmd_mcp(args: &[String]) {
     let mut cache = cache::Cache::new(&cache_dir, &store)
         .unwrap_or_else(|e| fail(format!("cache directory {}: {e}", cache_dir.display())))
         .with_refresh_secs(refresh_secs);
+    if denied_default {
+        cache = cache.with_denied_default();
+    }
     log(&format!(
         "serving {} with cache {}",
         cache.store_path().display(),
@@ -963,6 +967,28 @@ fn cmd_mcp(args: &[String]) {
         std::io::stdout().lock(),
     ) {
         fail(format!("i/o error: {e}"));
+    }
+}
+
+/// Log a warning when the header of `store` is not one of a known store
+/// version. Only the header is read: the store itself is read from a
+/// private copy.
+fn check_store_header(store: &Path) {
+    use hxprobe::mcp::log;
+    let mut head = Vec::with_capacity(0x40);
+    let header = File::open(store)
+        .and_then(|f| f.take(0x40).read_to_end(&mut head))
+        .map_err(|e| e.to_string())
+        .and_then(|_| header::check(&head));
+    match header {
+        Err(e) => log(&format!("warning: {}: {e}", store.display())),
+        Ok(h) if !h.known => log(&format!(
+            "warning: {}: store version {:?} (0x{:02x}) is untested",
+            store.display(),
+            h.version as char,
+            h.version
+        )),
+        Ok(_) => {}
     }
 }
 
@@ -1122,8 +1148,8 @@ fn spawn_signal_thread(set: libc::sigset_t, stop: hxprobe::mcp::service::Stop) {
 /// the MCP servers that use it, until idle, a `shutdown` request, a signal,
 /// or the removal of its socket. Exit status 0 then; 1 when it cannot
 /// start, 2 on a usage error, 75 when another service holds the
-/// directory's `service.lock`, 77 when the store cannot be read for lack
-/// of permission. With `--status` or `--stop`, see [`cmd_service_client`].
+/// directory's `service.lock`, 77 when the store (or the default profile
+/// directory) cannot be examined or read for lack of permission. With `--status` or `--stop`, see [`cmd_service_client`].
 fn cmd_service(args: &[String]) {
     use hxprobe::mcp::service::{self, CacheBackend, Core, InstanceLock, LockError, Stop};
     use hxprobe::mcp::{self, cache, log, proto};
@@ -1150,17 +1176,37 @@ fn cmd_service(args: &[String]) {
         log(&msg);
         std::process::exit(1);
     };
-    let store = opts
-        .store
-        .or_else(cache::default_store_path)
-        .unwrap_or_else(|| {
-            fail("no Outlook store found under the default profile directory; pass --store".into())
-        });
-    if !std::fs::metadata(&store).is_ok_and(|m| m.is_file()) {
-        fail(format!("{} is not a store file", store.display()));
+    // A store that cannot be examined for lack of permission is the same
+    // exit as one that cannot be read (see below).
+    let denied = |store: &Path| -> ! {
+        log(&format!(
+            "{} cannot be examined: permission denied; exiting",
+            store.display()
+        ));
+        std::process::exit(service::EXIT_PERMISSION);
+    };
+    let is_denied = |e: &std::io::Error| e.kind() == std::io::ErrorKind::PermissionDenied;
+    let store = match opts.store {
+        Some(s) => s,
+        None => match cache::find_default_store() {
+            cache::StoreLookup::Found(p) => p,
+            cache::StoreLookup::Denied(p) => denied(&p),
+            cache::StoreLookup::Missing => fail(
+                "no Outlook store found under the default profile directory; pass --store".into(),
+            ),
+        },
+    };
+    match std::fs::metadata(&store) {
+        Ok(m) if m.is_file() => {}
+        Err(e) if is_denied(&e) => denied(&store),
+        _ => fail(format!("{} is not a store file", store.display())),
     }
-    let store =
-        std::fs::canonicalize(&store).unwrap_or_else(|e| fail(format!("{}: {e}", store.display())));
+    let store = std::fs::canonicalize(&store).unwrap_or_else(|e| {
+        if is_denied(&e) {
+            denied(&store)
+        }
+        fail(format!("{}: {e}", store.display()))
+    });
     let dir = cache_dir_or_default(opts.cache_dir)
         .unwrap_or_else(|| fail("HOME is not set; pass --cache-dir".into()));
     let dir = std::path::absolute(&dir).unwrap_or_else(|e| fail(format!("{}: {e}", dir.display())));

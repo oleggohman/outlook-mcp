@@ -542,6 +542,9 @@ pub trait Refresher: std::fmt::Debug {
     fn status(&mut self, now: i64) -> Result<ServiceStatus, String>;
     /// Build now (or join the running build) and wait for it.
     fn refresh(&mut self, now: i64) -> Result<ServiceStatus, String>;
+    /// The store path was resolved (see [`crate::mcp::cache::Cache`]):
+    /// from now on the service is started with `store` and must report it.
+    fn set_store(&mut self, _store: &Path) {}
 }
 
 #[cfg(test)]
