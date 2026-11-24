@@ -397,7 +397,8 @@ The repository is also a Claude Code plugin. It provides the `outlook` MCP
 server and the `outlook-local-mail` skill (`skills/`), which tells Claude Code
 how to use the tools. The plugin starts the server through
 `scripts/run-mcp.sh`, which finds or installs the `hxprobe` program for the
-version in `hxprobe/Cargo.toml` and then runs `hxprobe mcp`.
+version in `hxprobe/Cargo.toml` and then runs `hxprobe mcp`. For Claude
+Desktop see "Claude Desktop" below.
 
 The program is installed at one stable path for every version:
 
@@ -511,9 +512,10 @@ write that directory can also write `bin/.origin`. The boundary is the owner
 and the mode of the directory.
 
 To use a program you built yourself, set `HXPROBE_BIN` to its absolute path
-in the environment of Claude Code. The launcher then runs it as it is and
-installs nothing; the background service is started from that same program,
-which needs its own Full Disk Access entry (see below).
+in the environment in which the client (Claude Code or Claude Desktop)
+starts the launcher. The launcher then runs it as it is and installs
+nothing; the background service is started from that same program, which
+needs its own Full Disk Access entry (see below).
 
 Upgrading from 0.1.x: earlier launchers kept the program as
 `bin/hxprobe-<version>` in the plugin's data directory (`$CLAUDE_PLUGIN_DATA`,
@@ -523,6 +525,38 @@ lock that earlier launchers left there, are removed. The Full Disk Access
 entry of the old `hxprobe-0.1.x` program no longer applies; add the new path
 (see below) and remove the old entry. Restart the MCP clients after the
 update, so that no 0.1.x server keeps building the cache on its own.
+
+#### Claude Desktop
+
+The server reaches Claude Desktop in one of two ways.
+
+* **As the plugin.** When the plugin is installed in Claude Desktop from a
+  plugin marketplace, the same launcher starts the server. Everything in
+  this section then applies: the program is installed at
+  `/Users/Shared/hxprobe/bin/hxprobe`, its SHA-256 is checked at every
+  start, and after a fallback the permission errors end with a
+  ` Note: ...`. This project has not verified how Claude Desktop loads
+  plugins; for the steps, follow the documentation of the app or of your
+  organisation.
+* **As a program registered directly**, with the JSON entry of
+  "Registration". Claude Desktop then runs the program itself and the
+  launcher never runs. So:
+  * nothing installs or updates the program. Register
+    `/Users/Shared/hxprobe/bin/hxprobe`, which is there when the plugin
+    installed it for the same account (in Claude Code, for example), or
+    when an administrator placed the release program there as root (see
+    "For administrators: Full Disk Access by device profile"). A program
+    placed by an administrator is updated by the administrator;
+  * nothing compares the SHA-256 of the program with
+    `release/SHA256SUMS`, and the owner and mode of its directories are
+    not examined;
+  * there is no fallback to another directory, and no ` Note: ...` at the
+    end of a permission error: "When the shared directory is not used"
+    does not apply. A program that is missing at the registered path is
+    an error of the client, which cannot start the server.
+
+  A device profile for `/Users/Shared/hxprobe/bin/hxprobe` covers the
+  program in both ways, as long as that path is the one that runs.
 
 #### When the shared directory is not used
 
@@ -724,7 +758,10 @@ Other MCP clients, such as Claude Desktop, take a JSON entry such as:
 {"mcpServers": {"outlook": {"command": "/absolute/path/to/hxprobe", "args": ["mcp"]}}}
 ```
 
-Options go after `mcp`, in `args` for the JSON form.
+Options go after `mcp`, in `args` for the JSON form. Such an entry does not
+install the program: the file must already be at the path it names. What
+else the launcher does and a direct entry does not is listed under "Claude
+Desktop" above.
 
 ### Options
 

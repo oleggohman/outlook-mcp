@@ -99,7 +99,9 @@ user's own one. The error then ends with a note of this form:
 Note: the shared program /Users/Shared/hxprobe/bin/hxprobe was not used (<reason>); a device profile for that path does not cover this program
 ```
 
-Read the note to the user, reason included.
+Read the note to the user, reason included. The note comes from the
+plugin's launcher: a server that the client runs directly (registered with
+the program path, not as the plugin) never has one.
 
 - On a Mac without the device profile: add the path the error names, as in
   the steps above.
