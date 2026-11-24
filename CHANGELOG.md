@@ -4,7 +4,9 @@ All notable changes to this project are listed here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.2.1] - 2026-11-24
+
+Plugin release; the hxprobe program stays at 0.2.0.
 
 ### Changed
 
@@ -78,7 +80,7 @@ All notable changes to this project are listed here. The format follows
 - Prebuilt program for Apple Silicon Macs, verified by the launcher against
   `release/SHA256SUMS`.
 
-[Unreleased]: https://github.com/oleggohman/outlook-mcp/compare/v0.2.0...HEAD
+[0.2.1]: https://github.com/oleggohman/outlook-mcp/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/oleggohman/outlook-mcp/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/oleggohman/outlook-mcp/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/oleggohman/outlook-mcp/releases/tag/v0.1.0
