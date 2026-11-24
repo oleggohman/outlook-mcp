@@ -1315,7 +1315,9 @@ fn mcp_session_in_service_mode() {
     assert_eq!(st["service"]["version"], VERSION);
     assert_eq!(st["service"]["last_error"], Value::Null);
     let pid = st["service"]["pid"].as_u64().unwrap();
-    assert_eq!(m.tool("list_messages")["total"], 0);
+    let list = m.tool("list_messages");
+    assert_eq!(list["total"], 0);
+    assert!(list.get("warning").is_none(), "{list}");
     assert_eq!(m.tool("list_events")["total"], 0);
     let log = m.log();
     assert!(
@@ -1399,13 +1401,21 @@ fn unreadable_store_with_a_database_is_served_and_names_the_permission() {
     store_mode(&d, 0o000);
     let mut m = spawn_mcp(&d);
     let st = m.tool("store_status");
+    let list = m.tool("list_messages");
     store_mode(&d, 0o600);
     assert_eq!(st["built"], hxprobe::mcp::text::iso(built), "{st}");
     let e = st["last_error"].as_str().unwrap();
     assert!(e.contains("permission denied"), "{e}");
     assert_remedy(&d, e);
     assert_eq!(st["service"]["running"], false, "{st}");
-    assert_eq!(m.tool("list_messages")["total"], 0);
+    assert_eq!(list["total"], 0);
+    // The older data comes with a warning that says why.
+    let w = list["warning"].as_str().unwrap_or_else(|| panic!("{list}"));
+    assert!(w.starts_with("mail data is from "), "{w}");
+    assert!(
+        w.contains("cannot read the store: permission denied"),
+        "{w}"
+    );
 }
 
 /// `e` names the steps under Full Disk Access with the test program and

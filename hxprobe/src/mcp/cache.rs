@@ -544,11 +544,7 @@ impl Cache {
     /// service mode `last_error` and `last_attempt_unix` are the service's.
     pub fn status(&self) -> Status<'_> {
         let meta = self.db.as_ref().map(|(_, m)| m);
-        let (last_error, last_attempt_unix) = match (&self.refresher, &self.service) {
-            (None, _) => (self.last_error.as_deref(), self.last_attempt_unix),
-            (Some(_), Some(v)) => (v.last_error.as_deref(), v.last_attempt_unix),
-            (Some(_), None) => (None, None),
-        };
+        let (last_error, last_attempt_unix) = self.last_failure();
         Status {
             store_path: &self.store,
             meta,
@@ -557,6 +553,33 @@ impl Cache {
             last_attempt_unix,
             service: self.service.as_ref(),
         }
+    }
+
+    /// `last_error` and `last_attempt_unix` of [`Cache::status`]: this
+    /// value's own, or in service mode the service's as the last request
+    /// found it.
+    fn last_failure(&self) -> (Option<&str>, Option<i64>) {
+        match (&self.refresher, &self.service) {
+            (None, _) => (self.last_error.as_deref(), self.last_attempt_unix),
+            (Some(_), Some(v)) => (v.last_error.as_deref(), v.last_attempt_unix),
+            (Some(_), None) => (None, None),
+        }
+    }
+
+    /// While older data is served because the cache is not being
+    /// refreshed (`last_error` of [`Cache::status`] is set): a sentence
+    /// with the build time of the database in use and that error. Reads
+    /// only the state the last call stored: no request, no file access.
+    pub fn warning(&self) -> Option<String> {
+        let e = self.last_failure().0?;
+        let from = self
+            .db
+            .as_ref()
+            .and_then(|(_, m)| m.int("built_unix"))
+            .map_or_else(|| "an earlier build".to_string(), iso);
+        Some(format!(
+            "mail data is from {from} and is not being refreshed: {e}"
+        ))
     }
 
     /// Service mode, no usable `mail.db`: wait for the service's first
@@ -2910,6 +2933,96 @@ mod tests {
             building: true,
             ..fake_status(None)
         }
+    }
+
+    /// The warning for data built at `built` (`None`: unknown) while `e` is
+    /// the error.
+    fn warned(built: Option<i64>, e: &str) -> String {
+        let from = built.map_or_else(|| "an earlier build".to_string(), iso);
+        format!("mail data is from {from} and is not being refreshed: {e}")
+    }
+
+    #[test]
+    fn warning_is_none_while_all_is_well_or_a_build_runs() {
+        let t = TestDir::new("warnnone");
+        let fake = FakeRefresher::new(Ok(fake_status(Some(NOW_I))));
+        let mut c = served(&t, &fake);
+        rebuild_in(&t.cache_dir(), NOW_I);
+        assert_eq!(c.warning(), None);
+        assert_eq!(messages(&mut c, NOW_I), 4);
+        assert_eq!(c.warning(), None);
+        // A rebuild runs; the text the service sets at its start is not an
+        // error.
+        fake.script().reply = Ok(ServiceStatus {
+            building: true,
+            last_error: Some(BUILD_UNFINISHED.into()),
+            ..fake_status(Some(NOW_I))
+        });
+        assert_eq!(messages(&mut c, NOW_I + 1), 4);
+        assert_eq!(c.warning(), None);
+        assert_eq!(fake.counts(), (2, 0, 0));
+    }
+
+    #[test]
+    fn warning_names_the_build_time_and_the_error_in_service_mode() {
+        let t = TestDir::new("warnsvc");
+        let fake = FakeRefresher::new(Ok(fake_status(Some(NOW_I))));
+        let mut c = served(&t, &fake);
+        rebuild_in(&t.cache_dir(), NOW_I);
+        let denial = proto::denied_text(Denied::Service, &Remedy::default(), &t.cache_dir());
+        let replies = [
+            // The service is not available.
+            Err("the refresh service did not start; see service.log".to_string()),
+            // It was denied the store.
+            Err(denial),
+            // A build failed while it runs.
+            Ok(ServiceStatus {
+                last_error: Some("export: boom".into()),
+                ..fake_status(Some(NOW_I))
+            }),
+        ];
+        for (dt, reply) in (1..).zip(replies) {
+            let e = match &reply {
+                Ok(st) => st.last_error.clone().unwrap(),
+                Err(e) => e.clone(),
+            };
+            fake.script().reply = reply;
+            assert_eq!(messages(&mut c, NOW_I + dt), 4);
+            assert_eq!(c.warning(), Some(warned(Some(NOW_I), &e)));
+        }
+        // One request per call, none for the warning.
+        assert_eq!(fake.counts(), (3, 0, 0));
+    }
+
+    #[test]
+    fn warning_without_a_build_time_names_an_earlier_build() {
+        let t = TestDir::new("warnnotime");
+        let why = "the refresh service did not start; see service.log";
+        let fake = FakeRefresher::new(Err(why.into()));
+        let mut c = served(&t, &fake);
+        rebuild_in(&t.cache_dir(), NOW_I);
+        Connection::open(t.cache_dir().join("mail.db"))
+            .unwrap()
+            .execute("DELETE FROM mcp_meta WHERE key = 'built_unix'", [])
+            .unwrap();
+        assert_eq!(messages(&mut c, NOW_I), 4);
+        assert_eq!(c.warning(), Some(warned(None, why)));
+    }
+
+    #[test]
+    fn warning_in_fallback_mode_after_a_failed_rebuild() {
+        let t = TestDir::new("warnfallback");
+        let mut c = lazy(&t, 900);
+        assert_eq!(messages(&mut c, NOW_I), 4);
+        assert_eq!(c.warning(), None);
+        t.store(b"this is not a store file, only some text that is long enough");
+        assert_eq!(messages(&mut c, NOW_I + 1000), 4);
+        let e = c
+            .status()
+            .last_error
+            .expect("last_error is set")
+            .to_string();
+        assert_eq!(c.warning(), Some(warned(Some(NOW_I), &e)));
     }
 
     #[test]

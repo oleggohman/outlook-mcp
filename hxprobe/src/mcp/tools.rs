@@ -453,7 +453,12 @@ pub fn call(cache: &mut Cache, now: i64, name: &str, args: &Value) -> Result<Val
         }
         _ => {
             let conn = cache.connection_at(now).map_err(ToolError::Failed)?;
-            query(conn, now, name, &args)
+            let mut v = query(conn, now, name, &args)?;
+            // Older data is served: say so in the result itself.
+            if let Some(w) = cache.warning() {
+                v["warning"] = json!(w);
+            }
+            Ok(v)
         }
     }
 }
@@ -1131,6 +1136,48 @@ mod tests {
         );
         assert_eq!(s["last_error"], why);
         assert_eq!(s["messages"], 4);
+    }
+
+    /// Each mail tool with arguments it accepts.
+    fn mail_calls() -> Vec<(&'static str, Value)> {
+        vec![
+            ("list_folders", json!({})),
+            ("list_messages", json!({})),
+            ("search_messages", json!({"query": "zebra"})),
+            ("get_message", json!({"guid": msg(0)})),
+            ("list_attachments", json!({"message_guid": msg(0)})),
+            ("search_people", json!({"query": "a"})),
+            ("list_events", json!({"since": "2020-01-01"})),
+        ]
+    }
+
+    #[test]
+    fn mail_tools_warn_only_while_older_data_is_served() {
+        let fake = FakeRefresher::new(Ok(fake_status(Some(NOW_I))));
+        let mut f = served(&fake);
+        for (name, args) in mail_calls() {
+            let v = f.ok(name, args);
+            assert!(v.get("warning").is_none(), "{name}: {v}");
+        }
+
+        let why = "the refresh service did not start; see service.log";
+        let fake = FakeRefresher::new(Err(why.into()));
+        let mut f = served(&fake);
+        let want = format!(
+            "mail data is from {} and is not being refreshed: {why}",
+            iso(NOW_I)
+        );
+        for (name, args) in mail_calls() {
+            let v = f.ok(name, args);
+            assert_eq!(v["warning"], want, "{name}");
+        }
+        // The two tools that carry `last_error` never warn.
+        let s = f.ok("store_status", json!({}));
+        assert!(s.get("warning").is_none(), "{s}");
+        assert_eq!(s["last_error"], why);
+        fake.script().refresh_reply = Some(Ok(fake_status(Some(NOW_I))));
+        let s = f.ok("refresh", Value::Null);
+        assert!(s.get("warning").is_none(), "{s}");
     }
 
     #[test]
