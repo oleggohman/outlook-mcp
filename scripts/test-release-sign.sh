@@ -3,7 +3,10 @@
 # `codesign` and `shasum` are stubs on PATH. The codesign stub records its
 # arguments, prints its answers on stderr as the real one does, and appends
 # bytes to the file it signs, so the checksum must be that of the changed
-# file.
+# file. Its answer to `-d -r-` is what the real tool prints: an
+# `Executable=` line and then the `designated => ` line. Every case passes
+# a temporary profile of its own through HXPROBE_PROFILE, with a made-up
+# team, so no case reads the committed profile.
 
 set -euo pipefail
 
@@ -35,9 +38,32 @@ Authority=Apple Root CA
 Timestamp=1 Jan 2026 at 00:00:00
 TeamIdentifier=STUBTEAM"
 
+# Writes a profile to $1 whose Full Disk Access entry has the code
+# requirement $2; without $2 the entry has no CodeRequirement key.
+make_profile() {
+    local req=''
+    if [ "$#" -ge 2 ]; then
+        req=$(printf '%s' "$2" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g')
+        req="<key>CodeRequirement</key><string>$req</string>"
+    fi
+    cat > "$1" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+<key>PayloadContent</key>
+<array><dict><key>Services</key><dict><key>SystemPolicyAllFiles</key>
+<array><dict><key>Authorization</key><string>Allow</string>$req</dict></array>
+</dict></dict></array>
+</dict>
+</plist>
+EOF
+}
+
 # A case directory with the stubs in $1/stub and the answers of codesign in
 # $1/req (designated requirement), $1/info (-dvv), $1/verify-rc and
-# $1/sign-rc; $1/sign-err is what the stub prints when signing fails. The
+# $1/sign-rc; $1/sign-err is what the stub prints when signing fails;
+# $1/profile is a profile whose code requirement matches $1/req. The
 # `lipo` stub prints $1/archs and the `uname` stub $1/host-arch for `-m`;
 # the program is a script that answers --version with $1/prog-version.
 make_case() {
@@ -45,6 +71,7 @@ make_case() {
     c=$(mktemp -d "$root/case.XXXXXX")
     mkdir -p "$c/stub" "$c/work"
     printf '%s\n' "$good_req" > "$c/req"
+    make_profile "$c/profile" "${good_req#designated => }"
     printf '%s\n' "$good_info" > "$c/info"
     echo 0 > "$c/verify-rc"
     echo 0 > "$c/sign-rc"
@@ -108,7 +135,8 @@ EOF
 # Runs the script in $1/work with the script arguments $3...; $2 is the
 # identity: `unset`, `empty`, `set` (the made-up one) or `hash` (a
 # certificate hash, as codesign also accepts). HOME is $1/home; with
-# sign_debug=1 the script runs with HXPROBE_SIGN_DEBUG=1. Sets out, err, rc.
+# sign_debug=1 the script runs with HXPROBE_SIGN_DEBUG=1. HXPROBE_PROFILE is
+# always $1/profile. Sets out, err, rc.
 run() {
     local c=$1 mode=$2
     shift 2
@@ -117,6 +145,7 @@ run() {
         cd "$c/work"
         unset HXPROBE_SIGN_IDENTITY HXPROBE_SIGN_DEBUG
         export HOME="$c/home"
+        export HXPROBE_PROFILE="$c/profile"
         case "$mode" in
             empty ) export HXPROBE_SIGN_IDENTITY='' ;;
             set ) export HXPROBE_SIGN_IDENTITY="$identity" ;;
@@ -327,6 +356,87 @@ run_signed "$c"
 if [ "$rc" = 1 ] && [[ "$err" == *'does not verify (status 3)'* ]] \
     && [[ "$err" != *'valid on disk'* ]] && no_identity "$c"; then pass "$t"
 else fail "$t" "rc=$rc err='$err'"; fi
+
+# (vi) The signature is compared with the profile: the code requirement of
+# the profile must equal the `designated => ` line without its prefix. Only
+# the double quotes around the team value may differ.
+req_body=${good_req#designated => }
+quoted_body=${req_body/subject.OU] = STUBTEAM/subject.OU] = \"STUBTEAM\"}
+for v in 'profile quoted, stub plain' 'profile plain, stub quoted' 'profile quoted, stub quoted'; do
+    t="profile matches, $v"
+    c=$(make_case)
+    case "$v" in
+        'profile quoted'* ) make_profile "$c/profile" "$quoted_body" ;;
+        * ) make_profile "$c/profile" "$req_body" ;;
+    esac
+    case "$v" in
+        *'stub quoted' ) printf 'designated => %s\n' "$quoted_body" > "$c/req" ;;
+    esac
+    run_signed "$c"
+    if [ "$rc" = 0 ] && [[ "$out" == *"  $asset" ]] && [ -e "$c/work/$asset" ] \
+        && no_identity "$c"; then pass "$t"
+    else fail "$t" "rc=$rc out='$out' err='$err'"; fi
+done
+
+# A difference stops the script: status 1, no asset, and neither
+# requirement nor team in the output.
+profile_differs() {
+    # $1 = name, $2 = case dir
+    check_stops "$1" "$2" 'differs from the code requirement'
+    t="$1: requirement not shown"
+    if [[ "$err$out" != *'anchor apple generic'* ]] && [[ "$err$out" != *'designated =>'* ]] \
+        && [[ "$err$out" != *OTHERTEAM* ]] && [[ "$err$out" != *io.example.other* ]]; then pass "$t"
+    else fail "$t" "err='$err'"; fi
+}
+c=$(make_case)
+make_profile "$c/profile" "${req_body/STUBTEAM/OTHERTEAM}"
+profile_differs 'profile with another team' "$c"
+c=$(make_case)
+make_profile "$c/profile" "${req_body/identifier \"$ident\"/identifier \"io.example.other\"}"
+profile_differs 'profile with another identifier' "$c"
+c=$(make_case)
+make_profile "$c/profile" "$req_body and certificate leaf[field.1.2.3] /* exists */"
+profile_differs 'profile with an added clause' "$c"
+c=$(make_case)
+make_profile "$c/profile"
+check_stops 'profile without a CodeRequirement' "$c" 'CodeRequirement'
+c=$(make_case)
+rm "$c/profile"
+check_stops 'profile missing' "$c" "$c/profile"
+
+# (vii) Exactly one `designated => ` line is taken from what codesign
+# printed.
+c=$(make_case)
+printf '%s\n' "$req_body" > "$c/req"
+check_stops 'no designated line' "$c" 'designated => '
+c=$(make_case)
+printf '%s\n%s\n' "$good_req" "$good_req" > "$c/req"
+check_stops 'two designated lines' "$c" 'designated => '
+
+# (viii) --compare <signed program>: only the comparison, with no identity,
+# no signing and no file written.
+for v in match difference; do
+    t="compare only: $v"
+    c=$(make_case)
+    want_rc=0
+    if [ "$v" = difference ]; then
+        make_profile "$c/profile" "${req_body/STUBTEAM/OTHERTEAM}"
+        want_rc=1
+    fi
+    run "$c" unset --compare "$c/prog"
+    if [ "$rc" = "$want_rc" ] && [ -z "$out" ] && grep -q -e '-d -r-' "$c/codesign-args" \
+        && ! grep -q -e '--sign' "$c/codesign-args" && [ "$(work_files "$c")" = 0 ] \
+        && cmp -s "$c/prog" "$c/prog.orig" && no_identity "$c" \
+        && [[ "$err" != *OTHERTEAM* ]]; then pass "$t"
+    else fail "$t" "rc=$rc out='$out' err='$err' args='$(cat "$c/codesign-args" 2>/dev/null || true)'"; fi
+done
+t='compare only: usage'
+c=$(make_case)
+run "$c" unset --compare
+rc1=$rc
+run "$c" unset --compare "$c/missing"
+if [ "$rc1" = 2 ] && [ "$rc" = 2 ] && [ ! -e "$c/codesign-args" ]; then pass "$t"
+else fail "$t" "rc=$rc1/$rc err='$err'"; fi
 
 if [ "$failures" -ne 0 ]; then
     printf '%d case(s) failed\n' "$failures"
