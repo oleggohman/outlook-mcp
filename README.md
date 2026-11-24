@@ -615,11 +615,12 @@ plugin installs it at `/Users/Shared/hxprobe/bin/hxprobe`.
 
 ### Full Disk Access
 
-The Outlook store lives in another app's container. Depending on how the MCP
-client starts the server, macOS checks the permission of the hxprobe program
-itself, not that of the client; giving the client Full Disk Access then does
-not help. The store is read by the background service, which runs detached
-from the client.
+The Outlook store lives in another app's container, so reading it needs Full
+Disk Access. The store is read by the background service, which the server
+starts. A grant for the hxprobe program is what the device profile gives; a
+grant for the app that starts the server (the MCP client, or the terminal app
+it runs in) has also been seen to be enough on its own. On a Mac that an
+organisation manages with the device profile, users have nothing to set up.
 
 When macOS denies the access, a tool error, the `warning` of a mail tool
 result and the `last_error` of `store_status` say so, name the program to

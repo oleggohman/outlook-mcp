@@ -38,14 +38,38 @@ If a tool error, a `warning` or the top-level `last_error` of `store_status`
 contains `cannot read the store: permission denied`, macOS blocked the
 hxprobe program. Errors of earlier versions say
 `Operation not permitted (os error 1)` for the store instead. Retrying at
-once does not help,
-and nothing you run can fix it: stop and give the user these steps.
+once does not help, and nothing you run can fix it: stop.
 
-macOS checks the permission of the hxprobe program itself, not the MCP
-client's or Terminal's: the store is read by hxprobe's background service,
-which runs detached from the client. Giving the client Full Disk Access is
-therefore not expected to help, and the same store can open fine from
-Terminal.
+First find out which kind of Mac this is. If the user has not said, ask
+once: "Is this a work Mac managed by your organisation?"
+
+### On a Mac managed by an organisation
+
+The organisation grants the access on every Mac with a device profile, so
+the user has nothing to set up, and a standard user cannot change the Full
+Disk Access list anyway. Do not walk the user through System Settings.
+
+A permission error on such a Mac means the profile has not reached this Mac
+yet, or does not cover the program the error names. Tell the user:
+
+1. Nothing is wrong with their mail and there is nothing for them to
+   change.
+2. Send the administrator (IT) the error text, complete and unchanged. It
+   names the program path and, when there is one, the ` Note: ...` at the
+   end; both are what the administrator needs.
+3. When the administrator says it is fixed, ask again. No restart is needed
+   unless the error says `restart the MCP client`.
+
+Until then, answer from the data the server still serves, and say from when
+it is (see `warning` under "Freshness").
+
+### On the user's own Mac
+
+Full Disk Access for either of two things lets the server read the store:
+the hxprobe program the error names, or the app that starts the server (the
+MCP client, or the terminal app it runs in). Give the steps for the program
+first; when the error stays after them, the same steps for the app are the
+next thing to try.
 
 The error names the program and the next steps. With the background
 service (the usual case) it reads:
@@ -67,11 +91,8 @@ used").
 2. Tell the user: open System Settings → Privacy & Security → Full Disk
    Access and click **+**. Press Cmd+Shift+G, paste the path, click Open and
    make sure its toggle is on. If it is already listed, remove it with **–**
-   and add it again. Changing this list needs an administrator of the Mac:
-   a standard user asks one. In an organisation the administrator can grant
-   the access on every Mac at once with the device profile in `mdm/` of the
-   hxprobe repository (`mdm/hxprobe-full-disk-access.mobileconfig`); it
-   covers `/Users/Shared/hxprobe/bin/hxprobe` only.
+   and add it again. Changing this list needs an administrator password of
+   the Mac.
 3. After the user confirms, wait 10 seconds and call `store_status`. No
    restart and no Terminal step is needed: that call starts a fresh
    background service, which now has the permission. When `last_error` is
@@ -82,11 +103,22 @@ used").
    single quotes), to run in Terminal; then call `store_status` again.
 5. With `--no-service` there is no service to stop: after the grant the user
    restarts the MCP client (see "Restarting the MCP client").
+6. If the error is still there, repeat step 2 for the app that starts the
+   server (Claude Desktop, or the terminal app Claude Code runs in), then
+   have the user restart that app.
 
 Upgrading from hxprobe 0.2.1 or earlier: those versions kept the program in
 the user's own Library folder. A Full Disk Access entry for that program does
 not cover `/Users/Shared/hxprobe/bin/hxprobe`; the new path needs its own
-entry (or the device profile). Do not tell the user to add the old path.
+entry. Do not tell the user to add the old path.
+
+### For administrators
+
+The device profile is `mdm/hxprobe-full-disk-access.mobileconfig` in the
+hxprobe repository. It grants Full Disk Access to
+`/Users/Shared/hxprobe/bin/hxprobe` only, and is delivered by the device
+management service; it cannot be installed by opening the file. Mention it
+only when the user says they administer the Macs.
 
 ### When the shared directory is not used
 
@@ -104,11 +136,11 @@ Read the note to the user, reason included. The note comes from the
 plugin's launcher: a server that the client runs directly (registered with
 the program path, not as the plugin) never has one.
 
-- On a Mac without the device profile: add the path the error names, as in
-  the steps above.
-- On a Mac with the device profile (one managed by an organisation): the
-  profile does not cover this program, and the user cannot fix that alone.
-  Tell them to pass the note to their administrator, who either removes or
+- On the user's own Mac: add the path the error names, as in the steps
+  above.
+- On a Mac managed by an organisation: the profile does not cover this
+  program, and the user cannot fix that alone. Tell them to pass the whole
+  error, note included, to their administrator, who either removes or
   repairs `/Users/Shared/hxprobe`, or creates it as root with the release
   program. After that the user restarts the MCP client, so that the plugin
   chooses the program again.
@@ -233,7 +265,7 @@ and say the full text is not cached.
 | `this cache directory serves another store` | Another server uses this cache for another Outlook store. Tell the user to give this server its own `--cache-dir`. Do not retry. |
 | `did not finish within` ... `and may still be running` | The rebuild goes on. Call `store_status` until `service.building` is false; do not call `refresh` again. |
 | `the refresh service did not start` or `exited at start` | Report it with the `service.log` path it names. Calls still answer from an existing cache. |
-| `cannot read the store: permission denied` | Follow "Permission errors". Do not retry before the user has granted the access. Also given when the default store cannot be looked up. |
+| `cannot read the store: permission denied` | Follow "Permission errors": on a managed Mac the error goes to the administrator, on the user's own Mac the user grants the access. Do not retry before that. Also given when the default store cannot be looked up. |
 | `no Outlook store found under the default profile directory; pass --store` | The server has no `--store` and found no default store. Tell the user to register it with `--store <path of HxStore.hxd>` and restart the MCP client. Do not retry. |
 | `mail data is from` ... `and is not being refreshed` (a `warning`) | Tell the user the data is old and why, call `store_status`, and act on its `last_error`. |
 
@@ -300,8 +332,10 @@ back to the user's zone. If two senders match "dana", show both and ask.
 - Calling `search_people` only to get an address for `from`.
 - Reporting `unread_count` as the number of messages that can be listed.
 - On "cannot read the store: permission denied" or "Operation not
-  permitted": retrying, or telling the user to give the client or Terminal
-  Full Disk Access. The hxprobe program itself needs it.
+  permitted": retrying before anything changed.
+- On a Mac managed by an organisation: walking the user through System
+  Settings. They have nothing to set up and cannot change that list; the
+  error goes to their administrator.
 - Ignoring a `warning`, or presenting the mail of a result that carries one
   as current.
 - After the update to 0.2.2, telling the user to add the program path of
