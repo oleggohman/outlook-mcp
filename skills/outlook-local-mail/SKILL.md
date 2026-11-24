@@ -36,8 +36,8 @@ permitted`, `os error 1` or `permission denied` for the Outlook store, macOS
 blocked the hxprobe program. Retrying does not help, and nothing you run can
 fix it: stop and give the user these steps.
 
-Claude starts hxprobe as a "disclaimed" helper, so macOS checks hxprobe's own
-permissions, not Claude's or Terminal's. That is why giving Claude Full Disk
+The MCP client starts hxprobe as a "disclaimed" helper, so macOS checks hxprobe's own
+permissions, not the client's or Terminal's. That is why giving the client Full Disk
 Access does not help, and why the same store opens fine from Terminal.
 
 1. Find the program path. It is
@@ -217,7 +217,7 @@ back to the user's zone. If two senders match "dana", show both and ask.
   local midnight. Use the full `...Z` form for local day boundaries.
 - Calling `search_people` only to get an address for `from`.
 - Reporting `unread_count` as the number of messages that can be listed.
-- On "Operation not permitted": retrying, or telling the user to give Claude
+- On "Operation not permitted": retrying, or telling the user to give the client
   or Terminal Full Disk Access. The hxprobe program itself needs it.
 - Retrying on "restart the MCP client" or "serves another store": only the
   user can fix those.

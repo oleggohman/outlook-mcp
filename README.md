@@ -325,7 +325,7 @@ before `limit` and `offset`. Times in results are UTC, as
 
 | Tool | Arguments | Result |
 |---|---|---|
-| `store_status` | none | store path, build time, whether the store changed since the build, counts of messages, folders, people and events, build time per phase, the last build error, and the background service (`service`, see "Background service"); answered at once |
+| `store_status` | none | store path, build time, whether the store changed since the build, counts of messages, folders, people, events and objects, the fixed-length mismatch count, build time per phase, the last build error, and the background service (`service`, see "Background service"); answered at once |
 | `refresh` | none | rebuilds the cache now (even when the store did not change), waits for the build, then returns `store_status` |
 | `list_folders` | `limit`, `offset` | folders with `guid, name, parent`, the counts stored by Outlook (`total_count, unread_count`) and the counts of locally cached mail (`cached_messages, cached_unread`); most cached messages first |
 | `list_messages` | `folder`, `unread_only`, `has_attachment`, `from`, `since`, `until`, `limit`, `offset` | messages with `guid, subject, sender_name, sender_address, sent, is_read, has_attachment, folder, preview`; newest first |
@@ -923,7 +923,7 @@ Developer ID Application certificate, the runtime flag), the architecture
 and, on a machine of that architecture, the version. `HXPROBE_SIGN_IDENTITY`
 is required and never printed. What `codesign` prints when it fails is not
 shown; run with `HXPROBE_SIGN_DEBUG=1` to see it, with the signer, team and
-home directory removed.
+home directory and user names removed.
 
 On success the script prints one line on stdout, `<sha256>  <asset>`,
 computed from the signed file. Publish exactly that file as the asset of the
