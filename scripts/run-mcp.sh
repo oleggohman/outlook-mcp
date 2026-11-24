@@ -35,7 +35,12 @@
 #           user, not writable by group or others, without an access list:
 #           used with all of the rules below; its directories and the
 #           program get mode 0755, bin/.origin 0644;
-#   root    the same, owned by root: not used yet;
+#   root    the same, owned by root: only read. Its program is run when its
+#           SHA-256 is listed with the wanted version, or with an older one
+#           (with a log line: an administrator has to update it); nothing
+#           is written there, no lock is taken, nothing is downloaded. A
+#           missing program or one that is not listed (also a newer one,
+#           and any program when shasum is missing) is not run;
 #   other   anything else (a link anywhere, another file type, a write bit
 #           for group or others, an access list, another account, mixed
 #           owners): not used. An own directory that is or was open to
@@ -131,6 +136,38 @@ case "$version" in
     '' ) die "no version found in the [package] table of $manifest" ;;
     *[!0-9A-Za-z.+-]* ) die "unexpected version '$version' in $manifest" ;;
 esac
+
+# Prints -1, 0 or 1 when version $1 is older than, equal to or newer than $2,
+# comparing major, minor and patch as numbers. With equal numbers a
+# pre-release (a suffix after `-`) is older than the version without one, and
+# two pre-releases compare as text; build metadata after `+` is ignored.
+# Prints `?` when either is not of that form.
+version_cmp() {
+    awk -v a="$1" -v b="$2" '
+        function parse(v, p,    n) {
+            sub(/[-+].*$/, "", v)
+            if (v !~ /^[0-9]+\.[0-9]+\.[0-9]+$/) return 0
+            n = split(v, p, ".")
+            return n == 3
+        }
+        function pre(v,    i) {
+            sub(/\+.*$/, "", v)
+            i = index(v, "-")
+            return i ? substr(v, i + 1) : ""
+        }
+        BEGIN {
+            if (!parse(a, x) || !parse(b, y)) { print "?"; exit }
+            for (i = 1; i <= 3; i++) {
+                if (x[i] + 0 < y[i] + 0) { print -1; exit }
+                if (x[i] + 0 > y[i] + 0) { print 1; exit }
+            }
+            pa = pre(a); pb = pre(b)
+            if (pa == pb) print 0
+            else if (pa == "") print 1
+            else if (pb == "") print -1
+            else print ((pa "") < (pb "")) ? -1 : 1
+        }'
+}
 
 # The architecture of the release programs for this machine (arm64 or
 # x86_64); fails on another system or machine.
@@ -266,13 +303,14 @@ classify_shared() {
     if [ "$owner" = "$myuid" ]; then chain=own; else chain=root; fi
 }
 
-# Succeeds when shared directory $1 is to be used as the install directory:
-# its parent is safe and the chain is the user's own. An absent directory
-# (and a missing `bin` in it) is made with mkdir under umask 022, and the
-# chain is then classified again from what is on disk, whether mkdir
-# succeeded or not: a directory or link that another account put there in
-# between is judged like any other. Otherwise `reason` says why it is not
-# used. A root chain is not used yet.
+# Succeeds when shared directory $1 is to be used: its parent is safe and the
+# chain is the user's own, or root's with a program whose SHA-256 is listed
+# (`chain` tells which). An absent directory (and a missing `bin` in it) is
+# made with mkdir under umask 022, and the chain is then classified again
+# from what is on disk, whether mkdir succeeded or not: a directory or link
+# that another account put there in between is judged like any other. A
+# root chain is only read: nothing is made or written there. Otherwise
+# `reason` says why it is not used.
 shared_usable() {
     case "$1" in
         /?* ) ;;
@@ -291,9 +329,34 @@ shared_usable() {
     fi
     case "$chain" in
         own ) return 0 ;;
-        root ) reason="$1 is owned by root" ;;
+        root ) root_listed "$1/bin/hxprobe" ;;
+        * ) return 1 ;;
     esac
-    return 1
+}
+
+# Succeeds when program $1 of a root-owned chain is to be run: its SHA-256
+# is listed with the wanted version, or with an older one (logged: only an
+# administrator can update it). A program that is not listed, also a newer
+# one this plugin does not know, is not run; `reason` says why.
+root_listed() {
+    local have
+    if ! [ -e "$1" ]; then reason="$(dirname "$(dirname "$1")") is owned by root and $1 does not exist"; return 1; fi
+    if ! [ -x "$1" ]; then reason="$1 is owned by root and is not executable"; return 1; fi
+    if ! command -v shasum >/dev/null 2>&1; then
+        reason="$1 is owned by root and shasum is not available to check its SHA-256"
+        return 1
+    fi
+    have=$(listed_version "$1")
+    if [ -z "$have" ]; then
+        reason="$1 is owned by root and its SHA-256 is not listed for this machine in $sums_file"
+        return 1
+    fi
+    case "$(version_cmp "$have" "$version")" in
+        0 ) ;;
+        -1 ) log "hxprobe $have at $1 is older than $version of this plugin; running it. It is owned by root: an administrator has to update it" ;;
+        1 ) log "hxprobe $have at $1 is newer than $version of this plugin; running it" ;;
+        * ) reason="$1 is owned by root and its listed version '$have' cannot be compared"; return 1 ;;
+    esac
 }
 
 # HOME is only needed for the per-user defaults; it may be unset or empty.
@@ -315,6 +378,11 @@ if [ -z "$inst" ]; then
     shared=${HXPROBE_SHARED_DIR:-$shared_default}
     reason=''
     if shared_usable "$shared"; then
+        # A verified root-owned program is run as it is, before anything
+        # could be written to its directory.
+        if [ "$chain" = root ]; then
+            run_server "$shared/bin/hxprobe" ${1+"$@"}
+        fi
         inst=$shared
         in_shared=1
         dir_mode=755
@@ -346,38 +414,6 @@ if ! [ -O "$inst" ] || ! [ -O "$bindir" ]; then
     die "$inst or $bindir is not owned by the current user; set HXPROBE_INSTALL_DIR to a directory of your own"
 fi
 chmod "$dir_mode" "$inst" "$bindir" || die "cannot set the mode of $inst and $bindir"
-
-# Prints -1, 0 or 1 when version $1 is older than, equal to or newer than $2,
-# comparing major, minor and patch as numbers. With equal numbers a
-# pre-release (a suffix after `-`) is older than the version without one, and
-# two pre-releases compare as text; build metadata after `+` is ignored.
-# Prints `?` when either is not of that form.
-version_cmp() {
-    awk -v a="$1" -v b="$2" '
-        function parse(v, p,    n) {
-            sub(/[-+].*$/, "", v)
-            if (v !~ /^[0-9]+\.[0-9]+\.[0-9]+$/) return 0
-            n = split(v, p, ".")
-            return n == 3
-        }
-        function pre(v,    i) {
-            sub(/\+.*$/, "", v)
-            i = index(v, "-")
-            return i ? substr(v, i + 1) : ""
-        }
-        BEGIN {
-            if (!parse(a, x) || !parse(b, y)) { print "?"; exit }
-            for (i = 1; i <= 3; i++) {
-                if (x[i] + 0 < y[i] + 0) { print -1; exit }
-                if (x[i] + 0 > y[i] + 0) { print 1; exit }
-            }
-            pa = pre(a); pb = pre(b)
-            if (pa == pb) print 0
-            else if (pa == "") print 1
-            else if (pb == "") print -1
-            else print ((pa "") < (pb "")) ? -1 : 1
-        }'
-}
 
 # The version that the program $1 reports (`hxprobe <version>` from
 # `--version`), or nothing when it is missing or gives no such answer.

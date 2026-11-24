@@ -1130,7 +1130,7 @@ else fail "$t" "rc=$rc out='$out' target='$target' err='$err'"; fi
 rm -rf "$root/home"
 
 # (xix) Which shared directory is used. A chain that is not the user's own
-# (or root's, from a later step) is never used: the launcher falls back to
+# (or root's with a listed program, see (xxi)) is never used: the launcher falls back to
 # $HOME/Library/Application Support/hxprobe, says why, and writes nothing
 # through or into the shared path.
 own_dir="$root/home/Library/Application Support/hxprobe"
@@ -1160,7 +1160,7 @@ if [ "$(id -u)" = "$other_uid" ]; then other_uid=4243; fi
 
 for kind in 'a link to a directory' 'a regular file' 'bin is a link' 'the program is a link' \
         'mode 775' 'mode 777' 'an access list' 'the parent is missing' \
-        'the parent is writable by others' 'another owner' 'root owner'; do
+        'the parent is writable by others' 'another owner'; do
     t="shared directory not used: $kind"
     r=$(make_repo)
     make_asset "$r"
@@ -1186,17 +1186,13 @@ for kind in 'a link to a directory' 'a regular file' 'bin is a link' 'the progra
         'the parent is missing' ) s="$r/missing/hxprobe"; phrase="$r/missing does not exist" ;;
         'the parent is writable by others' )
             chmod 777 "$(dirname "$s")"; phrase="$(dirname "$s") is writable by others and not sticky" ;;
-        'another owner' | 'root owner' )
+        'another owner' )
             # A chain of another account with the release program, whatever
             # its checksum: the ls stub shows another owner.
             mkdir -m 755 "$s" "$s/bin"
             cp "$r/rel/v$version/$asset" "$s/bin/hxprobe"
             echo "release $(awk '{ print $1 }' "$r/release/SHA256SUMS")" > "$s/bin/.origin"
-            if [ "$kind" = 'root owner' ]; then
-                make_ls_owner "$r" 0; phrase="$s is owned by root"
-            else
-                make_ls_owner "$r" "$other_uid"; phrase="$s is owned by another account (uid $other_uid)"
-            fi ;;
+            make_ls_owner "$r" "$other_uid"; phrase="$s is owned by another account (uid $other_uid)" ;;
     esac
     before=$(tree_state "$s"; tree_state "$r/elsewhere")
     run "$r" HXPROBE_INSTALL_DIR= HXPROBE_SHARED_DIR="$s" HXPROBE_RELEASE_BASE="file://$r/rel" \
@@ -1447,6 +1443,99 @@ run "$r" HXPROBE_INSTALL_DIR= HXPROBE_RELEASE_BASE="file://$r/rel" PATH="$r/stub
 if [ "$rc" = 0 ] && [ "$out" = 'FAKE mcp' ] && [ "$(cat "$r/ran.path")" = "$s/bin/hxprobe" ] \
     && [ -e "$r/ran.asked" ] && [ ! -e "$r/curl-args" ] && [ -z "$err" ]; then pass "$t"
 else fail "$t" "rc=$rc out='$out' err='$err'"; fi
+rm -rf "$root/home"
+
+# (xxi) A shared directory owned by root (the ls stub shows uid 0) is used
+# read-only, and only for a program whose SHA-256 is listed: nothing is
+# written there, no lock is taken, nothing is downloaded and no mode is set.
+
+# A chmod stub in $1/stub that records its arguments in $1/chmod-args and
+# runs the real chmod.
+make_chmod_probe() {
+    mkdir -p "$1/stub"
+    printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "%s/chmod-args"\nexec /bin/chmod "$@"\n' "$1" > "$1/stub/chmod"
+    chmod 755 "$1/stub/chmod"
+}
+
+for kind in wanted older; do
+    t="root-owned shared program listed, $kind version"
+    r=$(make_repo)
+    make_asset "$r"
+    make_curl_probe "$r"
+    make_chmod_probe "$r"
+    make_ls_owner "$r" 0
+    rm -rf "$root/home"
+    s=$(shared_of "$r")
+    if [ "$kind" = wanted ]; then
+        prog="$r/rel/v$version/$asset"; marker="$r/ran"
+    else
+        make_fake "$r/older" "$r/old-ran" '' 9.8.6
+        printf '%s  %s\n' "$(sum_of "$r/older")" "hxprobe-9.8.6-macos-$arch" >> "$r/release/SHA256SUMS"
+        prog="$r/older"; marker="$r/old-ran"
+    fi
+    put_program "$s" "$prog" 'root record'
+    before=$(tree_state "$s")
+    run "$r" HXPROBE_INSTALL_DIR= HXPROBE_INSTALL_NOTE=stale HXPROBE_RELEASE_BASE="file://$r/rel" \
+        PATH="$r/stub:$nocargo_path" -- a
+    if [ "$kind" = wanted ]; then log_ok=$([ -z "$err" ] && echo 1 || echo 0)
+    else log_ok=$([[ "$err" == *'9.8.6'*'administrator'* ]] && echo 1 || echo 0); fi
+    if [ "$rc" = 0 ] && [ "$out" = 'FAKE mcp a' ] && [ "$(cat "$marker.path" 2>/dev/null || true)" = "$s/bin/hxprobe" ] \
+        && [ "$(cat "$marker.note" 2>/dev/null || true)" = '(unset)' ] && [ "$log_ok" = 1 ] \
+        && [ ! -e "$marker.asked" ] && [ ! -e "$s/install.lock" ] && [ "$(origin_of "$s")" = 'root record' ] \
+        && [ ! -e "$r/chmod-args" ] && [ ! -e "$r/curl-args" ] && [ "$(tree_state "$s")" = "$before" ] \
+        && [ ! -e "$root/home" ] && [ ! -e "$r/inst" ]; then pass "$t"
+    else fail "$t" "rc=$rc out='$out' asked=$([ -e "$marker.asked" ] && echo yes || echo no) chmod='$(cat "$r/chmod-args" 2>/dev/null || true)' err='$err'"; fi
+done
+
+# A root chain that cannot be used: the program in it is never executed (no
+# marker of any kind), and the per-user program is installed and run with
+# the note. Without shasum nothing can be verified, the download included,
+# so the per-user program is built.
+for kind in 'not listed' 'no program' 'mode 775' 'no shasum'; do
+    t="root-owned shared directory not used: $kind"
+    r=$(make_repo)
+    make_asset "$r"
+    make_cargo_stub "$r" ''
+    make_ls_owner "$r" 0
+    rm -rf "$root/home"
+    s=$(shared_of "$r")
+    path="$r/stub:$nocargo_path"
+    if [ "$kind" = 'not listed' ]; then
+        make_fake "$r/shared-prog" "$r/shared-ran" '' "$version"
+    else
+        make_fake "$r/shared-prog" "$r/shared-ran" '' 9.8.6
+        printf '%s  %s\n' "$(sum_of "$r/shared-prog")" "hxprobe-9.8.6-macos-$arch" >> "$r/release/SHA256SUMS"
+    fi
+    put_program "$s" "$r/shared-prog" 'root record'
+    case "$kind" in
+        'not listed' ) phrase="$s/bin/hxprobe is owned by root and its SHA-256 is not listed" ;;
+        'no program' ) rm -f "$s/bin/hxprobe"; phrase="$s is owned by root and $s/bin/hxprobe does not exist" ;;
+        'mode 775' ) chmod 775 "$s"; phrase="$s is writable by group or others" ;;
+        'no shasum' )
+            mkdir -p "$r/tools"
+            for f in /usr/bin/*; do
+                case "${f##*/}" in shasum ) ;; * ) ln -s "$f" "$r/tools/${f##*/}" ;; esac
+            done
+            path="$r/stub:$r/tools:/bin"
+            phrase="$s/bin/hxprobe is owned by root and shasum is not available to check its SHA-256" ;;
+    esac
+    before=$(tree_state "$s")
+    run "$r" HXPROBE_INSTALL_DIR= HXPROBE_RELEASE_BASE="file://$r/rel" PATH="$path" --
+    note="the shared program $s/bin/hxprobe was not used ($phrase"
+    if [ "$kind" = 'no shasum' ]; then
+        ok=0
+        if [ "$rc" = 0 ] && [ "$out" = 'BUILT mcp' ] && [ "$(origin_of "$own_dir")" = build ] \
+            && [[ "$err" == *"$note"*'); a device profile for that path does not cover this program'* ]]; then ok=1; fi
+    else
+        ok=0; fell_back "$s" "$phrase" && ok=1
+        got=$(cat "$r/ran.note" 2>/dev/null || true)
+        [[ "$got" == "$note"*'); a device profile for that path does not cover this program' ]] || ok=0
+    fi
+    if [ "$ok" = 1 ] && [ ! -e "$r/shared-ran" ] && [ ! -e "$r/shared-ran.asked" ] \
+        && [ "$(tree_state "$s")" = "$before" ] && [ ! -e "$s/install.lock" ] \
+        && lock_free "$own_dir"; then pass "$t"
+    else fail "$t" "rc=$rc out='$out' note='$(cat "$r/ran.note" 2>/dev/null || true)' err='$err'"; fi
+done
 rm -rf "$root/home"
 
 # (last) No case reached the real shared directory: it is as it was before
