@@ -22,7 +22,8 @@
 #           chain is classified again from what is on disk;
 #   own     every element a real directory or regular file of the current
 #           user, not writable by group or others, without an access list:
-#           used with all of the rules below;
+#           used with all of the rules below; its directories and the
+#           program get mode 0755, bin/.origin 0644;
 #   root    the same, owned by root: not used yet;
 #   other   anything else (a link anywhere, another file type, a write bit
 #           for group or others, an access list, another account, mixed
@@ -32,7 +33,12 @@
 # When the shared directory is not used, the launcher says why on stderr and
 # falls back to $HOME/Library/Application Support/hxprobe, the user's own
 # directory with mode 0700. An explicit HXPROBE_INSTALL_DIR follows the rules
-# of that fallback directory.
+# of that fallback directory. After a fallback the same sentence is passed to
+# the server in HXPROBE_INSTALL_NOTE, which appends it to its permission
+# errors; in every other case that variable is removed from the server's
+# environment. The first install into the shared directory says once that
+# a program left by an earlier version under $HOME is no longer used; it is
+# not removed.
 #
 # Where the installed program came from is recorded next to it in
 # bin/.origin: `release <sha256>` for a verified download, `build` for a
@@ -79,6 +85,13 @@ run_server() {
     # $1 = program; the remaining arguments of the script follow `mcp`.
     local prog=$1
     shift
+    # The server appends the note to its permission errors; an inherited
+    # value is never passed on.
+    if [ -n "${install_note:-}" ]; then
+        export HXPROBE_INSTALL_NOTE="$install_note"
+    else
+        unset HXPROBE_INSTALL_NOTE
+    fi
     exec "$prog" mcp ${1+"$@"} 1>&3 3>&- 9>&-
 }
 
@@ -233,11 +246,25 @@ inst=${HXPROBE_INSTALL_DIR:-}
 # Why the shared directory was not used; empty when it was, or when an
 # install directory was given.
 install_note=''
+# Modes in the install directory: the shared directory is readable by every
+# account (one program for all of them, see the header); every other one is
+# the user's own and closed to everyone else. origin_mode is empty when the
+# mode of bin/.origin is left as it is.
+dir_mode=700
+prog_mode=700
+origin_mode=''
+mkdir_umask=077
+in_shared=0
 if [ -z "$inst" ]; then
     shared=${HXPROBE_SHARED_DIR:-$shared_default}
     reason=''
     if shared_usable "$shared"; then
         inst=$shared
+        in_shared=1
+        dir_mode=755
+        prog_mode=755
+        origin_mode=644
+        mkdir_umask=022
     else
         # Fall back to the user's own directory, with today's rules.
         install_note="the shared program $shared/bin/hxprobe was not used ($reason); a device profile for that path does not cover this program"
@@ -255,13 +282,14 @@ if [ -z "$legacy" ] && [ -n "$home" ]; then
     legacy="$home/Library/Application Support/hxprobe-plugin"
 fi
 if [ -n "$legacy" ]; then legacy="$legacy/bin"; fi
-(umask 077 && mkdir -p "$bindir") || die "cannot create $bindir"
+(umask "$mkdir_umask" && mkdir -p "$bindir") || die "cannot create $bindir"
 # The program run from here reads the user's mail: the directories must be
-# the user's own and closed to everyone else.
+# the user's own, and closed to everyone else or (the shared directory) not
+# writable by anyone else.
 if ! [ -O "$inst" ] || ! [ -O "$bindir" ]; then
     die "$inst or $bindir is not owned by the current user; set HXPROBE_INSTALL_DIR to a directory of your own"
 fi
-chmod 700 "$inst" "$bindir" || die "cannot set the mode of $inst and $bindir"
+chmod "$dir_mode" "$inst" "$bindir" || die "cannot set the mode of $inst and $bindir"
 
 # Prints -1, 0 or 1 when version $1 is older than, equal to or newer than $2,
 # comparing major, minor and patch as numbers. With equal numbers a
@@ -542,9 +570,9 @@ remove_old_build_dirs() {
 # the old program keep their file (overwriting a signed program in place
 # would invalidate the signature of running copies).
 install_and_run() {
-    local src=$1 origin=$2 f d have
+    local src=$1 origin=$2 f d have first=0
     shift 2
-    chmod 700 "$src" || die "cannot make $src executable"
+    chmod "$prog_mode" "$src" || die "cannot make $src executable"
     # The file must be the program it is named after: at least the wanted
     # version, by its own answer.
     have=$(program_version "$src")
@@ -563,6 +591,10 @@ install_and_run() {
     # Written after the move, the same would hold for a build that replaces
     # an older release program.
     printf '%s\n' "$origin" > "$origin_file" || die "cannot write $origin_file"
+    if [ -n "$origin_mode" ]; then
+        chmod "$origin_mode" "$origin_file" || die "cannot set the mode of $origin_file"
+    fi
+    if [ ! -e "$bin" ] && [ ! -L "$bin" ]; then first=1; fi
     if ! mv -f "$src" "$bin"; then
         rm -f "$origin_file" 2>/dev/null || true
         die "cannot move $src to $bin"
@@ -590,6 +622,15 @@ install_and_run() {
     fi
     release_lock
     log "installed hxprobe $version at $bin"
+    # The program of earlier versions, which installed per user, is left
+    # alone (other clients may still name it); said once, at the first
+    # install into the shared directory.
+    if [ "$in_shared" = 1 ] && [ "$first" = 1 ] && [ -n "$home" ]; then
+        f="$home/Library/Application Support/hxprobe/bin/hxprobe"
+        if [ -f "$f" ]; then
+            log "the earlier install $f is no longer used by the plugin; remove it, and its Full Disk Access entry, when no client registration names it"
+        fi
+    fi
     run_server "$bin" ${1+"$@"}
 }
 

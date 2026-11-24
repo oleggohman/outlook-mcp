@@ -60,8 +60,9 @@ fds_closed='fd3=closed fd9=closed'
 # Fake program: answers `--version` with `hxprobe $4` (without $4 it fails
 # with a usage message and status 2, as 0.1.0 does). Otherwise it prints its
 # arguments to stdout and leaves a marker file that holds the state of fd 3
-# and fd 9, and the file `<marker>.path` with the path it was run as. $3 is
-# optional shell code to run last.
+# and fd 9, the file `<marker>.path` with the path it was run as and the file
+# `<marker>.note` with HXPROBE_INSTALL_NOTE (`(unset)` when it is not set). $3
+# is optional shell code to run last.
 make_fake() {
     # $1 = path, $2 = marker file, $3 = shell code, $4 = version
     cat > "$1" <<EOF
@@ -75,6 +76,7 @@ echo "FAKE \$*"
 $fd_probe
 echo "fd3=\$f3 fd9=\$f9" > "$2"
 printf '%s\n' "\$0" > "$2.path"
+if [ -n "\${HXPROBE_INSTALL_NOTE+x}" ]; then printf '%s\n' "\$HXPROBE_INSTALL_NOTE"; else echo '(unset)'; fi > "$2.note"
 ${3:-}
 EOF
     chmod 755 "$1"
@@ -159,7 +161,7 @@ run() {
     rc=0
     # shellcheck disable=SC2086
     env -u HXPROBE_BIN -u HXPROBE_RELEASE_BASE -u HXPROBE_SUMS -u CLAUDE_PLUGIN_DATA \
-        -u HXPROBE_INSTALL_DIR -u HXPROBE_SHARED_DIR $nohome \
+        -u HXPROBE_INSTALL_DIR -u HXPROBE_SHARED_DIR -u HXPROBE_INSTALL_NOTE $nohome \
         ${home:+HOME="$home"} HXPROBE_INSTALL_DIR="$r/inst" HXPROBE_SHARED_DIR="$shared" \
         CLAUDE_PLUGIN_DATA="$r/data" $envs \
         bash "$r/scripts/run-mcp.sh" "$@" > "$root/out" 2> "$root/err" 9> "$root/fd9" || rc=$?
@@ -257,17 +259,18 @@ EOF
 }
 
 # Starts $2 launchers of repo $1 at once with PATH $3 and waits for them.
-# Sets bad to the number that failed or printed something else than the
-# server output.
+# The install directory is $1/inst, or $4 when it is given (empty selects
+# the default). Sets bad to the number that failed or printed something else
+# than the server output.
 run_many() {
-    local r=$1 n=$2 path=$3 i pids='' p shared
+    local r=$1 n=$2 path=$3 inst=${4-$1/inst} i pids='' p shared
     shared=$(shared_of "$r")
     guard_shared "$shared"
     bad=0
     i=0
     while [ "$i" -lt "$n" ]; do
         env -u HXPROBE_BIN -u HXPROBE_RELEASE_BASE -u HXPROBE_SUMS -u HXPROBE_SHARED_DIR \
-            HOME="$root/home" HXPROBE_INSTALL_DIR="$r/inst" CLAUDE_PLUGIN_DATA="$r/data" \
+            HOME="$root/home" HXPROBE_INSTALL_DIR="$inst" CLAUDE_PLUGIN_DATA="$r/data" \
             HXPROBE_SHARED_DIR="$shared" \
             PATH="$path" bash "$r/scripts/run-mcp.sh" > "$r/out.$i" 2> "$r/err.$i" &
         pids="$pids $!"
@@ -318,17 +321,24 @@ else fail "$t" "rc=$rc out='$out' err='$err' curl='$(cat "$r/curl-args" 2>/dev/n
 # (ii-b) Default install directory: the shared directory (HXPROBE_SHARED_DIR
 # stands in for /Users/Shared/hxprobe). The program is installed as
 # <shared>/bin/hxprobe and run from there, and nothing is created under HOME.
+# The directories and the program have mode 755 and bin/.origin 644, also
+# when the launcher starts with umask 077.
 t='default install dir'
 r=$(make_repo)
 make_asset "$r"
 d=$(shared_of "$r")
 rm -rf "$root/home"
+old_umask=$(umask)
+umask 077
 run "$r" HXPROBE_INSTALL_DIR= HXPROBE_RELEASE_BASE="file://$r/rel" PATH="$nocargo_path" -- a b
+umask "$old_umask"
 if [ "$rc" = 0 ] && [ "$out" = 'FAKE mcp a b' ] && [ "$(cat "$r/ran.path")" = "$d/bin/hxprobe" ] \
+    && [ "$(mode_of "$d")" = 755 ] && [ "$(mode_of "$d/bin")" = 755 ] \
+    && [ "$(mode_of "$d/bin/hxprobe")" = 755 ] && [ "$(mode_of "$d/bin/.origin")" = 644 ] \
     && cmp -s "$d/bin/hxprobe" "$r/rel/v$version/$asset" \
     && [[ "$(origin_of "$d")" == 'release '* ]] && [[ "$err" != *'was not used'* ]] \
     && [ ! -e "$root/home" ] && [ ! -e "$r/inst" ] && lock_free "$d"; then pass "$t"
-else fail "$t" "rc=$rc out='$out' ran='$(cat "$r/ran.path" 2>/dev/null || true)' err='$err'"; fi
+else fail "$t" "rc=$rc out='$out' ran='$(cat "$r/ran.path" 2>/dev/null || true)' modes=$(mode_of "$d")/$(mode_of "$d/bin")/$(mode_of "$d/bin/hxprobe")/$(mode_of "$d/bin/.origin") err='$err'"; fi
 rm -rf "$root/home"
 
 # (iii) Download with a matching checksum: installed as <install dir>/bin/hxprobe
@@ -1237,6 +1247,84 @@ EOF
         else fail "$t" "rc=$rc out='$out' err='$err'"; fi
     fi
 done
+rm -rf "$root/home"
+
+# Many launchers at once in shared mode: one install into the shared
+# directory (each start makes or finds the directory), every start answers,
+# the lock is free afterwards and nothing is left over.
+t='concurrent starts, shared directory'
+r=$(make_repo)
+make_cargo_stub "$r" 'sleep 0.3'
+s=$(shared_of "$r")
+rm -rf "$root/home"
+run_many "$r" "$many" "$r/stub:$nocargo_path" ''
+builds=$(wc -l < "$r/builds" | tr -d ' ')
+installs=$(cat "$r"/err.* | grep -c 'installed hxprobe' || true)
+if [ "$bad" = 0 ] && [ "$builds" = 1 ] && [ "$installs" = 1 ] && [ -x "$s/bin/hxprobe" ] \
+    && [ "$(leftovers "$s")" = 0 ] && lock_free "$s" && [ ! -e "$r/inst" ] \
+    && ! grep -q 'was not used' "$r"/err.* && [ ! -e "$root/home" ]; then pass "$t"
+else fail "$t" "bad=$bad builds=$builds installs=$installs leftovers=$(leftovers "$s") err='$(cat "$r"/err.*)'"; fi
+rm -rf "$root/home"
+
+# The note for the server. After a fallback the program gets the reason in
+# HXPROBE_INSTALL_NOTE, in place of an inherited value, and the fallback
+# directory has mode 700. Without a fallback, with HXPROBE_BIN and with an
+# explicit HXPROBE_INSTALL_DIR an inherited value is removed.
+for how in fallback 'shared directory used' HXPROBE_BIN 'HXPROBE_INSTALL_DIR given'; do
+    t="install note: $how"
+    r=$(make_repo)
+    make_asset "$r"
+    rm -rf "$root/home"
+    s=$(shared_of "$r")
+    note='(unset)'
+    case "$how" in
+        fallback )
+            printf 'x\n' > "$s"
+            note="the shared program $s/bin/hxprobe was not used ($s is not a directory); a device profile for that path does not cover this program"
+            run "$r" HXPROBE_INSTALL_DIR= HXPROBE_INSTALL_NOTE=stale HXPROBE_RELEASE_BASE="file://$r/rel" PATH="$nocargo_path" -- ;;
+        'shared directory used' )
+            run "$r" HXPROBE_INSTALL_DIR= HXPROBE_INSTALL_NOTE=stale HXPROBE_RELEASE_BASE="file://$r/rel" PATH="$nocargo_path" -- ;;
+        HXPROBE_BIN )
+            make_fake "$r/fake" "$r/ran" '' "$version"
+            run "$r" HXPROBE_BIN="$r/fake" HXPROBE_INSTALL_NOTE=stale PATH="$nocargo_path" -- ;;
+        * )
+            run "$r" HXPROBE_INSTALL_NOTE=stale HXPROBE_RELEASE_BASE="file://$r/rel" PATH="$nocargo_path" -- ;;
+    esac
+    got=$(cat "$r/ran.note" 2>/dev/null || echo 'no marker')
+    ok=1
+    if [ "$how" = fallback ]; then
+        fell_back "$s" "$s is not a directory" && [ "$(mode_of "$own_dir")" = 700 ] \
+            && [ "$(mode_of "$own_dir/bin")" = 700 ] && [ "$(mode_of "$own_dir/bin/hxprobe")" = 700 ] || ok=0
+    fi
+    if [ "$rc" = 0 ] && [ "$out" = 'FAKE mcp' ] && [ "$got" = "$note" ] && [ "$ok" = 1 ]; then pass "$t"
+    else fail "$t" "rc=$rc out='$out' note='$got' err='$err'"; fi
+done
+rm -rf "$root/home"
+
+# Migration from the per-user directory: the first install into the shared
+# directory with an earlier program at $HOME/Library/Application
+# Support/hxprobe/bin/hxprobe logs once that the plugin no longer uses it, and
+# leaves its files as they are; a later start does not log it again.
+t='earlier install is named once'
+r=$(make_repo)
+make_asset "$r"
+rm -rf "$root/home"
+s=$(shared_of "$r")
+mkdir -p "$own_dir/bin"
+make_fake "$own_dir/bin/hxprobe" "$r/old-ran" '' 0.2.0
+echo "release $(printf '0%.0s' $(seq 64))" > "$own_dir/bin/.origin"
+: > "$own_dir/bin/.download-failed"
+: > "$own_dir/install.lock"
+before=$(tree_state "$own_dir")
+run "$r" HXPROBE_INSTALL_DIR= HXPROBE_RELEASE_BASE="file://$r/rel" PATH="$nocargo_path" --
+rc1=$rc; out1=$out; err1=$err
+run "$r" HXPROBE_INSTALL_DIR= HXPROBE_RELEASE_BASE="file://$r/rel" PATH="$nocargo_path" --
+line="the earlier install $own_dir/bin/hxprobe is no longer used by the plugin"
+if [ "$rc1" = 0 ] && [ "$out1" = 'FAKE mcp' ] && [ "$(cat "$r/ran.path")" = "$s/bin/hxprobe" ] \
+    && [ "$(printf '%s\n' "$err1" | grep -cF "$line")" = 1 ] \
+    && [ "$rc" = 0 ] && [ "$out" = 'FAKE mcp' ] && [[ "$err" != *"$line"* ]] \
+    && [ "$(tree_state "$own_dir")" = "$before" ] && [ ! -e "$r/old-ran" ]; then pass "$t"
+else fail "$t" "rc=$rc1/$rc out='$out1'/'$out' err='$err1' / '$err'"; fi
 rm -rf "$root/home"
 
 # (last) No case reached the real shared directory: it is as it was before
