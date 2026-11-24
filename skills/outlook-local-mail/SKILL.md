@@ -57,8 +57,15 @@ yet, or does not cover the program the error names. Tell the user:
 2. Send the administrator (IT) the error text, complete and unchanged. It
    names the program path and, when there is one, the ` Note: ...` at the
    end; both are what the administrator needs.
-3. When the administrator says it is fixed, ask again. No restart is needed
-   unless the error says `restart the MCP client`.
+3. Tell the administrator that the fix is to install the device profile
+   that comes with hxprobe on this Mac, and give its address:
+   https://github.com/oleggohman/outlook-mcp/blob/main/mdm/hxprobe-full-disk-access.mobileconfig
+   The administrator installs it through the organisation's device
+   management service. Do not tell the user to download or open the file:
+   macOS accepts this kind of profile only from device management, and
+   opening it by hand does not grant anything.
+4. When the administrator says it is installed, ask again. No restart is
+   needed unless the error says `restart the MCP client`.
 
 Until then, answer from the data the server still serves, and say from when
 it is (see `warning` under "Freshness").
@@ -115,10 +122,13 @@ entry. Do not tell the user to add the old path.
 ### For administrators
 
 The device profile is `mdm/hxprobe-full-disk-access.mobileconfig` in the
-hxprobe repository. It grants Full Disk Access to
-`/Users/Shared/hxprobe/bin/hxprobe` only, and is delivered by the device
-management service; it cannot be installed by opening the file. Mention it
-only when the user says they administer the Macs.
+hxprobe repository
+(https://github.com/oleggohman/outlook-mcp/blob/main/mdm/hxprobe-full-disk-access.mobileconfig).
+It grants Full Disk Access to `/Users/Shared/hxprobe/bin/hxprobe` only, and
+is delivered by the device management service; it cannot be installed by
+opening the file. When the user says they administer the Macs, tell them to
+upload it there as a device-level profile and assign it to the Macs that
+show the error.
 
 ### When the shared directory is not used
 
