@@ -1403,8 +1403,21 @@ fn unreadable_store_with_a_database_is_served_and_names_the_permission() {
     assert_eq!(st["built"], hxprobe::mcp::text::iso(built), "{st}");
     let e = st["last_error"].as_str().unwrap();
     assert!(e.contains("permission denied"), "{e}");
+    assert_remedy(&d, e);
     assert_eq!(st["service"]["running"], false, "{st}");
     assert_eq!(m.tool("list_messages")["total"], 0);
+}
+
+/// `e` names the steps under Full Disk Access with the test program and
+/// the stop command with the test's cache directory.
+fn assert_remedy(d: &Dir, e: &str) {
+    let program = std::fs::canonicalize(env!("CARGO_BIN_EXE_hxprobe")).unwrap();
+    assert!(e.contains("Full Disk Access"), "{e}");
+    assert!(e.contains(&format!("\"{}\"", program.display())), "{e}");
+    assert!(
+        e.contains(&format!("--cache-dir \"{}\"", d.cache().display())),
+        "{e}"
+    );
 }
 
 #[test]
@@ -1420,6 +1433,7 @@ fn unreadable_store_without_a_database_is_a_tool_error() {
     let e = m.tool_error("list_messages");
     store_mode(&d, 0o600);
     assert!(e.contains("permission denied"), "{e}");
+    assert_remedy(&d, &e);
     assert!(
         started.elapsed() < Duration::from_secs(5),
         "{:?}",

@@ -458,6 +458,81 @@ fn is_zombie(pid: libc::pid_t) -> bool {
     }
 }
 
+/// Part of every error that reports a store denied by the system.
+pub const DENIED: &str = "cannot read the store: permission denied";
+
+/// Who was denied: the refresh service, or this server in fallback mode
+/// (with the text of the failed build).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Denied<'a> {
+    Service,
+    Server { cause: &'a str },
+}
+
+/// What a denial text names besides the cache directory.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Remedy {
+    /// The program to add under Full Disk Access.
+    pub program: Option<PathBuf>,
+    /// A note of the installer (`HXPROBE_INSTALL_NOTE`).
+    pub note: Option<String>,
+}
+
+/// Longest note a denial text carries, in characters.
+const MAX_NOTE_CHARS: usize = 300;
+
+/// The error for a store denied by the system, with the steps that fix it:
+/// the program to add under Full Disk Access (canonical when it can be
+/// resolved), then what to do after the grant. A note, without control
+/// characters and cut to [`MAX_NOTE_CHARS`], ends the text.
+pub fn denied_text(who: Denied, remedy: &Remedy, cache_dir: &Path) -> String {
+    let program = remedy
+        .program
+        .as_deref()
+        .map(|p| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf()));
+    let add = match &program {
+        Some(p) => format!("\"{}\"", p.display()),
+        None => "the hxprobe program".into(),
+    };
+    let fix = format!(
+        "{DENIED}. Fix: open System Settings, Privacy & Security, Full Disk Access, \
+         add {add} and turn it on; then"
+    );
+    let mut text = match who {
+        Denied::Service => {
+            let mut t = format!(
+                "the refresh service {fix} call again after {PERMISSION_BLOCK_SECS} seconds."
+            );
+            if let Some(p) = &program {
+                t.push_str(&format!(
+                    " If the error stays, stop the service so that the next call starts a \
+                     fresh one: \"{}\" service --stop --cache-dir \"{}\".",
+                    p.display(),
+                    cache_dir.display()
+                ));
+            }
+            t.push_str(&format!(" Log: {}", cache_dir.join(LOG_NAME).display()));
+            t
+        }
+        Denied::Server { cause } => format!(
+            "this server {fix} restart the MCP client (quit the app that uses these tools \
+             and open it again). Cause: {cause}"
+        ),
+    };
+    let note: String = remedy
+        .note
+        .as_deref()
+        .unwrap_or("")
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(MAX_NOTE_CHARS)
+        .collect();
+    if !note.is_empty() {
+        text.push_str(&format!(" Note: {note}"));
+    }
+    text
+}
+
 /// The service as an MCP server sees it.
 pub trait Refresher: std::fmt::Debug {
     /// Tell the service a client call happened; may start a build in the
@@ -889,5 +964,121 @@ mod tests {
         }
         child.wait().unwrap();
         assert!(pid_gone(pid));
+    }
+
+    /// A program path that does not exist, so it is shown as given.
+    fn remedy(note: Option<&str>) -> Remedy {
+        Remedy {
+            program: Some(PathBuf::from("/nonexistent-hx/bin/hxprobe")),
+            note: note.map(String::from),
+        }
+    }
+
+    #[test]
+    fn service_denial_names_the_steps_the_program_and_the_cache_dir() {
+        let dir = Path::new("/nonexistent-hx/cache");
+        let t = denied_text(Denied::Service, &remedy(None), dir);
+        assert!(
+            t.starts_with("the refresh service cannot read the store: permission denied"),
+            "{t}"
+        );
+        assert!(t.contains(DENIED), "{t}");
+        assert_eq!(
+            t.matches("\"/nonexistent-hx/bin/hxprobe\"").count(),
+            2,
+            "{t}"
+        );
+        assert!(t.contains("Full Disk Access"), "{t}");
+        assert!(
+            t.contains("service --stop --cache-dir \"/nonexistent-hx/cache\""),
+            "{t}"
+        );
+        assert!(t.contains("/nonexistent-hx/cache/service.log"), "{t}");
+        assert!(t.contains("after 10 seconds"), "{t}");
+        assert_eq!(
+            t,
+            "the refresh service cannot read the store: permission denied. Fix: open System \
+             Settings, Privacy & Security, Full Disk Access, add \"/nonexistent-hx/bin/hxprobe\" \
+             and turn it on; then call again after 10 seconds. If the error stays, stop the \
+             service so that the next call starts a fresh one: \"/nonexistent-hx/bin/hxprobe\" \
+             service --stop --cache-dir \"/nonexistent-hx/cache\". Log: \
+             /nonexistent-hx/cache/service.log"
+        );
+    }
+
+    #[test]
+    fn server_denial_names_the_restart_and_the_cause_and_no_stop() {
+        let dir = Path::new("/nonexistent-hx/cache");
+        let cause = "copy the store: Operation not permitted (os error 1)";
+        let t = denied_text(Denied::Server { cause }, &remedy(None), dir);
+        assert!(
+            t.starts_with("this server cannot read the store: permission denied"),
+            "{t}"
+        );
+        assert!(t.contains(DENIED), "{t}");
+        assert!(t.contains("restart the MCP client"), "{t}");
+        assert!(t.contains("Full Disk Access"), "{t}");
+        assert!(t.contains("\"/nonexistent-hx/bin/hxprobe\""), "{t}");
+        assert!(t.ends_with(&format!("Cause: {cause}")), "{t}");
+        assert!(!t.contains("--stop"), "{t}");
+        assert_eq!(
+            t,
+            format!(
+                "this server cannot read the store: permission denied. Fix: open System \
+                 Settings, Privacy & Security, Full Disk Access, add \
+                 \"/nonexistent-hx/bin/hxprobe\" and turn it on; then restart the MCP client \
+                 (quit the app that uses these tools and open it again). Cause: {cause}"
+            )
+        );
+    }
+
+    #[test]
+    fn denial_without_a_program_has_no_quoted_path() {
+        let dir = Path::new("/nonexistent-hx/cache");
+        let none = Remedy::default();
+        for t in [
+            denied_text(Denied::Service, &none, dir),
+            denied_text(Denied::Server { cause: "x" }, &none, dir),
+        ] {
+            assert!(!t.contains('"'), "{t}");
+            assert!(t.contains("add the hxprobe program and turn it on"), "{t}");
+            assert!(!t.contains("--stop"), "{t}");
+        }
+    }
+
+    #[test]
+    fn denial_program_is_shown_canonical() {
+        let t = TestDir::new();
+        std::fs::write(t.0.join("hxprobe"), b"").unwrap();
+        let program = t.0.join(".").join("hxprobe");
+        let canonical = std::fs::canonicalize(&program).unwrap();
+        let r = Remedy {
+            program: Some(program),
+            note: None,
+        };
+        let s = denied_text(Denied::Service, &r, &t.0);
+        assert!(s.contains(&format!("\"{}\"", canonical.display())), "{s}");
+    }
+
+    #[test]
+    fn denial_ends_with_the_note_cut_and_without_control_characters() {
+        let dir = Path::new("/nonexistent-hx/cache");
+        for who in [Denied::Service, Denied::Server { cause: "x" }] {
+            let t = denied_text(who, &remedy(Some("use\tthe\nshared\u{7f} path")), dir);
+            assert!(t.ends_with(" Note: usetheshared path"), "{t}");
+            let long = "é".repeat(400);
+            let t = denied_text(who, &remedy(Some(&long)), dir);
+            assert!(t.ends_with(&format!(" Note: {}", "é".repeat(300))), "{t}");
+            assert!(!t.contains(&"é".repeat(301)), "{t}");
+        }
+    }
+
+    #[test]
+    fn denial_without_a_note_has_none() {
+        let dir = Path::new("/nonexistent-hx/cache");
+        for r in [remedy(None), remedy(Some("")), remedy(Some("\n"))] {
+            let t = denied_text(Denied::Service, &r, dir);
+            assert!(!t.contains("Note:"), "{t}");
+        }
     }
 }

@@ -742,6 +742,12 @@ impl Cache {
     }
 }
 
+/// Whether opening `store` for reading fails for lack of permission
+/// (`EPERM` or `EACCES`); false for a readable or missing file.
+pub fn store_denied(store: &Path) -> bool {
+    File::open(store).is_err_and(|e| e.kind() == ErrorKind::PermissionDenied)
+}
+
 /// `HxStore.hxd` of the default Outlook profile: under the profiles
 /// directory of `$HOME` (see [`default_store_path_in`]).
 pub fn default_store_path() -> Option<PathBuf> {
@@ -1784,6 +1790,23 @@ mod tests {
         assert!(c.connection_at(NOW_I + 10).is_ok());
         assert_eq!(c.builds, 1);
         assert_eq!(c.status().last_error, Some(e.as_str()));
+    }
+
+    #[test]
+    fn store_denied_is_true_only_for_a_file_that_cannot_be_opened() {
+        // Root reads a file of mode 000.
+        // SAFETY: geteuid() has no preconditions and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let t = TestDir::new("denied");
+        let store = t.store(b"store");
+        assert!(!store_denied(&store));
+        assert!(!store_denied(&t.0.join("missing.hxd")));
+        std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let denied = store_denied(&store);
+        std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(denied);
     }
 
     #[test]

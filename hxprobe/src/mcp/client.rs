@@ -41,6 +41,8 @@ pub struct Client {
     /// The store of this server, as the service reports its own.
     store: PathBuf,
     program: PathBuf,
+    /// What a denial text names; its program defaults to `program`.
+    remedy: proto::Remedy,
     refresh_secs: u64,
     idle_secs: u64,
     /// Services this process started and has not seen exit.
@@ -84,6 +86,7 @@ impl Client {
             sock,
             store,
             program,
+            remedy: proto::Remedy::default(),
             refresh_secs,
             idle_secs,
             children: Vec::new(),
@@ -116,6 +119,13 @@ impl Client {
             stop_wait,
             ..self.timeouts
         };
+        self
+    }
+
+    /// What the error of a denied start names (see [`proto::denied_text`]);
+    /// without a program it names the program the service is started from.
+    pub fn with_remedy(mut self, remedy: proto::Remedy) -> Client {
+        self.remedy = remedy;
         self
     }
 
@@ -270,10 +280,7 @@ impl Client {
                     // A peer took the lock; its service should answer.
                     StartOutcome::Lost => child = None,
                     StartOutcome::Denied => {
-                        let e = format!(
-                            "the refresh service cannot read the store: permission denied; see {}",
-                            self.log_path().display()
-                        );
+                        let e = self.denied();
                         return Err(self.block(now, proto::PERMISSION_BLOCK_SECS, e));
                     }
                     StartOutcome::Failed(status) => {
@@ -414,6 +421,15 @@ impl Client {
              call store_status later",
             self.timeouts.refresh.as_secs()
         )
+    }
+
+    /// The error of a service that exited for a permission error.
+    fn denied(&self) -> String {
+        let remedy = proto::Remedy {
+            program: Some(self.remedy.program.clone().unwrap_or(self.program.clone())),
+            note: self.remedy.note.clone(),
+        };
+        proto::denied_text(proto::Denied::Service, &remedy, &self.dir)
     }
 
     fn unreadable(&self) -> String {
@@ -942,11 +958,10 @@ mod tests {
     fn permission_exit_is_reported_at_once_and_blocks_starts_for_10_s() {
         let _p = process_lock();
         let t = TestDir::new();
-        let mut c = t.client(t.script("svc", "exit 77")).with_timeouts(
-            Duration::from_secs(5),
-            SHORT,
-            SHORT,
-        );
+        let program = t.script("svc", "exit 77");
+        let mut c = t
+            .client(program.clone())
+            .with_timeouts(Duration::from_secs(5), SHORT, SHORT);
         let started = Instant::now();
         let e = c.call(&Request::Touch, NOW).unwrap_err();
         assert!(
@@ -954,7 +969,14 @@ mod tests {
             "{:?}",
             started.elapsed()
         );
-        assert!(e.contains("permission"), "{e}");
+        let remedy = proto::Remedy {
+            program: Some(program),
+            note: None,
+        };
+        assert_eq!(
+            e,
+            proto::denied_text(proto::Denied::Service, &remedy, &t.cache())
+        );
         assert_eq!(t.runs(), 1);
         assert_eq!(
             c.call(&Request::Touch, NOW + proto::PERMISSION_BLOCK_SECS - 1),

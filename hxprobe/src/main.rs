@@ -930,6 +930,7 @@ fn cmd_mcp(args: &[String]) {
         cache.store_path().display(),
         cache_dir.display()
     ));
+    let remedy = install_remedy();
     let service = if opts.no_service {
         Err("--no-service".to_string())
     } else if env::var_os("HXPROBE_SERVICE").is_some_and(|v| v == "0") {
@@ -943,6 +944,7 @@ fn cmd_mcp(args: &[String]) {
                 refresh_secs,
                 opts.idle_secs.unwrap_or(proto::DEFAULT_IDLE_SECS),
             )
+            .map(|c| c.with_remedy(remedy.clone()))
         })
     };
     match service {
@@ -961,6 +963,17 @@ fn cmd_mcp(args: &[String]) {
         std::io::stdout().lock(),
     ) {
         fail(format!("i/o error: {e}"));
+    }
+}
+
+/// What a denial text names: this program's own file and the note of the
+/// installer in `HXPROBE_INSTALL_NOTE` (see [`proto::denied_text`]).
+fn install_remedy() -> hxprobe::mcp::proto::Remedy {
+    hxprobe::mcp::proto::Remedy {
+        program: hxprobe::mcp::client::service_program().ok(),
+        note: env::var("HXPROBE_INSTALL_NOTE")
+            .ok()
+            .filter(|n| !n.is_empty()),
     }
 }
 

@@ -102,7 +102,7 @@ impl Backend for CacheBackend {
     }
 
     fn store_denied(&self) -> bool {
-        File::open(&self.store).is_err_and(|e| e.kind() == io::ErrorKind::PermissionDenied)
+        cache::store_denied(&self.store)
     }
 }
 
