@@ -1154,7 +1154,8 @@ fn spawn_signal_thread(set: libc::sigset_t, stop: hxprobe::mcp::service::Stop) {
 /// or the removal of its socket. Exit status 0 then; 1 when it cannot
 /// start, 2 on a usage error, 75 when another service holds the
 /// directory's `service.lock`, 77 when the store (or the default profile
-/// directory) cannot be examined or read for lack of permission. With `--status` or `--stop`, see [`cmd_service_client`].
+/// directory) cannot be examined or read for lack of permission. With
+/// `--status` or `--stop`, see [`cmd_service_client`].
 fn cmd_service(args: &[String]) {
     use hxprobe::mcp::service::{self, CacheBackend, Core, InstanceLock, LockError, Stop};
     use hxprobe::mcp::{self, cache, log, proto};
