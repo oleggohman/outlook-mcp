@@ -187,6 +187,54 @@ check_versions() {
         || { why="Cargo.toml '$toml', Cargo.lock '$lock', plugin.json '$plugin'"; return 1; }
 }
 
+# File $1 contains each of the fixed strings $2...
+check_phrases() {
+    local f=$1 p
+    shift
+    for p in "$@"; do
+        grep -qF -e "$p" "$f" || { why="$(basename "$f") lacks '$p'"; return 1; }
+    done
+}
+
+# The description in the front matter of skill $1 is a "Use when ..."
+# trigger list that names a warning in a result.
+check_skill_description() {
+    local d
+    d=$(awk 'NR == 1 && $0 != "---" { exit } NR > 1 && $0 == "---" { exit }
+        NR > 1 && /^description:/ { sub(/^description: */, ""); print }' "$1")
+    case "$d" in
+        'Use when '* ) ;;
+        * ) why='the description does not start with "Use when "'; return 1 ;;
+    esac
+    case "$d" in
+        *warning* ) ;;
+        * ) why='the description does not name a warning in a result'; return 1 ;;
+    esac
+}
+
+# Every line of Markdown file $1 that contains the fixed string $2 lies
+# under one of the headings $3... (any level, also below a subheading of
+# it). Lines in fenced code blocks are never taken for headings.
+check_lines_under() {
+    local f=$1 s=$2 bad
+    shift 2
+    bad=$(awk -v s="$s" -v allowed="$(printf '%s\n' "$@")" '
+        BEGIN { n = split(allowed, a, "\n"); for (i = 1; i <= n; i++) ok[a[i]] = 1 }
+        /^```/ { fence = !fence }
+        !fence && /^#+ / {
+            l = index($0, " ") - 1
+            h[l] = substr($0, l + 2)
+            for (i = l + 1; i <= 6; i++) delete h[i]
+            next
+        }
+        index($0, s) {
+            good = 0
+            for (i = 1; i <= 6; i++) if ((i in h) && (h[i] in ok)) good = 1
+            if (!good) { print NR; exit }
+        }' "$f")
+    [ -z "$bad" ] || { why="line $bad of $(basename "$f") names '$s' outside the allowed headings"; return 1; }
+}
+
 # Checksum file $1 lists hxprobe-$2-macos-arm64 with a 64-digit sum. Read
 # as the launcher reads it: `#` comments and blank lines are skipped, and an
 # optional `*` before the name is the binary-mode marker of shasum.
@@ -239,7 +287,7 @@ with_req() {
 t='inputs are tracked'
 missing=''
 for f in "$profile_rel" scripts/run-mcp.sh scripts/release-sign.sh hxprobe/Cargo.toml \
-    hxprobe/Cargo.lock .claude-plugin/plugin.json; do
+    hxprobe/Cargo.lock .claude-plugin/plugin.json skills/outlook-local-mail/SKILL.md; do
     git -C "$repo" ls-files --error-unmatch -- "$f" >/dev/null 2>&1 || missing="$missing $f"
 done
 if [ -z "$missing" ]; then pass "$t"; else fail "$t" "not tracked:$missing"; fi
@@ -335,6 +383,34 @@ expect_fail 'self-test: another plugin version' check_versions "$cargo_toml" "$c
 awk '$0 == "name = \"hxprobe\"" { print; getline; print "version = \"0.0.1\""; next } { print }' \
     "$cargo_lock" > "$tmp/Cargo.lock"
 expect_fail 'self-test: another version in Cargo.lock' check_versions "$cargo_toml" "$tmp/Cargo.lock" "$plugin_json"
+
+# The skill: both clients, the shared program path, the denial and the
+# warning; the per-user path only under the heading that explains it.
+skill="$repo/skills/outlook-local-mail/SKILL.md"
+skill_phrases=(warning 'cannot read the store: permission denied' "$program" \
+    'Claude Desktop' 'Claude Code')
+skill_fallback='When the shared directory is not used'
+expect_pass 'skill: required phrases' check_phrases "$skill" "${skill_phrases[@]}"
+expect_pass 'skill: description names a warning' check_skill_description "$skill"
+expect_pass 'skill: per-user path only under its heading' \
+    check_lines_under "$skill" 'Application Support/hxprobe' "$skill_fallback"
+grep -vF -e 'Claude Desktop' "$skill" > "$tmp/skill-no-desktop.md"
+expect_fail 'self-test: skill without Claude Desktop' \
+    check_phrases "$tmp/skill-no-desktop.md" "${skill_phrases[@]}"
+sed '/^description:/s/warning/notice/g' "$skill" > "$tmp/skill-description.md"
+expect_fail 'self-test: skill description without a warning' \
+    check_skill_description "$tmp/skill-description.md"
+sed '/^description:/s/^description: Use when/description: Call/' "$skill" > "$tmp/skill-use-when.md"
+expect_fail 'self-test: skill description not a trigger list' \
+    check_skill_description "$tmp/skill-use-when.md"
+{ cat "$skill"; printf '\n## Elsewhere\n\n`~/Library/Application Support/hxprobe/bin/hxprobe`\n'; } \
+    > "$tmp/skill-path.md"
+expect_fail 'self-test: per-user path under another heading' \
+    check_lines_under "$tmp/skill-path.md" 'Application Support/hxprobe' "$skill_fallback"
+printf '# Top\n\n## %s\n\n### Sub\n\n```sh\n# comment\nApplication Support/hxprobe\n```\n' \
+    "$skill_fallback" > "$tmp/nested.md"
+expect_pass 'self-test: a subheading and a code comment keep the heading' \
+    check_lines_under "$tmp/nested.md" 'Application Support/hxprobe' "$skill_fallback"
 
 # The release gate (only with --release): the checksum file lists the arm64
 # program of the version in hxprobe/Cargo.toml, with a 64-digit sum.
