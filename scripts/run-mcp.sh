@@ -37,7 +37,9 @@
 #           user, not writable by group or others, without an access list:
 #           used with all of the rules below; its directories and the
 #           program get mode 0755, bin/.origin 0644, install.lock 0600;
-#   root    the same, owned by root: only read. Its program is run when its
+#   root    the same, owned by root, while the launcher runs as another
+#           user (run as root, such a chain is its own: `own`, and written
+#           to): only read. Its program is run when its
 #           SHA-256 is listed with the wanted version, or with an older one
 #           (with a log line: an administrator has to update it); nothing
 #           is written there, no lock is taken, nothing is downloaded. A
@@ -271,7 +273,8 @@ parent_safe() {
 #           regular file), owned by the current user, not writable by group
 #           or others and without an access list; `bin` and the program may
 #           be missing;
-#   root    the same, owned by root;
+#   root    the same, owned by root, when the current user is not root
+#           (for root such a chain is `own`);
 #   bad     anything else (a link anywhere, another file type, a write bit
 #           for group or others, an access list, another account, mixed
 #           owners); `reason` says why.
@@ -468,8 +471,8 @@ release_sum() {
     arch=$(release_arch) || return 1
     asset="hxprobe-$version-macos-$arch"
     [ -f "$sums" ] || return 1
-    # Lines are `<sha256>  <asset>` (an optional `*` before the name is the
-    # binary-mode marker of shasum). Blank lines and `#` comments are skipped.
+    # Lines are `<sha256>  <asset>` (shasum may put a `*` before the name;
+    # it is not part of it). Blank lines and `#` comments are skipped.
     want=$(awk -v a="$asset" '
         /^[[:space:]]*#/ || NF == 0 { next }
         NF == 2 { n = $2; sub(/^\*/, "", n); if (n == a) { print tolower($1); exit } }
