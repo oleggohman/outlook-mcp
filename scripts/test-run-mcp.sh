@@ -1180,6 +1180,32 @@ fell_back() {
         && [[ "$err" == *"the shared program $1/bin/hxprobe was not used ("*"$2"*"); a device profile for that path does not cover this program"* ]]
 }
 
+# The longest note the server appends to an error (it cuts a longer one),
+# read from its source.
+max_note=$(sed -n 's/^const MAX_NOTE_CHARS: usize = \([0-9][0-9]*\);.*/\1/p' "$here/../hxprobe/src/mcp/proto.rs" 2>/dev/null || true)
+
+# Succeeds when the note of the last run (taken from the launcher's log
+# line) would reach the user whole on a real Mac: with the real shared
+# directory in place of the one of the case ($1) it has at most $max_note
+# characters, and it names no path inside the plugin ($r), whose length
+# nobody bounds.
+note_fits() {
+    local n
+    n=$(printf '%s\n' "$err" \
+        | sed -n 's/^hxprobe plugin: \(the shared program .* does not cover this program\); using .*/\1/p' \
+        | head -n 1)
+    [ -n "$n" ] && [ -n "$max_note" ] || return 1
+    n=${n//"$1"/$real_shared}
+    n=${n//"$(dirname "$1")"/$(dirname "$real_shared")}
+    case "$n" in
+        *"$r"* ) return 1 ;;
+    esac
+    [ "${#n}" -le "$max_note" ]
+}
+
+t='note limit of the server found'
+if [ -n "$max_note" ]; then pass "$t"; else fail "$t" 'no MAX_NOTE_CHARS in hxprobe/src/mcp/proto.rs'; fi
+
 # Another uid than the one running the tests.
 other_uid=4242
 if [ "$(id -u)" = "$other_uid" ]; then other_uid=4243; fi
@@ -1224,7 +1250,7 @@ for kind in 'a link to a directory' 'a regular file' 'bin is a link' 'the progra
     run "$r" HXPROBE_INSTALL_DIR= HXPROBE_SHARED_DIR="$s" HXPROBE_RELEASE_BASE="file://$r/rel" \
         PATH="$r/stub:$nocargo_path" --
     after=$(tree_state "$s"; tree_state "$r/elsewhere")
-    if fell_back "$s" "$phrase" && [ "$after" = "$before" ] && [ ! -e "$r/link-ran" ] \
+    if fell_back "$s" "$phrase" && note_fits "$s" && [ "$after" = "$before" ] && [ ! -e "$r/link-ran" ] \
         && [ "$(origin_of "$own_dir")" != none ] && lock_free "$own_dir"; then pass "$t"
     else fail "$t" "rc=$rc out='$out' ran='$(cat "$r/ran.path" 2>/dev/null || true)' changed=$([ "$after" = "$before" ] && echo no || echo yes) err='$err'"; fi
 done
@@ -1531,7 +1557,9 @@ done
 # A root chain that cannot be used: the program in it is never executed (no
 # marker of any kind), and the per-user program is installed and run with
 # the note. Without shasum nothing can be verified, the download included,
-# so the per-user program is built.
+# so the per-user program is built. The note of the program that is not
+# listed is the longest one the launcher writes; it names the checksum file
+# as release/SHA256SUMS, not by its full path.
 for kind in 'not listed' 'no program' 'mode 775' 'no shasum'; do
     t="root-owned shared directory not used: $kind"
     r=$(make_repo)
@@ -1549,7 +1577,7 @@ for kind in 'not listed' 'no program' 'mode 775' 'no shasum'; do
     fi
     put_program "$s" "$r/shared-prog" 'root record'
     case "$kind" in
-        'not listed' ) phrase="$s/bin/hxprobe is owned by root and its SHA-256 is not listed" ;;
+        'not listed' ) phrase="$s/bin/hxprobe is owned by root and its SHA-256 is not listed for this machine in release/SHA256SUMS" ;;
         'no program' ) rm -f "$s/bin/hxprobe"; phrase="$s is owned by root and $s/bin/hxprobe does not exist" ;;
         'mode 775' ) chmod 775 "$s"; phrase="$s is writable by group or others" ;;
         'no shasum' )
@@ -1572,7 +1600,7 @@ for kind in 'not listed' 'no program' 'mode 775' 'no shasum'; do
         got=$(cat "$r/ran.note" 2>/dev/null || true)
         [[ "$got" == "$note"*'); a device profile for that path does not cover this program' ]] || ok=0
     fi
-    if [ "$ok" = 1 ] && [ ! -e "$r/shared-ran" ] && [ ! -e "$r/shared-ran.asked" ] \
+    if [ "$ok" = 1 ] && note_fits "$s" && [ ! -e "$r/shared-ran" ] && [ ! -e "$r/shared-ran.asked" ] \
         && [ "$(tree_state "$s")" = "$before" ] && [ ! -e "$s/install.lock" ] \
         && lock_free "$own_dir"; then pass "$t"
     else fail "$t" "rc=$rc out='$out' note='$(cat "$r/ran.note" 2>/dev/null || true)' err='$err'"; fi

@@ -53,7 +53,8 @@
 # directory with mode 0700. An explicit HXPROBE_INSTALL_DIR follows the rules
 # of that fallback directory. After a fallback the same sentence is passed to
 # the server in HXPROBE_INSTALL_NOTE, which appends it to its permission
-# errors; in every other case that variable is removed from the server's
+# errors (up to 300 characters of it, so no reason names a path inside the
+# plugin); in every other case that variable is removed from the server's
 # environment. The first install into the shared directory says once that
 # a program left by an earlier version under $HOME is no longer used; it is
 # not removed.
@@ -350,7 +351,9 @@ root_listed() {
     fi
     have=$(listed_version "$1")
     if [ -z "$have" ]; then
-        reason="$1 is owned by root and its SHA-256 is not listed for this machine in $sums_file"
+        # Not the full path of the checksum file: the reason goes into the
+        # note for the server, which cuts it after 300 characters.
+        reason="$1 is owned by root and its SHA-256 is not listed for this machine in release/SHA256SUMS"
         return 1
     fi
     case "$(version_cmp "$have" "$version")" in
