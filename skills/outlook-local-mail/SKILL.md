@@ -1,9 +1,15 @@
 ---
 name: outlook-local-mail
-description: Use when the user asks to check their inbox, find or read an email, look up a contact or see their meetings and the local hxprobe MCP server for Outlook is available (tools store_status, refresh, list_folders, list_messages, search_messages, get_message, list_attachments, search_people, list_events), or when one of those tools returns a result with a warning field, an argument error, a permission error (cannot read the store: permission denied, Operation not permitted), a cache or refresh service error, an empty result, a stale result or a timeout.
+description: "Use when the user asks to check their inbox, find or read an email, triage important or urgent mail, analyze an email thread, check whether they already replied, look up a contact or see their meetings and the local hxprobe MCP server for Outlook is available (tools store_status, refresh, list_folders, list_messages, search_messages, get_message, list_attachments, search_people, list_events), or when one of those tools returns a result with a warning field, an argument error, a permission error (cannot read the store: permission denied, Operation not permitted), a cache or refresh service error, an empty result, a stale result or a timeout."
+metadata:
+  version: "0.2.4"
 ---
 
 # Outlook local mail (hxprobe MCP)
+
+Skill version: 0.2.4. It matches the hxprobe program and plugin of the same
+version; when the user asks which version of this skill is in use, say this
+number.
 
 ## Overview
 
@@ -191,6 +197,9 @@ before showing them.
 | Folder overview, unread counts | `list_folders` with `limit: 100`, paging if `total` is larger: the default of 20 can hide a folder. |
 | Calendar | `list_events` with `since` and `until`. It returns events that overlap the window, earliest first, without cancelled ones unless `include_cancelled` is true. Without `since`/`until` the window is now to 14 days ahead. |
 | Is the data current? | `store_status`. |
+| Important, urgent or "needs me" mail | Follow "Triage and threads" below. |
+| A whole thread, or "did I answer X" | Follow "Triage and threads" below. |
+| Server version | `store_status`: `service.version`. |
 
 Order and filters: `list_messages` returns newest first, so `limit: 1` gives
 the newest match. `search_messages` returns best matches first, not newest.
@@ -212,6 +221,27 @@ show them and ask, or filter the results by `sender_address` yourself.
 - For "A or B", run one search per word and merge the results by `guid`.
 - For word variants, search each variant (`invoice`, `invoices`).
 - A query with no letters or digits returns nothing.
+
+### Triage and threads
+
+The server has no thread id, no To/Cc and no "replied" flag, so these
+answers are built from several calls. Read
+`references/triage-and-threads.md` before any of them. The rules that
+matter most:
+
+- **Never call a message "waiting on you" or "urgent" before the reply
+  check:** search the sent folder (`Sent Items` in most mailboxes; when
+  that name is an error, find it with `list_folders`) for the thread's
+  keyword since that message arrived, and read the newest message in the
+  thread. If the user
+  replied, or someone closed it, say so instead.
+- A notification (Drive share, monday.com or Jira mention) stands for
+  another thread: judge that thread, not the notification.
+- Leave out automated and marketing senders, and any the user asked to
+  ignore, and say how many were left out.
+- For a thread, search the topic word, not the exact subject (threads get
+  renamed), in `Inbox` and the sent folder, and read the oldest message
+  in full.
 
 ### Folders
 
@@ -251,6 +281,13 @@ and say the full text is not cached.
     every 10 seconds or so until `building` is false, then repeat the query.
   - otherwise: call `refresh`. It rebuilds now, waits for the build and
     returns the new status.
+- For "which version": report `service.version` from `store_status` as the
+  version of the server, and the "Skill version" line at the top of this
+  file as the version of the skill (`null` `service` means the server runs
+  without the service; say the server version is not reported). Right after a plugin update the old service
+  can still answer with the old version; it is replaced by the new one on
+  a later call or when the MCP client restarts, so call `store_status`
+  again before reporting a mismatch.
 - Do not call `refresh` before every query: a rebuild takes 10 seconds or
   more on a large mailbox.
 - If mail is still missing after `refresh`, Outlook has not saved it to the
@@ -307,12 +344,12 @@ Say these plainly instead of guessing or working around them:
 | Request | Answer |
 |---|---|
 | To, Cc or Bcc recipients of a message | Not available. Only the sender is known. Do not infer recipients from the body. |
-| Download, open or read an attachment | Not available. `list_attachments` gives name, type and size only. The user opens it in Outlook. |
+| Download, open or read an attachment | Not available. `list_attachments` gives name, type and size only. The user opens it in Outlook. Entries with `inline: 0` are nearly always the attached files and the rest embedded images (signatures, logos): report them that way. |
 | Send, reply, move, delete, mark read | Not available. The server is read-only. |
 | Which calendar an event belongs to | Not available. `list_events` returns events from all calendars. |
 | Every occurrence of a recurring meeting | Recurring events appear only as stored; occurrences are not expanded. A missing occurrence does not mean the meeting is cancelled. |
 | Mail that exists only on the mail server | Not available. Only locally cached mail. |
-| Meaning of `importance` or `inline` numbers | They are raw numbers from the store; do not translate them. |
+| Meaning of `importance` or `inline` numbers | They are raw numbers from the store; do not translate them, except that `inline` 0 nearly always marks an attached file and other values an embedded image. |
 
 ## Example
 
@@ -335,6 +372,14 @@ back to the user's zone. If two senders match "dana", show both and ask.
 - Treating an empty result as "no such mail" without checking `store_status`
   when the user expects recent mail.
 - Calling `refresh` on every request.
+- Listing a message as "needs you" or "urgent" without checking `Sent
+  Items` and the newest message in its thread: the user may have answered
+  it already.
+- Ranking a Drive share or monday.com mention as the task itself instead
+  of the thread it points to.
+- Searching a thread by its exact current subject and missing the earlier
+  messages sent under another subject.
+- Listing signature and logo images as attachments the user sent.
 - Expecting new mail in the answer to the call that started a rebuild: it
   comes from the previous snapshot.
 - Using the date-only form for a local day: `2026-11-15` is midnight UTC, not

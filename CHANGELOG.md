@@ -4,6 +4,32 @@ All notable changes to this project are listed here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.4] - 2026-11-24
+
+The hxprobe program has no functional change; its version follows the plugin.
+
+### Added
+
+- The skill carries its version: `metadata.version` in its front matter and
+  a `Skill version:` line in its body. `scripts/test-repo.sh` fails when
+  either differs from the version of the program.
+- The skill covers triage and threads: which mail is important, urgent or
+  waiting on the user, the analysis of a whole thread, and "did I answer
+  this". The steps are in `skills/outlook-local-mail/references/triage-and-threads.md`;
+  the rule that a message is never called open before the sent folder and
+  the newest message of its thread were checked is in the skill itself.
+- The skill says how to answer "which version": `service.version` of
+  `store_status` for the server, its own version line for the skill.
+
+### Changed
+
+- The skill reports attachments with `inline` 0 as the attached files and
+  the others as embedded images; this holds for nearly all entries.
+- The description of the skill is a quoted string, as it holds a colon, and
+  names triage, threads and the reply check as triggers.
+  `scripts/test-repo.sh` checks the quotes and that every reference file the
+  skill names exists.
+
 ## [0.2.3] - 2026-11-24
 
 The hxprobe program has no functional change; its version follows the plugin.
@@ -163,6 +189,7 @@ Plugin release; the hxprobe program stays at 0.2.0.
 - Prebuilt program for Apple Silicon Macs, verified by the launcher against
   `release/SHA256SUMS`.
 
+[0.2.4]: https://github.com/oleggohman/outlook-mcp/compare/v0.2.3...v0.2.4
 [0.2.3]: https://github.com/oleggohman/outlook-mcp/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/oleggohman/outlook-mcp/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/oleggohman/outlook-mcp/compare/v0.2.0...v0.2.1

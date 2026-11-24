@@ -193,6 +193,25 @@ check_versions() {
         || { why="Cargo.toml '$toml', Cargo.lock '$lock', plugin.json '$plugin'"; return 1; }
 }
 
+# The skill $1 carries the version of the program in $2 twice: as
+# `metadata.version` in its front matter and in a `Skill version: <v>` line
+# of its body, so that a reader of the skill can tell which release it is.
+check_skill_version() {
+    local want front body
+    want=$(cargo_version "$2")
+    [ -n "$want" ] || { why='no version in hxprobe/Cargo.toml'; return 1; }
+    front=$(awk 'NR == 1 && $0 == "---" { f = 1; next }
+                 f && $0 == "---" { exit }
+                 f && $0 == "metadata:" { m = 1; next }
+                 f && m && /^  version: / { v = $2; gsub(/"/, "", v); print v; exit }
+                 f && m && /^[^ ]/ { m = 0 }' "$1")
+    body=$(awk 'NR == 1 && $0 == "---" { f = 1; next }
+                f == 1 && $0 == "---" { f = 2; next }
+                f == 2 && /^Skill version: / { v = $3; sub(/[.]$/, "", v); print v; exit }' "$1")
+    [ "$front" = "$want" ] && [ "$body" = "$want" ] \
+        || { why="Cargo.toml '$want', skill front matter '$front', skill body '$body'"; return 1; }
+}
+
 # File $1 contains each of the fixed strings $2...
 check_phrases() {
     local f=$1 p
@@ -208,6 +227,15 @@ check_skill_description() {
     local d
     d=$(awk 'NR == 1 && $0 != "---" { exit } NR > 1 && $0 == "---" { exit }
         NR > 1 && /^description:/ { sub(/^description: */, ""); print }' "$1")
+    # A description that holds ": " has to be a quoted YAML string, or a
+    # strict parser reads the rest as a mapping.
+    case "$d" in
+        *': '* )
+            case "$d" in
+                '"'*'"' ) d=${d#\"}; d=${d%\"} ;;
+                * ) why='the description holds ": " and is not in double quotes'; return 1 ;;
+            esac ;;
+    esac
     case "$d" in
         'Use when '* ) ;;
         * ) why='the description does not start with "Use when "'; return 1 ;;
@@ -427,6 +455,36 @@ awk '$0 == "name = \"hxprobe\"" { print; getline; print "version = \"0.0.1\""; n
     "$cargo_lock" > "$tmp/Cargo.lock"
 expect_fail 'self-test: another version in Cargo.lock' check_versions "$cargo_toml" "$tmp/Cargo.lock" "$plugin_json"
 
+# The skill carries the same version, in its front matter and in its body.
+expect_pass 'versions: the skill carries the version of the program' \
+    check_skill_version "$repo/skills/outlook-local-mail/SKILL.md" "$cargo_toml"
+sed 's/^  version: .*/  version: "0.0.1"/' "$repo/skills/outlook-local-mail/SKILL.md" > "$tmp/skill-front.md"
+expect_fail 'self-test: skill with another version in the front matter' \
+    check_skill_version "$tmp/skill-front.md" "$cargo_toml"
+sed 's/^Skill version: .*/Skill version: 0.0.1./' "$repo/skills/outlook-local-mail/SKILL.md" > "$tmp/skill-body.md"
+expect_fail 'self-test: skill with another version in the body' \
+    check_skill_version "$tmp/skill-body.md" "$cargo_toml"
+grep -v -e '^  version: ' -e '^Skill version: ' "$repo/skills/outlook-local-mail/SKILL.md" > "$tmp/skill-none.md"
+expect_fail 'self-test: skill without a version' \
+    check_skill_version "$tmp/skill-none.md" "$cargo_toml"
+
+# Every file under references/ that the skill names exists.
+check_skill_references() {
+    local dir f
+    dir=$(dirname "$1")
+    for f in $(grep -o 'references/[A-Za-z0-9._-]*\.md' "$1" | sort -u); do
+        [ -f "$dir/$f" ] || { why="the skill names $f, which does not exist"; return 1; }
+    done
+}
+expect_pass 'skill: the reference files it names exist' \
+    check_skill_references "$repo/skills/outlook-local-mail/SKILL.md"
+mkdir -p "$tmp/skill-ref" && { cat "$repo/skills/outlook-local-mail/SKILL.md"; echo 'See references/absent.md.'; } > "$tmp/skill-ref/SKILL.md"
+expect_fail 'self-test: skill that names a missing reference file' \
+    check_skill_references "$tmp/skill-ref/SKILL.md"
+sed 's/^description: "\(.*\)"$/description: \1/' "$repo/skills/outlook-local-mail/SKILL.md" > "$tmp/skill-unquoted.md"
+expect_fail 'self-test: skill description with a colon and no quotes' \
+    check_skill_description "$tmp/skill-unquoted.md"
+
 # The skill: both clients, the shared program path, the denial and the
 # warning; the per-user path only under the heading that explains it.
 skill="$repo/skills/outlook-local-mail/SKILL.md"
@@ -443,7 +501,7 @@ expect_fail 'self-test: skill without Claude Desktop' \
 sed '/^description:/s/warning/notice/g' "$skill" > "$tmp/skill-description.md"
 expect_fail 'self-test: skill description without a warning' \
     check_skill_description "$tmp/skill-description.md"
-sed '/^description:/s/^description: Use when/description: Call/' "$skill" > "$tmp/skill-use-when.md"
+sed '/^description:/s/^description: "*Use when/description: "Call/' "$skill" > "$tmp/skill-use-when.md"
 expect_fail 'self-test: skill description not a trigger list' \
     check_skill_description "$tmp/skill-use-when.md"
 { cat "$skill"; printf '\n## Elsewhere\n\n`~/Library/Application Support/hxprobe/bin/hxprobe`\n'; } \
