@@ -1451,6 +1451,56 @@ fn unreadable_store_without_a_database_is_a_tool_error() {
     );
 }
 
+#[test]
+fn server_whose_own_service_is_denied_keeps_an_older_service() {
+    if is_root() {
+        return;
+    }
+    /// Gives the store mode 0600 back on drop, also when the test fails.
+    struct Readable<'a>(&'a Dir);
+    impl Drop for Readable<'_> {
+        fn drop(&mut self) {
+            store_mode(self.0, 0o600);
+        }
+    }
+    let _s = serial();
+    let d = Dir::new();
+    old_database(&d);
+    let played = Played::start(&d, "0.0.1", OnShutdown::Exit);
+    store_mode(&d, 0o000);
+    let _readable = Readable(&d);
+    let mut m = spawn_mcp(&d);
+    // The older service is replaced at first contact; the own one is denied.
+    let list = m.tool("list_messages");
+    let w = list["warning"].as_str().unwrap_or_else(|| panic!("{list}"));
+    assert!(w.contains(proto::DENIED), "{w}");
+    assert_eq!(played.requests(), [Request::Touch, old_shutdown()]);
+    drop(played);
+    // Another client starts the older service again: it is kept.
+    let played = Played::start(&d, "0.0.1", OnShutdown::Exit);
+    let list = m.tool("list_messages");
+    assert!(list.get("warning").is_none(), "{list}\n{}", m.log());
+    m.tool("list_messages");
+    let st = m.tool("store_status");
+    assert_eq!(st["service"]["running"], true, "{st}");
+    assert_eq!(st["service"]["version"], "0.0.1", "{st}");
+    assert_eq!(st["service"]["pid"], played.pid, "{st}");
+    assert_eq!(st["last_error"], Value::Null, "{st}");
+    assert!(
+        !played
+            .requests()
+            .iter()
+            .any(|r| matches!(r, Request::Shutdown { .. })),
+        "{:?}",
+        played.requests()
+    );
+    assert!(
+        m.log().contains("keeping refresh service 0.0.1"),
+        "{}",
+        m.log()
+    );
+}
+
 /// Sets the mode of a directory and gives it mode 0700 back on drop, also
 /// when the test fails, so the temp dir can be removed.
 struct Locked(PathBuf);

@@ -55,6 +55,9 @@ pub struct Client {
     last_error: Option<String>,
     /// When this process last started a service (unix seconds).
     last_start_unix: Option<i64>,
+    /// A service this process started exited because it was denied the
+    /// store, and none it started has answered since.
+    own_denied: bool,
     timeouts: Timeouts,
     /// The clock of the start timeout: [`Instant::now`]; tests replace it.
     clock: fn() -> Instant,
@@ -94,6 +97,7 @@ impl Client {
             blocked_until: None,
             last_error: None,
             last_start_unix: None,
+            own_denied: false,
             timeouts: Timeouts {
                 start: proto::START_TIMEOUT,
                 probe: proto::REQUEST_TIMEOUT,
@@ -164,7 +168,8 @@ impl Client {
     }
 
     /// The reply `v` to `req`: checked when it comes from a service not
-    /// seen before (its store, then its version; an older one is replaced).
+    /// seen before (its store, then its version; an older one is replaced,
+    /// unless a service this process started was denied the store).
     fn accept(
         &mut self,
         req: &Request,
@@ -182,13 +187,31 @@ impl Client {
                 }
             }
             if proto::cmp_versions(&st.version, proto::VERSION) == Ordering::Less {
-                return self.replace_older(req, &st, now, round);
+                // This program was denied the store, while an older one
+                // (another file, perhaps with Full Disk Access) can read it:
+                // keep that one instead of stopping it for a start that
+                // fails. Safe only while the cache format is unchanged
+                // (`cache::FORMAT_VERSION` "3" since 0.2.0); a release that
+                // changes the format has to revisit this branch.
+                if !self.own_denied {
+                    return self.replace_older(req, &st, now, round);
+                }
+                log(&format!(
+                    "keeping refresh service {} (pid {}): this program was denied the store",
+                    st.version, st.pid
+                ));
+            } else {
+                log(&format!(
+                    "using refresh service {} (pid {})",
+                    st.version, st.pid
+                ));
             }
-            log(&format!(
-                "using refresh service {} (pid {})",
-                st.version, st.pid
-            ));
             self.known_pid = Some(st.pid);
+        }
+        // A service this process started answers: its program can read
+        // the store.
+        if self.children.iter().any(|c| c.id() == st.pid) {
+            self.own_denied = false;
         }
         self.blocked_until = None;
         self.last_error = None;
@@ -280,6 +303,7 @@ impl Client {
                     // A peer took the lock; its service should answer.
                     StartOutcome::Lost => child = None,
                     StartOutcome::Denied => {
+                        self.own_denied = true;
                         let e = self.denied();
                         return Err(self.block(now, proto::PERMISSION_BLOCK_SECS, e));
                     }
@@ -1026,6 +1050,104 @@ mod tests {
             .call(&Request::Touch, NOW + proto::PERMISSION_BLOCK_SECS)
             .is_err());
         assert_eq!(t.runs(), 2);
+    }
+
+    #[test]
+    fn older_service_is_kept_after_a_denied_own_start() {
+        let _p = process_lock();
+        let t = TestDir::new();
+        let mut c = t
+            .client(t.script("svc", "exit 77"))
+            .with_timeouts(LONG, SHORT, SHORT);
+        let e = c.call(&Request::Touch, NOW).unwrap_err();
+        assert!(e.contains(proto::DENIED), "{e}");
+        assert!(c.own_denied);
+        assert_eq!(t.runs(), 1);
+        // An older service started by another client: used as it is, also
+        // within the start block and after it.
+        let store = t.store();
+        let played = Played::start(&t.sock(), move |r| match r {
+            Request::Shutdown { .. } => "{\"ok\":true,\"stopping\":true}\n".into(),
+            _ => status_line("0.0.1", 4242, &store),
+        });
+        let st = c.call(&Request::Touch, NOW + 1).unwrap();
+        assert_eq!((st.version.as_str(), st.pid), ("0.0.1", 4242));
+        let later = NOW + proto::PERMISSION_BLOCK_SECS + 100;
+        assert_eq!(c.call(&Request::Status, later).unwrap().pid, 4242);
+        assert_eq!(c.call(&Request::Touch, later).unwrap().pid, 4242);
+        drop(c);
+        assert_eq!(
+            played.requests(),
+            [Request::Touch, Request::Status, Request::Touch]
+        );
+        assert_eq!(t.runs(), 1);
+    }
+
+    #[test]
+    fn own_service_accepted_after_a_denial_replaces_older_services_again() {
+        let _p = process_lock();
+        let t = TestDir::new();
+        // First run: denied. Second run: a service that the test plays under
+        // the script's pid. Later runs: a start that fails.
+        let program = t.script(
+            "svc",
+            "n=$(wc -l < runs)\n\
+             [ \"$n\" -eq 1 ] && exit 77\n\
+             [ \"$n\" -eq 2 ] && { echo $$ > pid; exec sleep 30; }\n\
+             exit 3",
+        );
+        let mut c = t.client(program).with_timeouts(LONG, SHORT, SHORT);
+        assert!(c
+            .call(&Request::Touch, NOW)
+            .unwrap_err()
+            .contains(proto::DENIED));
+        assert!(c.own_denied);
+
+        // An older service is kept while it runs.
+        let store = t.store();
+        let older = Played::start(&t.sock(), move |_| status_line("0.0.1", 4242, &store));
+        assert_eq!(c.call(&Request::Touch, NOW + 1).unwrap().pid, 4242);
+        drop(older);
+        std::fs::remove_file(t.sock()).unwrap();
+
+        // It is gone; this reader's own start now succeeds.
+        let (sock, pid_file, store) = (t.sock(), t.cache().join("pid"), t.store());
+        let own = thread::spawn(move || {
+            let started = Instant::now();
+            let pid = loop {
+                if let Some(pid) = std::fs::read_to_string(&pid_file)
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u32>().ok())
+                {
+                    break pid;
+                }
+                assert!(started.elapsed() < LONG, "the own service did not start");
+                thread::sleep(Duration::from_millis(5));
+            };
+            Played::start(&sock, move |_| status_line(proto::VERSION, pid, &store))
+        });
+        let later = NOW + proto::PERMISSION_BLOCK_SECS + 100;
+        let st = c.call(&Request::Touch, later).unwrap();
+        let own = own.join().unwrap();
+        assert_eq!(st.version, proto::VERSION);
+        assert!(!c.own_denied);
+        assert_eq!(t.runs(), 2);
+        // The own service ends; an older one appears and is replaced again.
+        for child in &mut c.children {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        drop(own);
+        std::fs::remove_file(t.sock()).unwrap();
+        let (store, gone) = (t.store(), gone_pid());
+        let older = Played::start(&t.sock(), move |r| match r {
+            Request::Shutdown { .. } => "{\"ok\":true,\"stopping\":true}\n".into(),
+            _ => status_line("0.0.1", gone, &store),
+        });
+        let e = c.call(&Request::Touch, later + 100).unwrap_err();
+        assert!(e.contains("exit status: 3"), "{e}");
+        assert_eq!(older.requests(), [Request::Touch, shutdown("0.0.1")]);
+        assert_eq!(t.runs(), 3);
     }
 
     #[test]
