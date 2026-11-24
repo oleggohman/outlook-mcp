@@ -36,7 +36,7 @@
 #   own     every element a real directory or regular file of the current
 #           user, not writable by group or others, without an access list:
 #           used with all of the rules below; its directories and the
-#           program get mode 0755, bin/.origin 0644;
+#           program get mode 0755, bin/.origin 0644, install.lock 0600;
 #   root    the same, owned by root: only read. Its program is run when its
 #           SHA-256 is listed with the wanted version, or with an older one
 #           (with a log line: an administrator has to update it); nothing
@@ -607,7 +607,8 @@ run_child() {
 # (Linux). The kernel drops it when the launcher ends, however it ends, so
 # there is no stale lock to detect. Without either tool the install runs
 # unlocked; build directories are per process, so two installs at once cost
-# time but do not disturb each other.
+# time but do not disturb each other. The lock file has mode 0600 in every
+# install directory.
 lock="$inst/install.lock"
 lock_held=0
 
@@ -626,6 +627,11 @@ acquire_lock() {
         rm -f "$lock/pid" 2>/dev/null || true
         rmdir "$lock" 2>/dev/null || true
     fi
+    # The shared directory can be read by other accounts, and a lock taken
+    # through a read-only descriptor would hold up every install: the lock
+    # file is the user's alone, also one that an earlier start left open.
+    (umask 077 && : >> "$lock") 2>/dev/null || true
+    chmod 600 "$lock" 2>/dev/null || true
     exec 9>>"$lock" || die "cannot open $lock"
     $try 3>&- || rc=$?
     if [ "$rc" = 75 ]; then

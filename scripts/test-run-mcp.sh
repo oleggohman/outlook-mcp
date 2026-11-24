@@ -343,6 +343,32 @@ if [ "$rc" = 0 ] && [ "$out" = 'FAKE mcp a b' ] && [ "$(cat "$r/ran.path")" = "$
 else fail "$t" "rc=$rc out='$out' ran='$(cat "$r/ran.path" 2>/dev/null || true)' modes=$(mode_of "$d")/$(mode_of "$d/bin")/$(mode_of "$d/bin/hxprobe")/$(mode_of "$d/bin/.origin") err='$err'"; fi
 rm -rf "$root/home"
 
+# (ii-c) The install lock in the shared directory, which other accounts can
+# read, is closed to them (mode 600): a lock taken through a read-only
+# descriptor would hold up every install. A new lock file is made that way
+# under umask 022, and one that an earlier start left open is closed.
+for how in new 'left with mode 644'; do
+    t="install lock closed to other accounts: $how"
+    r=$(make_repo)
+    make_asset "$r"
+    d=$(shared_of "$r")
+    rm -rf "$root/home"
+    if [ "$how" != new ]; then
+        mkdir -m 755 "$d"
+        : > "$d/install.lock"
+        chmod 644 "$d/install.lock"
+    fi
+    old_umask=$(umask)
+    umask 022
+    run "$r" HXPROBE_INSTALL_DIR= HXPROBE_RELEASE_BASE="file://$r/rel" PATH="$nocargo_path" --
+    umask "$old_umask"
+    if [ "$rc" = 0 ] && [ "$out" = 'FAKE mcp' ] && [ "$(cat "$r/ran.path")" = "$d/bin/hxprobe" ] \
+        && [ "$(mode_of "$d/install.lock")" = 600 ] && [ "$(mode_of "$d/bin/hxprobe")" = 755 ] \
+        && lock_free "$d"; then pass "$t"
+    else fail "$t" "rc=$rc out='$out' lock mode=$(mode_of "$d/install.lock") err='$err'"; fi
+done
+rm -rf "$root/home"
+
 # (iii) Download with a matching checksum: installed as <install dir>/bin/hxprobe
 # with mode 0700 in directories of mode 0700, legacy versioned programs in
 # <plugin data>/bin removed (other files stay), no temp files left, server

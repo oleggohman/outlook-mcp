@@ -426,7 +426,8 @@ Which directory is used:
     symbolic link) owned by the current user, not writable by group or
     others, without an access control list. The launcher installs and
     updates the program here, as described below; the directories and the
-    program have mode `0755`, `bin/.origin` has `0644`;
+    program have mode `0755`, `bin/.origin` has `0644` and the install
+    lock `0600`, so that no other account can hold it;
   * owned by root, with the same conditions: the launcher only reads it. It
     runs the program when its SHA-256 is listed in `release/SHA256SUMS`
     with the plugin's version, or with an older one (with a log line that
