@@ -483,8 +483,8 @@ const MAX_NOTE_CHARS: usize = 300;
 
 /// The error for a store denied by the system, with the steps that fix it:
 /// the program to add under Full Disk Access (canonical when it can be
-/// resolved), then what to do after the grant. A note, without control
-/// characters and cut to [`MAX_NOTE_CHARS`], ends the text.
+/// resolved), then what to do after the grant. A note, as one line (see
+/// [`one_line`]), ends the text.
 pub fn denied_text(who: Denied, remedy: &Remedy, cache_dir: &Path) -> String {
     let program = remedy
         .program
@@ -519,18 +519,37 @@ pub fn denied_text(who: Denied, remedy: &Remedy, cache_dir: &Path) -> String {
              and open it again). Cause: {cause}"
         ),
     };
-    let note: String = remedy
-        .note
-        .as_deref()
-        .unwrap_or("")
-        .chars()
-        .filter(|c| !c.is_control())
-        .take(MAX_NOTE_CHARS)
-        .collect();
+    let note = one_line(remedy.note.as_deref().unwrap_or(""));
     if !note.is_empty() {
         text.push_str(&format!(" Note: {note}"));
     }
     text
+}
+
+/// `note` as one line of at most [`MAX_NOTE_CHARS`] characters: control
+/// characters and the line and paragraph separators count as spaces,
+/// characters that are not shown or that change the direction of the text
+/// are dropped, and words are set apart by one space each.
+fn one_line(note: &str) -> String {
+    let hidden = |c: char| {
+        matches!(
+            c,
+            '\u{ad}'
+                | '\u{61c}'
+                | '\u{200b}'..='\u{200f}'
+                | '\u{202a}'..='\u{202e}'
+                | '\u{2060}'..='\u{2069}'
+                | '\u{feff}'
+        )
+    };
+    let spaced: String = note
+        .chars()
+        .filter(|c| !hidden(*c))
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let line = spaced.split_whitespace().collect::<Vec<_>>().join(" ");
+    let cut: String = line.chars().take(MAX_NOTE_CHARS).collect();
+    cut.trim_end().to_string()
 }
 
 /// The service as an MCP server sees it.
@@ -1067,21 +1086,60 @@ mod tests {
     fn denial_ends_with_the_note_cut_and_without_control_characters() {
         let dir = Path::new("/nonexistent-hx/cache");
         for who in [Denied::Service, Denied::Server { cause: "x" }] {
+            // A control character separates words as a space does.
             let t = denied_text(who, &remedy(Some("use\tthe\nshared\u{7f} path")), dir);
-            assert!(t.ends_with(" Note: usetheshared path"), "{t}");
+            assert!(t.ends_with(" Note: use the shared path"), "{t}");
             let long = "é".repeat(400);
             let t = denied_text(who, &remedy(Some(&long)), dir);
             assert!(t.ends_with(&format!(" Note: {}", "é".repeat(300))), "{t}");
             assert!(!t.contains(&"é".repeat(301)), "{t}");
+            // The cut leaves no space at the end.
+            let cut = format!("{} b", "a".repeat(299));
+            let t = denied_text(who, &remedy(Some(&cut)), dir);
+            assert!(t.ends_with(&format!(" Note: {}", "a".repeat(299))), "{t}");
         }
+    }
+
+    #[test]
+    fn note_has_one_line_and_no_invisible_or_direction_characters() {
+        let dir = Path::new("/nonexistent-hx/cache");
+        // Line and paragraph separators end a line as a newline does.
+        let t = denied_text(
+            Denied::Service,
+            &remedy(Some("one\u{2028}two\u{2029}three\u{85}four")),
+            dir,
+        );
+        assert!(t.ends_with(" Note: one two three four"), "{t}");
+        // Zero-width and direction characters are dropped.
+        let hidden = [
+            '\u{ad}', '\u{61c}', '\u{200b}', '\u{200c}', '\u{200d}', '\u{200e}', '\u{200f}',
+            '\u{202a}', '\u{202b}', '\u{202c}', '\u{202d}', '\u{202e}', '\u{2060}', '\u{2066}',
+            '\u{2067}', '\u{2068}', '\u{2069}', '\u{feff}',
+        ];
+        for c in hidden {
+            let t = denied_text(Denied::Service, &remedy(Some(&format!("ab{c}cd"))), dir);
+            assert!(t.ends_with(" Note: abcd"), "{:04x}: {t}", c as u32);
+        }
+        // Other text stays as it is.
+        let t = denied_text(Denied::Service, &remedy(Some("  a (b); c: é  ")), dir);
+        assert!(t.ends_with(" Note: a (b); c: é"), "{t}");
     }
 
     #[test]
     fn denial_without_a_note_has_none() {
         let dir = Path::new("/nonexistent-hx/cache");
-        for r in [remedy(None), remedy(Some("")), remedy(Some("\n"))] {
+        let empty = [
+            "",
+            "\n",
+            "   ",
+            " \t\u{2028} ",
+            "\u{200b}\u{202e}",
+            " \u{feff} ",
+        ];
+        for r in std::iter::once(remedy(None)).chain(empty.map(|n| remedy(Some(n)))) {
             let t = denied_text(Denied::Service, &r, dir);
             assert!(!t.contains("Note:"), "{t}");
+            assert!(t.ends_with("service.log"), "{t}");
         }
     }
 }
