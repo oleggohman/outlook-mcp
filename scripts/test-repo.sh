@@ -14,7 +14,12 @@
 # default program path (read from scripts/run-mcp.sh) by path; its code
 # requirement names the signing identifier of scripts/release-sign.sh, the
 # Apple anchor and a team, and no code hash; the team value, read from the
-# profile at run time, occurs in no other tracked file. Every check is a
+# profile at run time, occurs in no other tracked file. The versions of
+# hxprobe/Cargo.toml, its lock file and the plugin agree, and CHANGELOG.md
+# has that version on top with a compare link. The skill and README.md
+# name the warning, the shared program path, the denial and the clients,
+# and name the per-user program path only under the headings that explain
+# it. Every check is a
 # function that takes the file to check; each one also runs on a changed
 # copy in a temp directory, where it must fail. The release gate stays out
 # of the plain run, so the tree is green before the program is signed.
@@ -218,8 +223,10 @@ check_skill_description() {
 check_lines_under() {
     local f=$1 s=$2 bad
     shift 2
-    bad=$(awk -v s="$s" -v allowed="$(printf '%s\n' "$@")" '
-        BEGIN { n = split(allowed, a, "\n"); for (i = 1; i <= n; i++) ok[a[i]] = 1 }
+    # The headings reach awk through the environment: `-v` cannot carry a
+    # line break in the macOS awk.
+    bad=$(HXPROBE_HEADINGS="$(printf '%s\n' "$@")" awk -v s="$s" '
+        BEGIN { n = split(ENVIRON["HXPROBE_HEADINGS"], a, "\n"); for (i = 1; i <= n; i++) ok[a[i]] = 1 }
         /^```/ { fence = !fence }
         !fence && /^#+ / {
             l = index($0, " ") - 1
@@ -231,8 +238,22 @@ check_lines_under() {
             good = 0
             for (i = 1; i <= 6; i++) if ((i in h) && (h[i] in ok)) good = 1
             if (!good) { print NR; exit }
-        }' "$f")
+        }' "$f") || { why="awk failed on $(basename "$f")"; return 1; }
     [ -z "$bad" ] || { why="line $bad of $(basename "$f") names '$s' outside the allowed headings"; return 1; }
+}
+
+# Changelog $1: the newest section is `## [$2] - <date>`, the next one is the
+# previous version, and a link `[$2]: .../compare/v<previous>...v$2` exists.
+check_changelog() {
+    local top prev
+    top=$(sed -n 's/^## \[\([^]]*\)\] - [0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}$/\1/p' "$1" | head -n 1)
+    prev=$(sed -n 's/^## \[\([^]]*\)\] - .*/\1/p' "$1" | sed -n 2p)
+    [ "$top" = "$2" ] || { why="the newest section of $(basename "$1") is '$top', not '$2'"; return 1; }
+    [ "$(sed -n 's/^## \[\([^]]*\)\].*/\1/p' "$1" | head -n 1)" = "$2" ] \
+        || { why="the first section of $(basename "$1") is not '## [$2] - <date>'"; return 1; }
+    [ -n "$prev" ] || { why="no section before $2 in $(basename "$1")"; return 1; }
+    grep -qF -e "[$2]: https://github.com/oleggohman/outlook-mcp/compare/v$prev...v$2" "$1" \
+        || { why="no compare link [$2] from v$prev in $(basename "$1")"; return 1; }
 }
 
 # Checksum file $1 lists hxprobe-$2-macos-arm64 with a 64-digit sum. Read
@@ -287,7 +308,8 @@ with_req() {
 t='inputs are tracked'
 missing=''
 for f in "$profile_rel" scripts/run-mcp.sh scripts/release-sign.sh hxprobe/Cargo.toml \
-    hxprobe/Cargo.lock .claude-plugin/plugin.json skills/outlook-local-mail/SKILL.md; do
+    hxprobe/Cargo.lock .claude-plugin/plugin.json skills/outlook-local-mail/SKILL.md \
+    README.md CHANGELOG.md; do
     git -C "$repo" ls-files --error-unmatch -- "$f" >/dev/null 2>&1 || missing="$missing $f"
 done
 if [ -z "$missing" ]; then pass "$t"; else fail "$t" "not tracked:$missing"; fi
@@ -411,6 +433,34 @@ printf '# Top\n\n## %s\n\n### Sub\n\n```sh\n# comment\nApplication Support/hxpro
     "$skill_fallback" > "$tmp/nested.md"
 expect_pass 'self-test: a subheading and a code comment keep the heading' \
     check_lines_under "$tmp/nested.md" 'Application Support/hxprobe' "$skill_fallback"
+
+# The changelog has a section for the version of hxprobe/Cargo.toml on top.
+changelog="$repo/CHANGELOG.md"
+expect_pass 'changelog: newest section is the version, with a compare link' \
+    check_changelog "$changelog" "$(cargo_version "$cargo_toml")"
+sed 's/^## \[\(.*\)\] - /## [9.9.9] - /' "$changelog" > "$tmp/changelog-version.md"
+expect_fail 'self-test: changelog with another newest version' \
+    check_changelog "$tmp/changelog-version.md" "$(cargo_version "$cargo_toml")"
+grep -v '^\[[0-9.]*\]: ' "$changelog" > "$tmp/changelog-links.md"
+expect_fail 'self-test: changelog without compare links' \
+    check_changelog "$tmp/changelog-links.md" "$(cargo_version "$cargo_toml")"
+
+# The README: the warning, the shared program and the profile, Claude
+# Desktop and the denial; the per-user program only under its two headings.
+readme="$repo/README.md"
+readme_phrases=(warning "$program" "$profile_rel" 'Claude Desktop' \
+    'the refresh service cannot read the store: permission denied')
+readme_headings=('When the shared directory is not used' 'Upgrading from 0.2.0 and 0.2.1')
+expect_pass 'readme: required phrases' check_phrases "$readme" "${readme_phrases[@]}"
+expect_pass 'readme: per-user program only under its headings' \
+    check_lines_under "$readme" 'Application Support/hxprobe/bin/hxprobe' "${readme_headings[@]}"
+grep -vF -e "$profile_rel" "$readme" > "$tmp/readme-no-profile.md"
+expect_fail 'self-test: README without the profile' \
+    check_phrases "$tmp/readme-no-profile.md" "${readme_phrases[@]}"
+{ cat "$readme"; printf '\n### Elsewhere\n\n"$HOME/Library/Application Support/hxprobe/bin/hxprobe" service --stop\n'; } \
+    > "$tmp/readme-path.md"
+expect_fail 'self-test: README per-user program under another heading' \
+    check_lines_under "$tmp/readme-path.md" 'Application Support/hxprobe/bin/hxprobe' "${readme_headings[@]}"
 
 # The release gate (only with --release): the checksum file lists the arm64
 # program of the version in hxprobe/Cargo.toml, with a 64-digit sum.

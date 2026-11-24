@@ -4,6 +4,64 @@ All notable changes to this project are listed here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.2] - 2026-11-24
+
+### Added
+
+- A `warning` field in the results of the seven mail tools while older data
+  is served because the cache is not being refreshed:
+  `mail data is from <time> and is not being refreshed: <error>`. It is
+  absent when all is well; `store_status` and `refresh` do not carry it.
+- `mdm/hxprobe-full-disk-access.mobileconfig`: a device profile that grants
+  Full Disk Access to `/Users/Shared/hxprobe/bin/hxprobe` with the release
+  signature, for organisations that manage their Macs.
+- The README section "For administrators: Full Disk Access by device
+  profile".
+- `scripts/release-sign.sh --compare <signed program>` checks the designated
+  requirement of a signed program against the profile; signing does the
+  same check and stops on a difference.
+- `scripts/test-repo.sh`: checks of the profile, the versions and the
+  documents; `--release` also requires the checksum line of the version.
+
+### Changed
+
+- A store that macOS denies gives an error that names the remedy and the
+  program to add, in the service form
+  `the refresh service cannot read the store: permission denied. Fix: open System Settings, Privacy & Security, Full Disk Access, add "<program>" and turn it on; then call again after 10 seconds. ...`
+  and in fallback mode
+  `this server cannot read the store: permission denied. Fix: ...`. The
+  service, the server that starts it and the fallback mode give it in the
+  same words. The leading phrase is unchanged.
+- A server whose store cannot even be examined at start (no access) starts
+  anyway and answers with that error; after the grant the next call after
+  about 10 seconds works, without a restart of the client.
+- The server's MCP instructions tell the client what to do with a
+  `warning`.
+- The plugin installs the program at `/Users/Shared/hxprobe/bin/hxprobe`,
+  the same path for every account, when that directory is the user's own or
+  owned by root; otherwise it falls back to
+  `~/Library/Application Support/hxprobe` and the permission errors say why.
+  A root-owned program is only run when its SHA-256 is listed.
+- The launcher checks the SHA-256 of the installed program at every start; a
+  release program that changed after its install is not run.
+- While the service a server started is denied access, an older service
+  that works is kept in use instead of being stopped.
+- The `outlook-local-mail` skill covers Claude Desktop as well as Claude
+  Code, the new error text, the `warning`, the shared path and the fallback
+  path, and gives client-neutral advice on tool timeouts.
+
+### Upgrade notes
+
+- The new path `/Users/Shared/hxprobe/bin/hxprobe` needs Full Disk Access
+  again: add it by hand, or have the administrator install the device
+  profile before the update. Until then the mail tools answer from the old
+  cache with a `warning` that names the path.
+- The program of 0.2.0 and 0.2.1 in `~/Library/Application Support/hxprobe`
+  is no longer used by the plugin; remove it, and its Full Disk Access entry,
+  when no client registration names it.
+- Restart the MCP clients after the update (quit a desktop app and open it
+  again), so that they run the new version.
+
 ## [0.2.1] - 2026-11-24
 
 Plugin release; the hxprobe program stays at 0.2.0.
@@ -80,6 +138,7 @@ Plugin release; the hxprobe program stays at 0.2.0.
 - Prebuilt program for Apple Silicon Macs, verified by the launcher against
   `release/SHA256SUMS`.
 
+[0.2.2]: https://github.com/oleggohman/outlook-mcp/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/oleggohman/outlook-mcp/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/oleggohman/outlook-mcp/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/oleggohman/outlook-mcp/compare/v0.1.0...v0.1.1

@@ -363,6 +363,27 @@ Arguments:
 * An integer may be written with a zero fraction (`20.0`). A string argument
   must not contain control characters other than tab and line breaks.
 
+While older data is served because the cache is not being refreshed, the
+result of each of the seven mail tools (`list_folders`, `list_messages`,
+`search_messages`, `get_message`, `list_attachments`, `search_people`,
+`list_events`) carries one more top-level key, `warning`, a string:
+
+```json
+{"total": 0, "offset": 0, "items": [],
+ "warning": "mail data is from 2026-11-20T08:15:00Z and is not being refreshed: the refresh service cannot read the store: permission denied. Fix: ..."}
+```
+
+The text is `mail data is from <time> and is not being refreshed: <error>`:
+`<time>` is the build time of the database in use (`an earlier build` when
+it is not known), and `<error>` is the `last_error` that `store_status`
+shows. It is present whenever `last_error` is set after the call got its
+database: the store cannot be read, the background service is not
+available, or the last build failed. It is absent, not `null`, when all is
+well; a rebuild that runs does not add it by itself. `store_status` and `refresh` never carry
+it; they show `last_error`. The server's MCP instructions tell the client to
+call `store_status` and tell the user what its `last_error` says when a
+warning is present.
+
 A missing required argument, an unknown argument name, a value of the wrong
 type or out of range (except `limit`), or an unknown message guid in
 `get_message` gives a
@@ -381,20 +402,68 @@ version in `hxprobe/Cargo.toml` and then runs `hxprobe mcp`.
 The program is installed at one stable path for every version:
 
 ```
-<install dir>/bin/hxprobe
+/Users/Shared/hxprobe/bin/hxprobe
 ```
 
-`<install dir>` is `$HXPROBE_INSTALL_DIR`, or
-`~/Library/Application Support/hxprobe` when that is not set. The directory
-and its `bin` folder must belong to the current user; the launcher sets both
-to mode `0700`. The path stays the same across upgrades, so every client and
-every version use one program file and one Full Disk Access entry.
+The path is the same for every account on every Mac, so one device profile
+can grant Full Disk Access to it in an organisation (see "For
+administrators: Full Disk Access by device profile"), and it stays the same
+across upgrades, so every client and every version use one program file and
+one Full Disk Access entry.
 
-On each start the launcher asks the installed program for its version
-(`hxprobe --version`):
+Which directory is used:
+
+* `HXPROBE_INSTALL_DIR` set: `$HXPROBE_INSTALL_DIR/bin/hxprobe`. The
+  directory and its `bin` folder must belong to the current user; the
+  launcher sets both to mode `0700`.
+* Otherwise the shared directory `/Users/Shared/hxprobe`, when it can be
+  trusted. Its parent (`/Users/Shared`) must be owned by root or by the
+  current user, and be sticky or not writable by group and others. The
+  launcher then looks at the directory, `bin` and the program:
+  * absent: it creates the directory (mode `0755`) and looks again at what
+    is on disk;
+  * the user's own: every element is a real directory or regular file (no
+    symbolic link) owned by the current user, not writable by group or
+    others, without an access control list. The launcher installs and
+    updates the program here, as described below; the directories and the
+    program have mode `0755`, `bin/.origin` has `0644`;
+  * owned by root, with the same conditions: the launcher only reads it. It
+    runs the program when its SHA-256 is listed in `release/SHA256SUMS`
+    with the plugin's version, or with an older one (with a log line that
+    an administrator has to update it). It writes nothing there, takes no
+    lock and downloads nothing. A missing program, or one that is not
+    listed, is not run;
+  * anything else (another account's directory, mixed owners, a symbolic
+    link anywhere, another file type, a write bit for group or others, an
+    access control list): not used. A directory of the user's own that is or
+    was open to others is not tightened, since its content can no longer be
+    vouched for.
+
+  Why only these two: the server starts its background service from its own
+  program file at every service start, for as long as it runs, and the
+  service reads your mail. Whoever can change that file could have their
+  code run as you. Another account cannot change a file of your own or of
+  root.
+* When the shared directory cannot be used, the launcher falls back to a
+  directory of the user's own; see "When the shared directory is not used"
+  below.
+
+`HXPROBE_SHARED_DIR` replaces `/Users/Shared/hxprobe`. It exists for the
+launcher's tests.
+
+On each start (unless `HXPROBE_BIN` is set) the launcher computes the
+SHA-256 of the installed program and looks it up in `release/SHA256SUMS`
+among the programs for this Mac's architecture. A listed program has the
+version of its name and is not run to ask it. A program that is not listed
+(one built here, one of a newer plugin, or any program when `shasum` is not
+available) is asked with `hxprobe --version`. Then:
 
 * The version of the plugin, or a newer one: it is run as it is. The launcher
   never downgrades; with a newer program it logs that it runs it.
+* A release program of the plugin's version whose SHA-256 is no longer the
+  listed one has changed since it was installed: it is not run, and the
+  release program is downloaded again. When that fails, the launcher stops
+  with a message.
 * Missing, older, or no answer: a new program is installed under the lock
   `<install dir>/install.lock`, by a rename over `bin/hxprobe`. A running
   server or service keeps its old file.
@@ -433,6 +502,11 @@ soon as `release/SHA256SUMS` lists one. A program built here is not signed
 with the release identity, so its Full Disk Access grant may not survive the
 next build; the launcher logs a note when it builds.
 
+The checksum at every start finds a damaged or half-written program in a
+directory of the user's own. It is not a security boundary: whoever can
+write that directory can also write `bin/.origin`. The boundary is the owner
+and the mode of the directory.
+
 To use a program you built yourself, set `HXPROBE_BIN` to its absolute path
 in the environment of Claude Code. The launcher then runs it as it is and
 installs nothing; the background service is started from that same program,
@@ -447,34 +521,119 @@ entry of the old `hxprobe-0.1.x` program no longer applies; add the new path
 (see below) and remove the old entry. Restart the MCP clients after the
 update, so that no 0.1.x server keeps building the cache on its own.
 
+#### When the shared directory is not used
+
+When `/Users/Shared/hxprobe` cannot be used, the launcher installs and runs
+the program in the user's own directory,
+`$HOME/Library/Application Support/hxprobe` (mode `0700`, the rules of
+`HXPROBE_INSTALL_DIR`), so the program is
+`~/Library/Application Support/hxprobe/bin/hxprobe`. It says why on stderr
+and passes the same sentence to the server, which appends it to its
+permission errors as ` Note: ...`:
+
+```
+the shared program /Users/Shared/hxprobe/bin/hxprobe was not used (<reason>); a device profile for that path does not cover this program
+```
+
+That program needs a Full Disk Access entry of its own: the device profile
+does not cover it. On a Mac with the profile, an error that names
+`~/Library/Application Support/hxprobe/bin/hxprobe` therefore means that the
+shared directory was not used; the reason is in the note. An administrator
+then removes or repairs `/Users/Shared/hxprobe`, or creates it as root with
+the release program, and the user restarts the MCP client.
+
+On a Mac with several accounts the account that creates
+`/Users/Shared/hxprobe` first owns it, and the other accounts fall back,
+unless an administrator creates it as root with the release program. Without
+`HOME` and without a usable shared directory the launcher stops and asks for
+`HXPROBE_INSTALL_DIR`.
+
+#### Upgrading from 0.2.0 and 0.2.1
+
+Versions 0.2.0 and 0.2.1 installed the program at
+`~/Library/Application Support/hxprobe/bin/hxprobe`. From 0.2.2 on the
+plugin installs it at `/Users/Shared/hxprobe/bin/hxprobe`.
+
+* The old program and its files are left where they are: it is the fallback
+  path, other clients may be registered with it, and an older plugin still
+  uses it. After the first install into the shared directory the launcher
+  logs once:
+
+  ```
+  the earlier install <path> is no longer used by the plugin; remove it, and its Full Disk Access entry, when no client registration names it
+  ```
+* The Full Disk Access entry of the old path does not cover the new one. Add
+  `/Users/Shared/hxprobe/bin/hxprobe` (see "Full Disk Access"), or have the
+  administrator install the device profile before the update.
+* Until then, with only updated clients, the first mail call returns the old
+  data with a `warning` that names `/Users/Shared/hxprobe/bin/hxprobe` and
+  the steps. While a client with an older version is still open, mail stays
+  fresh through that client's older service, and nothing warns until it is
+  updated or its service ends (see "Background service").
+* Restart the MCP clients after the update, so that they run the new
+  version.
+* On a Mac with the device profile, an error that names
+  `~/Library/Application Support/hxprobe/bin/hxprobe` means that the shared
+  directory was not used; see "When the shared directory is not used".
+
 ### Full Disk Access
 
 The Outlook store lives in another app's container. Depending on how the MCP
 client starts the server, macOS checks the permission of the hxprobe program
 itself, not that of the client; giving the client Full Disk Access then does
-not help. When a tool or `store_status` reports `Operation not permitted` or
-`permission denied` for the store, give the program Full Disk Access:
+not help. The store is read by the background service, which runs detached
+from the client.
+
+When macOS denies the access, a tool error, the `warning` of a mail tool
+result and the `last_error` of `store_status` say so, name the program to
+add and the next step. In service mode:
+
+```
+the refresh service cannot read the store: permission denied. Fix: open System Settings, Privacy & Security, Full Disk Access, add "<program>" and turn it on; then call again after 10 seconds. If the error stays, stop the service so that the next call starts a fresh one: "<program>" service --stop --cache-dir "<cache dir>". Log: <cache dir>/service.log
+```
+
+`<program>` is the real path of the running program. Errors of earlier
+versions say `Operation not permitted` or `permission denied` for the store.
+To give the program Full Disk Access:
 
 1. Open System Settings, Privacy & Security, Full Disk Access and click
-   **+**.
-2. Press Cmd+Shift+G, paste the path of the program and click Open. The path
-   is `~/Library/Application Support/hxprobe/bin/hxprobe`, or
-   `$HXPROBE_INSTALL_DIR/bin/hxprobe` when that is set, or the program named
-   by `HXPROBE_BIN`. Make sure its toggle is on.
-3. Stop the background service, so that the next tool call starts one with
-   the permission (this works while the client stays open):
+   **+**. Changing this list needs an administrator of the Mac; a standard
+   user asks one. In an organisation the administrator can grant the access
+   on every Mac with the device profile instead (see "For administrators:
+   Full Disk Access by device profile").
+2. Press Cmd+Shift+G, paste the path that the error names and click Open.
+   With the plugin the path is `/Users/Shared/hxprobe/bin/hxprobe`,
+   `$HXPROBE_INSTALL_DIR/bin/hxprobe` when that is set, the program named by
+   `HXPROBE_BIN`, or the fallback path (see "When the shared directory is
+   not used"). Make sure its toggle is on.
+3. Wait 10 seconds and use the tools again (in a desktop app such as Claude
+   Desktop, ask for the mail again). No restart of the client and no
+   Terminal step is needed: after a denied start the server starts no
+   service for 10 seconds, and the next call after that starts a fresh one,
+   which now has the permission.
+4. Only if the error stays, stop the service with the command from the error
+   text, so that the next call starts a fresh one. With the plugin:
 
    ```sh
-   "$HOME/Library/Application Support/hxprobe/bin/hxprobe" service --stop
+   /Users/Shared/hxprobe/bin/hxprobe service --stop --cache-dir ~/Library/Caches/hxprobe-mcp
    ```
 
-   Add `--cache-dir <dir>` when the server runs with another cache directory,
-   and use the program's real path when it is elsewhere.
+   This is needed when an older service is still in use (see "Background
+   service").
+
+A server started with `--no-service` reports
+`this server cannot read the store: permission denied`, with the same
+steps but no service to stop: after the grant, restart the MCP client. In a
+desktop app such as Claude Desktop, quit the app completely (Cmd+Q, not only
+its window) and open it again; in Claude Code, end the session and start a
+new one.
 
 macOS remembers the grant by the program's code signature (Apple, TN3127
 "Inside Code Signing: Requirements"). Releases from 0.2.0 on are signed with a Developer ID
 and a fixed signing identifier, and an upgrade replaces the file at the same
-path, so the grant is expected to survive upgrades without a new entry. A
+path, so the grant is expected to survive upgrades without a new entry. An
+entry is for one path: the entry of the path that 0.2.0 and 0.2.1 used does
+not cover the shared path (see "Upgrading from 0.2.0 and 0.2.1"). A
 program you built yourself (the `cargo` fallback, or `HXPROBE_BIN`) is not
 signed that way, so its grant may need to be given again after each build.
 
@@ -485,18 +644,77 @@ The launcher's own download is not affected. A release program downloaded by
 hand with a browser from the release page is blocked by macOS on its first
 run; allow it once in System Settings, Privacy & Security.
 
+### For administrators: Full Disk Access by device profile
+
+`mdm/hxprobe-full-disk-access.mobileconfig` grants Full Disk Access to
+`/Users/Shared/hxprobe/bin/hxprobe` on every Mac it is installed on, so
+users do not need to add the entry themselves (a standard user cannot).
+
+* Upload it to your device management service as a device-level profile
+  (payload `com.apple.TCC.configuration-profile-policy`, service
+  `SystemPolicyAllFiles`, scope System). It takes effect only on Macs
+  enrolled with user-approved or automated enrollment; it cannot be
+  installed by opening the file on a Mac. It has not been tried on a
+  managed Mac by this project yet.
+* It names one path and the release signature (the code requirement of the
+  signing identifier and the team). A program built locally with `cargo`,
+  a program at another path (`HXPROBE_INSTALL_DIR`, `HXPROBE_BIN`, or the
+  fallback path of "When the shared directory is not used"), or one signed
+  by someone else is not covered.
+* Only an arm64 release program exists. On an Intel Mac the launcher builds
+  the program with `cargo`, and that program is not covered; without
+  `cargo` there is no server.
+* Install the profile before users update to 0.2.2: the entry they may have
+  added by hand for the path of 0.2.0 and 0.2.1 does not cover the new path
+  (see "Upgrading from 0.2.0 and 0.2.1").
+* On Macs with several accounts, the account that creates
+  `/Users/Shared/hxprobe` first owns it, and the other accounts fall back to
+  their own directory, which the profile does not cover. To serve all
+  accounts, create `/Users/Shared/hxprobe/bin` as root and put the release
+  program there as `hxprobe` (directories and program mode `0755`, owned by
+  root, not writable by group or others). The launcher runs it only when its
+  SHA-256 is listed in the plugin's `release/SHA256SUMS`, and never writes
+  to it. Update it only after the plugin update has reached the users: an
+  older plugin does not list the newer program and falls back. A listed
+  older program is still run, with a log line that an administrator has to
+  update it.
+* To check a program against the profile, run
+  `scripts/release-sign.sh --compare <signed program>` on a Mac with the
+  repository. It needs no signing identity and writes nothing; exit status 0
+  means that the program's designated requirement equals the profile's
+  `CodeRequirement`, 1 that it does not.
+* If the signing identity changes, the code requirement has to change too
+  (and every existing grant ends): take the line that
+  `codesign -d -r- <signed program>` prints after `designated => `, put it
+  into the `CodeRequirement` string of the profile, and check it with
+  `--compare` and `bash scripts/test-repo.sh`.
+
+A note on the future of this payload: in Apple's device management schema
+(`https://github.com/apple/device-management/blob/release/mdm/profiles/com.apple.TCC.configuration-profile-policy.yaml`)
+five privacy services of this payload are marked as deprecated in macOS
+27.0 in favour of the declarative configuration
+(`https://github.com/apple/device-management/blob/release/declarative/declarations/configurations/app.settings.yaml`),
+which has no entry for Full Disk Access and no identity by path. The
+payload as a whole and `SystemPolicyAllFiles` carry no deprecation mark
+there; Apple's reference page is reported to show the payload as deprecated
+from macOS 27, which could not be confirmed. If a later macOS stops honouring
+the payload for a program identified by path, the entry added by hand
+remains the way.
+
 ### Registration
 
 Build `hxprobe` (see Build) and register the program with its absolute path.
 When the plugin is installed too, register its installed program instead
-(`~/Library/Application Support/hxprobe/bin/hxprobe`), so that every client
-uses one program and one Full Disk Access entry. For Claude Code:
+(`/Users/Shared/hxprobe/bin/hxprobe`, or the path that the plugin's errors
+name), so that every client uses one program and one Full Disk Access entry.
+A client registered this way runs the program directly, without the
+launcher and its checks. For Claude Code:
 
 ```sh
 claude mcp add outlook -- /absolute/path/to/hxprobe mcp
 ```
 
-Other MCP clients take a JSON entry such as:
+Other MCP clients, such as Claude Desktop, take a JSON entry such as:
 
 ```json
 {"mcpServers": {"outlook": {"command": "/absolute/path/to/hxprobe", "args": ["mcp"]}}}
@@ -517,9 +735,13 @@ hxprobe mcp [--store <file>] [--cache-dir <dir>] [--refresh-secs <n>]
   only profile directory that holds an `HxStore.hxd`. When none is found (or
   several other profiles hold one), or the path is not a regular file, the
   server exits with status 1 and a message on stderr before it reads any
-  request. The path is resolved at start to an absolute path without
-  symbolic links; `store_status` shows that path, and the cache is kept for
-  it.
+  request. A store that cannot be examined because macOS denies the access
+  is not such a failure: the server logs it, starts, and its tool calls
+  return the permission error (see "Full Disk Access"). The path is resolved
+  at start to an absolute path without symbolic links; `store_status` shows
+  that path, and the cache is kept for it. When the access is denied at
+  start, the server resolves the path again at every call until that
+  succeeds, so it recovers after the grant without a restart.
 * `--cache-dir`: default `~/Library/Caches/hxprobe-mcp`. The directory must
   be on a filesystem that keeps Unix permissions (not exFAT or a network
   share without them).
@@ -555,7 +777,13 @@ again when the service replaced it, and answer from it.
 * **Idle exit.** The service exits after `--idle-secs` (default 30 minutes)
   without a request; the next tool call starts it again.
 * **Upgrades.** A server that finds an older service stops it and starts its
-  own; a newer service is used as it is.
+  own; a newer service is used as it is. One exception: while the service
+  this server started was denied access to the store, an older service that
+  answers is used as it is and not stopped. After an upgrade the new program
+  path may not have Full Disk Access yet while the old one has; mail then
+  stays fresh through the older service of another client, and nothing
+  warns. The server tries its own service again when no service answers
+  (after the idle exit, or `service --stop`).
 * **Another store.** A cache directory serves one store at a time: the store
   of the server that started the service. A server with another `--store` gets
   the error `this cache directory serves another store: <path>; use another
@@ -565,8 +793,8 @@ again when the service replaced it, and answer from it.
 Show the status of the service, or stop it:
 
 ```sh
-"$HOME/Library/Application Support/hxprobe/bin/hxprobe" service --status
-"$HOME/Library/Application Support/hxprobe/bin/hxprobe" service --stop
+/Users/Shared/hxprobe/bin/hxprobe service --status
+/Users/Shared/hxprobe/bin/hxprobe service --stop
 ```
 
 Add `--cache-dir <dir>` when the server runs with another cache directory
@@ -586,7 +814,9 @@ Add `--cache-dir <dir>` when the server runs with another cache directory
 * A usage error exits with status 2. The service process itself exits with
   0 (idle, stop request, signal, or its socket was removed), 1 (it cannot
   start: store, directory, socket), 2 (usage), 75 (another service holds the
-  directory) or 77 (the store cannot be read: permission denied).
+  directory) or 77 (the store cannot be read or examined: permission
+  denied). It exits with 77 at start already when the store, or the
+  directory that holds it, cannot be examined for lack of permission.
 
 The service writes its log to `<cache dir>/service.log`
 (`~/Library/Caches/hxprobe-mcp/service.log` by default): start, builds with
@@ -598,7 +828,7 @@ service.
 mode):
 
 ```json
-"service": {"running": true, "building": false, "version": "0.2.0", "pid": 4242, "last_error": null}
+"service": {"running": true, "building": false, "version": "0.2.2", "pid": 4242, "last_error": null}
 ```
 
 `running` tells whether the service answered the last request and `building`
@@ -616,11 +846,18 @@ Errors of the tools in service mode:
 | `the rebuild did not finish within 300 s and may still be running; call store_status later` | `refresh` stopped waiting; the build goes on. Check `store_status` later. |
 | `the refresh service did not start; see <cache dir>/service.log` | No service answered within 10 s. See the log; a new start is tried after 30 s. |
 | `the refresh service exited at start (<status>); see <cache dir>/service.log` | The service failed at start. See the log. |
-| `the refresh service cannot read the store: permission denied; see <cache dir>/service.log` | See "Full Disk Access". |
+| `the refresh service cannot read the store: permission denied. Fix: open System Settings, Privacy & Security, Full Disk Access, add "<program>" and turn it on; then call again after 10 seconds. If the error stays, stop the service so that the next call starts a fresh one: "<program>" service --stop --cache-dir "<cache dir>". Log: <cache dir>/service.log` | macOS denies the program access to the store. See "Full Disk Access". |
+| `this server cannot read the store: permission denied. Fix: open System Settings, Privacy & Security, Full Disk Access, add "<program>" and turn it on; then restart the MCP client (quit the app that uses these tools and open it again). Cause: <error of the build>` | The same in fallback mode, where the server builds the cache itself. Grant the access, then restart the MCP client. |
+
+Both permission errors end with ` Note: <text>` when the plugin launcher did
+not use the shared directory (see "When the shared directory is not used").
+When the program path is not known, they say `the hxprobe program` instead
+of a quoted path, and the service form leaves out the stop command.
 
 When a usable `mail.db` exists, a service that is not available does not
-stop the tools: calls are answered from the database on disk, and the reason
-shows in `last_error`.
+stop the tools: calls are answered from the database on disk, the reason
+shows in `last_error`, and the results of the mail tools carry a `warning`
+(see "Tools").
 
 Fallback mode (`--no-service`, `HXPROBE_SERVICE=0`) is also used when the
 path of the socket `<cache dir>/service.sock` is too long for a Unix socket
@@ -683,8 +920,10 @@ On a store of 330 MB with about 21,500 messages a build takes about 11 to
 13 s (the export about 10 s, the search index about 1 s); after that, list
 calls take 10 to 50 ms and searches 50 to 90 ms. Only the first call ever,
 `refresh` and, in fallback mode, a call that triggers a rebuild wait for a
-build. Raise the client's tool timeout if it is shorter than a build, for
-example `MCP_TOOL_TIMEOUT` (in milliseconds) for Claude Code.
+build. Raise the client's tool timeout if it is shorter than a build and
+the client has a setting for it (Claude Code: `MCP_TOOL_TIMEOUT`, in
+milliseconds). Where it has none, call again after a while: the build goes
+on in the background.
 
 On that store `mail.db` is about 830 MB. During a rebuild the old database,
 the new one and the store copy exist side by side: about twice the database
@@ -695,7 +934,7 @@ To delete the cache, stop the service (and the servers in fallback mode),
 then remove the directory:
 
 ```sh
-"$HOME/Library/Application Support/hxprobe/bin/hxprobe" service --stop
+/Users/Shared/hxprobe/bin/hxprobe service --stop
 rm -rf ~/Library/Caches/hxprobe-mcp
 ```
 
@@ -703,27 +942,31 @@ The next tool call builds it again.
 
 ### Uninstall
 
-1. Quit the MCP clients that use the server, so that no call starts the
-   service again, and stop the service:
+1. Quit the MCP clients that use the server (a desktop app with Cmd+Q), so
+   that no call starts the service again, and stop the service:
 
    ```sh
-   "$HOME/Library/Application Support/hxprobe/bin/hxprobe" service --stop
+   /Users/Shared/hxprobe/bin/hxprobe service --stop
    ```
 
-   Add `--cache-dir <dir>` for every other cache directory in use.
+   Use the program path the errors named when it is another one, and add
+   `--cache-dir <dir>` for every other cache directory in use.
 2. Remove the plugin, or the MCP registration, from each client.
-3. Remove the install directory and the cache directory, and the data
+3. Remove the install directories and the cache directory, and the data
    directory of 0.1.x if it is still there:
 
    ```sh
-   rm -rf ~/"Library/Application Support/hxprobe" ~/Library/Caches/hxprobe-mcp
+   rm -rf /Users/Shared/hxprobe ~/Library/Caches/hxprobe-mcp
+   rm -rf ~/"Library/Application Support/hxprobe"
    rm -rf ~/"Library/Application Support/hxprobe-plugin"
    ```
 
    Use `$HXPROBE_INSTALL_DIR`, your `--cache-dir` and `$CLAUDE_PLUGIN_DATA`
-   instead when they were set.
-4. Remove the `hxprobe` entry, and any old `hxprobe-0.1.x` entry, from System
-   Settings, Privacy & Security, Full Disk Access.
+   instead when they were set. A `/Users/Shared/hxprobe` owned by root (one
+   an administrator made for all accounts) is removed by an administrator,
+   when no account uses it any more.
+4. Remove the `hxprobe` entries, and any old `hxprobe-0.1.x` entry, from
+   System Settings, Privacy & Security, Full Disk Access.
 
 ### Privacy and safety
 
