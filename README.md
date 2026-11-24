@@ -1171,11 +1171,15 @@ that forbids sockets makes them fail with `Operation not permitted`; run them
 outside it.
 
 The launcher and the release script have shell tests with stub programs on
-`PATH`, no network and no signing identity:
+`PATH`, no network and no signing identity. A third script checks the
+repository itself: the device profile, the versions in `hxprobe/Cargo.toml`,
+its lock file and the plugin manifest, the changelog, and phrases that the
+skill and this file must contain:
 
 ```sh
 bash scripts/test-run-mcp.sh
 bash scripts/test-release-sign.sh
+bash scripts/test-repo.sh
 ```
 
 The integration test against a real store is opt-in. Without the
@@ -1230,9 +1234,29 @@ is required and never printed. What `codesign` prints when it fails is not
 shown; run with `HXPROBE_SIGN_DEBUG=1` to see it, with the signer, team and
 home directory and user names removed.
 
+Signing stops when the designated requirement of the signed program
+differs from the `CodeRequirement` of
+`mdm/hxprobe-full-disk-access.mobileconfig`: the device profile would not
+cover that program. Only double quotes around the team value may differ,
+and neither requirement is printed. `HXPROBE_PROFILE` names another profile
+file. To run this comparison alone on a program signed before, and to
+verify its signature against the profile's requirement:
+
+```sh
+scripts/release-sign.sh --compare <signed program>
+```
+
+It needs no identity and writes nothing; exit status 0 is a match.
+
 On success the script prints one line on stdout, `<sha256>  <asset>`,
 computed from the signed file. Publish exactly that file as the asset of the
-GitHub release `v<version>` and add the line to `release/SHA256SUMS`.
+GitHub release `v<version>` and add the line to `release/SHA256SUMS`. Then
+run the release gate, which fails until the checksum file lists the arm64
+program of the version in `hxprobe/Cargo.toml`:
+
+```sh
+bash scripts/test-repo.sh --release
+```
 
 ## License
 
