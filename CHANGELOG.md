@@ -81,9 +81,12 @@ All notable changes to this project are listed here. The format follows
 - PDF text is made in a child process, never inside the server: an empty
   environment, no argument but `pdf-text`, the bytes on its input, at most
   20 seconds and 16,000,000 bytes of text, and its whole process group
-  killed when a limit is passed. Any failure means "no text" for that call.
-  The Word, Excel and PowerPoint readers bound the entries, the inflated
-  bytes and the text they produce.
+  killed when a limit is passed. The child's own allocator ends it with
+  exit status 4 once it holds more than 1 GiB at once, so a compressed
+  stream that inflates without end cannot fill the Mac's memory; the
+  allocator of every other command only counts. Any failure means "no
+  text" for that call. The Word, Excel and PowerPoint readers bound the
+  entries, the inflated bytes and the text they produce.
 - Attachment content is marked untrusted in the instructions, in the tool
   description and with the key `untrusted` in every `get_attachment` result.
 - Nothing is written and nothing is copied into the cache: a file is read in

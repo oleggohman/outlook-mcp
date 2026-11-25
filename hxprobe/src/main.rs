@@ -39,6 +39,90 @@ use memmap2::Mmap;
 
 use hxprobe::{block, export, header, inspect, item, kv, names, record, schema};
 
+/// The allocator of the program: the system's, with a count of the bytes
+/// live at once and a cap on it. The cap is off (0) except in `pdf-text`,
+/// which sets [`hxprobe::mcp::pdf::CHILD_MEMORY_CAP`]; off, it costs one
+/// relaxed atomic add or subtract and one relaxed load per call.
+mod capped {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+
+    use hxprobe::mcp::pdf::CHILD_MEMORY_EXIT;
+
+    static LIVE: AtomicUsize = AtomicUsize::new(0);
+    static CAP: AtomicUsize = AtomicUsize::new(0);
+
+    pub struct Capped;
+
+    /// Turn the cap on at `bytes` live at once.
+    pub fn set_cap(bytes: usize) {
+        CAP.store(bytes, Relaxed);
+    }
+
+    /// Count `n` more bytes live, before they are allocated. Past the cap
+    /// the process ends at once with [`CHILD_MEMORY_EXIT`]: nothing is
+    /// printed (the standard handler of a failed allocation prints a line
+    /// and aborts) and nothing else runs.
+    fn grow(n: usize) {
+        let live = LIVE.fetch_add(n, Relaxed).saturating_add(n);
+        let cap = CAP.load(Relaxed);
+        if cap != 0 && live > cap {
+            // SAFETY: _exit() has no preconditions; it ends the process.
+            unsafe { libc::_exit(CHILD_MEMORY_EXIT) }
+        }
+    }
+
+    fn shrink(n: usize) {
+        LIVE.fetch_sub(n, Relaxed);
+    }
+
+    // SAFETY: every call goes to `System` unchanged; only the count is
+    // added, and it never changes what `System` gets or returns.
+    unsafe impl GlobalAlloc for Capped {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            grow(layout.size());
+            let p = System.alloc(layout);
+            if p.is_null() {
+                shrink(layout.size());
+            }
+            p
+        }
+
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            grow(layout.size());
+            let p = System.alloc_zeroed(layout);
+            if p.is_null() {
+                shrink(layout.size());
+            }
+            p
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            System.dealloc(ptr, layout);
+            shrink(layout.size());
+        }
+
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            let old = layout.size();
+            if new_size > old {
+                grow(new_size - old);
+            }
+            let p = System.realloc(ptr, layout, new_size);
+            if p.is_null() {
+                if new_size > old {
+                    shrink(new_size - old);
+                }
+            } else if new_size < old {
+                shrink(old - new_size);
+            }
+            p
+        }
+    }
+}
+
+#[global_allocator]
+static ALLOC: capped::Capped = capped::Capped;
+
 /// Memory-map a store file read-only.
 ///
 /// Mapping rather than reading matters: these stores reach a gigabyte, and
@@ -1304,7 +1388,9 @@ fn cmd_service(args: &[String]) {
 /// It takes no argument (`extra` of them: exit 2, nothing read), reads only
 /// its stdin (more than [`hxprobe::mcp::attach::MAX_SOURCE_BYTES`]: exit
 /// 3), opens no file other than `/dev/null`, reads no environment variable
-/// and prints nothing to stderr. Before the library is touched, descriptor
+/// and prints nothing to stderr. More than
+/// [`hxprobe::mcp::pdf::CHILD_MEMORY_CAP`] bytes allocated at once: exit
+/// [`hxprobe::mcp::pdf::CHILD_MEMORY_EXIT`] at that moment. Before the library is touched, descriptor
 /// 1 is duplicated for the result and pointed at `/dev/null`, so nothing
 /// the library prints can reach the result. Text: exit 0; an error, a
 /// panic or empty input: exit 1 and nothing written.
@@ -1336,6 +1422,7 @@ fn cmd_pdf_text(extra: usize) -> ! {
     }
     // SAFETY: `result_fd` is a fresh descriptor owned by nothing else.
     let mut result = unsafe { File::from_raw_fd(result_fd) };
+    capped::set_cap(hxprobe::mcp::pdf::CHILD_MEMORY_CAP);
 
     let max = hxprobe::mcp::attach::MAX_SOURCE_BYTES;
     let mut input = Vec::new();

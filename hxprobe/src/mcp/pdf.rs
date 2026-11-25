@@ -23,6 +23,12 @@ use crate::mcp::client;
 pub const PDF_DEADLINE: Duration = Duration::from_secs(20);
 /// Most bytes of text read from the child.
 pub const PDF_MAX_TEXT: usize = 16_000_000;
+/// Most bytes the child may have allocated at once; past it the child
+/// exits with status [`CHILD_MEMORY_EXIT`] (a compressed stream can inflate
+/// to far more than any input it is given).
+pub const CHILD_MEMORY_CAP: usize = 1 << 30;
+/// Exit status of the child that passed [`CHILD_MEMORY_CAP`].
+pub const CHILD_MEMORY_EXIT: i32 = 4;
 
 /// How the child ended, for the log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

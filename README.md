@@ -562,8 +562,9 @@ own instead of showing it.
   call; ZIP64 archives, encrypted entries and methods other than stored and
   deflate are not read. The text made from one file stops at 16,000,000
   bytes. A workbook keeps at most 1,000,000 shared strings.
-* The text of a PDF is made by a child process with a limit of 20 seconds
-  and 16,000,000 bytes of text (see "Privacy and safety").
+* The text of a PDF is made by a child process with a limit of 20 seconds,
+  16,000,000 bytes of text and 1 GiB of memory allocated at once (see
+  "Privacy and safety").
 
 **What has no text.**
 
@@ -1327,8 +1328,9 @@ The next tool call builds it again.
   crash, an exit status other than 0, a timeout or too much output means "no
   text" for that call; the server is not affected. The child opens no file
   (other than `/dev/null`, where its own standard output points while the
-  PDF library runs) and reads nothing but its input. Its memory is not
-  limited.
+  PDF library runs) and reads nothing but its input. Its own allocator
+  counts the memory it holds: past 1 GiB at once (a compressed stream can
+  inflate to far more than the file) it exits at once with status 4.
 * **The file's bytes leave the server only in the tool result**, to the
   client that asked. A client may keep what a tool returns in files of its
   own (Claude Code keeps images and large results in its session

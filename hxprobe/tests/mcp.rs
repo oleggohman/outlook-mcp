@@ -820,22 +820,36 @@ const PDF_LINE: &str = "Quarterly figures are attached";
 /// uncompressed content stream.
 fn one_page_pdf() -> Vec<u8> {
     let content = format!("BT /F1 24 Tf 72 720 Td ({PDF_LINE}) Tj ET");
+    pdf_of_page(content.as_bytes(), "")
+}
+
+/// A one-page PDF whose page content stream is `content`, with `filter`
+/// (empty, or for example `/Filter /FlateDecode`) in its dictionary.
+fn pdf_of_page(content: &[u8], filter: &str) -> Vec<u8> {
     let objects = [
         "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
         "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
         "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R \
          /Resources << /Font << /F1 5 0 R >> >> >>"
             .to_string(),
-        format!(
-            "<< /Length {} >>\nstream\n{content}\nendstream",
-            content.len()
-        ),
+        String::new(),
         "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_string(),
     ];
     let mut pdf = b"%PDF-1.4\n".to_vec();
     let mut offsets = Vec::new();
     for (i, body) in objects.iter().enumerate() {
         offsets.push(pdf.len());
+        if i == 3 {
+            let head = format!(
+                "{} 0 obj\n<< /Length {} {filter} >>\nstream\n",
+                i + 1,
+                content.len()
+            );
+            pdf.extend_from_slice(head.as_bytes());
+            pdf.extend_from_slice(content);
+            pdf.extend_from_slice(b"\nendstream\nendobj\n");
+            continue;
+        }
         pdf.extend_from_slice(format!("{} 0 obj\n{body}\nendobj\n", i + 1).as_bytes());
     }
     let xref = pdf.len();
@@ -902,6 +916,89 @@ fn pdf_text_of_a_damaged_pdf_fails_silently() {
     assert!(!status.success(), "{status:?}");
     assert!(out.is_empty(), "{out:?}");
     assert!(err.is_empty(), "{}", String::from_utf8_lossy(&err));
+}
+
+/// Deflate bits, least significant first.
+struct Bits {
+    out: Vec<u8>,
+    acc: u64,
+    n: u32,
+}
+
+impl Bits {
+    /// `len` bits of `v`, low bit first (header fields, extra bits).
+    fn put(&mut self, v: u64, len: u32) {
+        self.acc |= v << self.n;
+        self.n += len;
+        while self.n >= 8 {
+            self.out.push(self.acc as u8);
+            self.acc >>= 8;
+            self.n -= 8;
+        }
+    }
+
+    /// A Huffman code of `len` bits, high bit first.
+    fn code(&mut self, v: u64, len: u32) {
+        for i in (0..len).rev() {
+            self.put(v >> i & 1, 1);
+        }
+    }
+}
+
+/// A zlib stream that inflates to at least `min_out` zero bytes: fixed
+/// Huffman blocks of matches of length 258 at distance 1. Each block is a
+/// whole number of bytes, so one block is made and repeated.
+fn zlib_bomb(min_out: usize) -> Vec<u8> {
+    // 3 header bits, 8 for the first literal, 13 per match, 7 for the end
+    // of block: a multiple of 8 with 8 * 1000 + 6 matches.
+    const MATCHES: usize = 8006;
+    let block = |first: bool| {
+        let mut b = Bits {
+            out: Vec::new(),
+            acc: 0,
+            n: 0,
+        };
+        b.put(0b010, 3); // not final, fixed Huffman
+        if first {
+            b.code(0b0011_0000, 8); // literal 0
+        }
+        for _ in 0..MATCHES {
+            b.code(0b1100_0101, 8); // length 258
+            b.code(0, 5); // distance 1
+        }
+        b.code(0, 7); // end of block
+        if !first {
+            assert_eq!(b.n, 0);
+        }
+        b.out
+    };
+    // The first block has 8 bits more; its end needs no padding either.
+    let mut z = vec![0x78, 0x01];
+    z.extend(block(true));
+    let repeat = block(false);
+    let mut out = 1 + MATCHES * 258;
+    while out < min_out {
+        z.extend_from_slice(&repeat);
+        out += MATCHES * 258;
+    }
+    // A final, empty fixed block; then a checksum the reader never gets to.
+    z.extend_from_slice(&[0x03, 0x00, 0, 0, 0, 0]);
+    z
+}
+
+#[test]
+fn pdf_text_of_a_flate_bomb_ends_at_the_memory_cap() {
+    // More than the child may hold, whatever its buffers' growth.
+    let cap = hxprobe::mcp::pdf::CHILD_MEMORY_CAP;
+    let bomb = zlib_bomb(cap + cap / 4);
+    let pdf = pdf_of_page(&bomb, "/Filter /FlateDecode");
+    assert!(pdf.len() < 30_000_000);
+    let started = Instant::now();
+    let (status, out, _) = pdf_text(&[], &pdf);
+    // Exit 4: the cap on live memory was passed.
+    assert_eq!(status.code(), Some(4), "{status:?}");
+    assert!(out.is_empty(), "{} bytes out", out.len());
+    eprintln!("flate bomb: {:?}", started.elapsed());
 }
 
 #[test]
