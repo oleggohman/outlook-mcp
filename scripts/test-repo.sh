@@ -601,7 +601,8 @@ while IFS= read -r -d '' f; do
 done < <(git -C "$repo" ls-files -z -- skills)
 t='skill files: tracked files found'
 if [ "${#skill_files[@]}" -ge 2 ]; then pass "$t"; else fail "$t" "found ${#skill_files[@]}"; fi
-expect_pass 'skill files: no local path or file address' check_skill_paths "${skill_files[@]}"
+expect_pass 'skill files: no local path or file address' \
+    check_skill_paths ${skill_files[@]+"${skill_files[@]}"}
 i=0
 for p in "${skill_path_patterns[@]}"; do
     i=$((i + 1))
