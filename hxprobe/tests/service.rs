@@ -331,6 +331,9 @@ fn removing_the_cache_directory_ends_the_service() {
 
 #[test]
 fn version_flag_prints_the_version() {
+    // Serial too: a child started while another test's listening socket
+    // is not close-on-exec yet would inherit it.
+    let _s = serial();
     let (st, out, err) = run(&["--version"]);
     assert_eq!(st.code(), Some(0), "{err}");
     assert_eq!(out, format!("hxprobe {VERSION}\n"));
