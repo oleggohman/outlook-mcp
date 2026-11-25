@@ -8,7 +8,8 @@
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
+use std::sync::{mpsc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -57,6 +58,24 @@ impl Drop for Running {
     }
 }
 
+/// Start `cmd`. Every child of this file is started under one lock: on
+/// macOS a pipe becomes close-on-exec in a step after its creation, so a child
+/// that another test started meanwhile could inherit it and keep, say, the
+/// stdin of a server open.
+fn spawn(cmd: &mut Command) -> Child {
+    static SPAWN: Mutex<()> = Mutex::new(());
+    let _g = SPAWN.lock().unwrap_or_else(|e| e.into_inner());
+    cmd.spawn().unwrap()
+}
+
+/// [`Command::output`], started by [`spawn`].
+fn output(cmd: &mut Command) -> Output {
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    spawn(cmd).wait_with_output().unwrap()
+}
+
 fn drain(mut r: impl Read + Send + 'static) -> JoinHandle<Vec<u8>> {
     std::thread::spawn(move || {
         let mut v = Vec::new();
@@ -94,7 +113,7 @@ fn mcp_with(
         .env("HXPROBE_SERVICE", "0")
         .env_remove("HXPROBE_TEST_BUILD_DELAY_MS");
     configure(&mut cmd);
-    let mut child = Running(cmd.spawn().unwrap());
+    let mut child = Running(spawn(&mut cmd));
     let out = drain(child.0.stdout.take().unwrap());
     let stderr = child.0.stderr.take().unwrap();
     let err = if read_stderr {
@@ -843,7 +862,7 @@ fn pdf_text(extra: &[&str], input: &[u8]) -> (ExitStatus, Vec<u8>, Vec<u8>) {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = Running(cmd.spawn().unwrap());
+    let mut child = Running(spawn(&mut cmd));
     let out = drain(child.0.stdout.take().unwrap());
     let err = drain(child.0.stderr.take().unwrap());
     {
@@ -902,7 +921,7 @@ fn pdf_text_with_an_argument_fails_without_reading() {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = Running(cmd.spawn().unwrap());
+    let mut child = Running(spawn(&mut cmd));
     let started = Instant::now();
     let status = loop {
         if let Some(s) = child.0.try_wait().unwrap() {
@@ -928,9 +947,7 @@ fn pdf_text_with_an_argument_fails_without_reading() {
 
 #[test]
 fn usage_does_not_name_pdf_text() {
-    let out = Command::new(env!("CARGO_BIN_EXE_hxprobe"))
-        .output()
-        .unwrap();
+    let out = output(&mut Command::new(env!("CARGO_BIN_EXE_hxprobe")));
     let all = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),
@@ -967,7 +984,8 @@ fn base64_decode(s: &str) -> Option<Vec<u8>> {
 struct Session {
     child: Running,
     stdin: Option<std::process::ChildStdin>,
-    stdout: std::io::BufReader<std::process::ChildStdout>,
+    /// The lines of its stdout, read by a thread of their own.
+    lines: mpsc::Receiver<String>,
     stderr: Option<JoinHandle<Vec<u8>>>,
     next_id: i64,
 }
@@ -986,14 +1004,24 @@ impl Session {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let mut child = Running(cmd.spawn().unwrap());
+        let mut child = Running(spawn(&mut cmd));
         let stdin = child.0.stdin.take();
         let stdout = std::io::BufReader::new(child.0.stdout.take().unwrap());
+        let (tx, lines) = mpsc::channel();
+        std::thread::spawn(move || {
+            use std::io::BufRead;
+            for line in stdout.lines() {
+                let Ok(line) = line else { break };
+                if tx.send(line + "\n").is_err() {
+                    break;
+                }
+            }
+        });
         let stderr = Some(drain(child.0.stderr.take().unwrap()));
         let mut s = Session {
             child,
             stdin,
-            stdout,
+            lines,
             stderr,
             next_id: 1,
         };
@@ -1009,9 +1037,9 @@ impl Session {
         self.child.0.id()
     }
 
-    /// The response line to one request, as text.
+    /// The response line to one request, as text. Fails the test when none
+    /// comes within [`TIMEOUT`].
     fn send_raw(&mut self, method: &str, params: Value) -> String {
-        use std::io::BufRead;
         let id = self.next_id;
         self.next_id += 1;
         let stdin = self.stdin.as_mut().unwrap();
@@ -1019,9 +1047,9 @@ impl Session {
             .write_all(request(id, method, params).as_bytes())
             .unwrap();
         stdin.flush().unwrap();
-        let mut line = String::new();
-        self.stdout.read_line(&mut line).unwrap();
-        line
+        self.lines
+            .recv_timeout(TIMEOUT)
+            .unwrap_or_else(|e| panic!("no response to {method} within {TIMEOUT:?}: {e}"))
     }
 
     fn send(&mut self, method: &str, params: Value) -> Value {
@@ -1055,10 +1083,16 @@ impl Session {
 
 /// The children of process `pid`, by `pgrep -P`.
 fn children_of(pid: u32) -> String {
-    let out = Command::new("/usr/bin/pgrep")
-        .args(["-P", &pid.to_string()])
-        .output()
-        .unwrap();
+    let out = output(Command::new("/usr/bin/pgrep").args(["-P", &pid.to_string()]));
+    // 0: some found; 1: none. Anything else is a failure of pgrep, not "no
+    // children".
+    let expected = if out.stdout.is_empty() { 1 } else { 0 };
+    assert_eq!(
+        out.status.code(),
+        Some(expected),
+        "pgrep: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
