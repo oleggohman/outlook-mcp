@@ -167,7 +167,8 @@ pub enum Kind {
 /// The kind of a file from its first bytes (`head`, at most
 /// [`HEAD_BYTES`] are looked at), the extension of the stored name and the
 /// stored content type. A signature always wins; the extension and the
-/// content type only select text, and only when no NUL byte is in the head.
+/// content type only select text, and only when no NUL byte is in the head
+/// or the head starts with a UTF-16 byte order mark.
 pub fn classify(head: &[u8], extension: Option<&str>, content_type: Option<&str>) -> Kind {
     if let Some(mime) = image_type(head) {
         return Kind::Image(mime);
@@ -178,7 +179,10 @@ pub fn classify(head: &[u8], extension: Option<&str>, content_type: Option<&str>
     if head.starts_with(b"PK\x03\x04") {
         return Kind::Zip;
     }
-    if head[..head.len().min(HEAD_BYTES)].contains(&0) {
+    // UTF-16 text has a NUL in every second byte when it is mostly ASCII;
+    // with a byte order mark the NUL test is skipped.
+    let utf16 = head.starts_with(b"\xff\xfe") || head.starts_with(b"\xfe\xff");
+    if !utf16 && head[..head.len().min(HEAD_BYTES)].contains(&0) {
         return Kind::File;
     }
     let ext = extension.map(str::to_ascii_lowercase);
@@ -806,6 +810,26 @@ mod tests {
         let mut long = vec![b'a'; HEAD_BYTES + 1];
         long[HEAD_BYTES] = 0;
         assert_eq!(classify(&long, Some("txt"), None), Kind::Text);
+    }
+
+    #[test]
+    fn utf16_text_with_a_byte_order_mark_is_text() {
+        let s = "name,amount\nAnna,12\n";
+        let mut le = b"\xff\xfe".to_vec();
+        le.extend(utf16le(s));
+        let mut be = b"\xfe\xff".to_vec();
+        be.extend(utf16be(s));
+        for bytes in [&le, &be] {
+            assert_eq!(classify(bytes, Some("csv"), None), Kind::Text);
+            assert_eq!(classify(bytes, Some("txt"), None), Kind::Text);
+            assert_eq!(classify(bytes, None, Some("text/plain")), Kind::Text);
+            assert_eq!(classify(bytes, Some("htm"), None), Kind::Html);
+            assert_eq!(decode_text(bytes), (s.to_string(), false));
+            // The extension or the content type still has to say text.
+            assert_eq!(classify(bytes, Some("bin"), None), Kind::File);
+        }
+        // Without a byte order mark a NUL still makes a file.
+        assert_eq!(classify(&utf16le(s), Some("csv"), None), Kind::File);
     }
 
     #[test]

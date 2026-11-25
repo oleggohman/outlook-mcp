@@ -10,7 +10,8 @@ All notable changes to this project are listed here. The format follows
 
 - The tool `get_attachment` sends the content of one attachment that Outlook
   has downloaded, by the `guid` that `list_attachments` returns, in the tool
-  result itself: a text or HTML file as text, a PNG, JPEG, GIF or WebP image
+  result itself: a text or HTML file (UTF-8, or UTF-16 with a byte order
+  mark) as text, a PNG, JPEG, GIF or WebP image
   as an MCP `image` item, a Word, Excel or PowerPoint file (`.docx`,
   `.xlsx`, `.pptx`) as its text only, a PDF as its text and, in the same
   result, as an embedded `resource` with its bytes, and any other file as an
