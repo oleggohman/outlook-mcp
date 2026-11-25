@@ -618,6 +618,44 @@ pub fn mail_store() -> Vec<u8> {
     store_of(items)
 }
 
+/// An extra attachment record for [`mail_store_with_attachments`].
+#[derive(Debug, Clone, Copy)]
+pub struct TestAttachment<'a> {
+    pub guid: [u8; 16],
+    /// `Filename` as the store holds it (`~/Files/...`); `None`: not set.
+    pub filename: Option<&'a str>,
+    /// `DisplayName`; `None`: not set.
+    pub display_name: Option<&'a str>,
+    pub content_type: &'a str,
+    pub size: i64,
+    pub inline: i64,
+    pub download_status: i64,
+}
+
+/// [`mail_store`] plus one `AttachmentHeader` per entry of `extra`, each
+/// attached to `MAIL_MSGS[1]`.
+pub fn mail_store_with_attachments(extra: &[TestAttachment]) -> Vec<u8> {
+    let mut items = mail_items();
+    items.extend(calendar_items());
+    items.extend(extra.iter().map(|a| {
+        let mut v = vec![
+            ("ContentType", text(a.content_type)),
+            ("Size", PropValue::Int(a.size)),
+            ("InlineStatus", PropValue::Int(a.inline)),
+            ("DownloadStatus", PropValue::Int(a.download_status)),
+            ("MessageHeader", reference(MESSAGE_HEADER, MAIL_MSGS[1])),
+        ];
+        if let Some(f) = a.filename {
+            v.push(("Filename", text(f)));
+        }
+        if let Some(d) = a.display_name {
+            v.push(("DisplayName", text(d)));
+        }
+        make_typed_item("AttachmentHeader", a.guid, &v)
+    }));
+    store_of(items)
+}
+
 /// [`mail_store`] without attachments and appointments.
 pub fn mail_store_without_calendar() -> Vec<u8> {
     store_of(mail_items())
@@ -778,6 +816,35 @@ mod tests {
                 .unwrap();
             assert_eq!(blob, "blob");
         }
+    }
+
+    #[test]
+    fn extra_attachments_are_exported() {
+        assert_eq!(mail_store_with_attachments(&[]), mail_store());
+        let mm = mail_store_with_attachments(&[TestAttachment {
+            guid: [0x43; 16],
+            filename: Some("~/Files/S0/3/Attachments/0/a[1].txt"),
+            display_name: None,
+            content_type: "text/plain",
+            size: 5,
+            inline: 1,
+            download_status: 2,
+        }]);
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let st = crate::export::export(&crate::kv::Store::load(&mm), &mm, &conn, window()).unwrap();
+        assert_eq!(st.schema_objects, 17);
+        let row: (String, Option<String>, i64, i64, i64) = conn
+            .query_row(
+                "SELECT Filename, DisplayName, Size, InlineStatus, DownloadStatus
+                 FROM \"AttachmentHeader\" WHERE guid = ?1",
+                [crate::props::guid_hex(&[0x43; 16])],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            row,
+            ("~/Files/S0/3/Attachments/0/a[1].txt".into(), None, 5, 1, 2)
+        );
     }
 
     #[test]

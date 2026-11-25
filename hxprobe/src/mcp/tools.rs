@@ -217,7 +217,8 @@ pub const TOOLS: &[Tool] = &[
     Tool {
         name: "list_attachments",
         description: concat!(
-            "List the attachments of a message (metadata only: names, type, size).",
+            "List the attachments of a message: guid, names, type, size. Pass a guid to \
+             get_attachment for the content.",
             untrusted!()
         ),
         params: &[param(
@@ -796,20 +797,34 @@ fn list_attachments(conn: &Connection, _now: i64, args: &Args) -> Result<Value, 
     let guid = args.guid("message_guid")?;
     let items = rows(
         conn,
-        "SELECT Filename, DisplayName, ContentType, Size, InlineStatus
+        "SELECT guid, Filename, DisplayName, ContentType, Size, InlineStatus
          FROM \"AttachmentHeader\" WHERE \"MessageHeader\" = ?1 ORDER BY object_id",
         &[SqlValue::Text(guid.to_string())],
         |r| {
             Ok(json!({
-                "filename": field(r.get_ref(0)?),
-                "display_name": field(r.get_ref(1)?),
-                "content_type": field(r.get_ref(2)?),
-                "size": number(r.get_ref(3)?),
-                "inline": number(r.get_ref(4)?),
+                "guid": field(r.get_ref(0)?),
+                "filename": own_name_field(r.get_ref(1)?),
+                "display_name": field(r.get_ref(2)?),
+                "content_type": field(r.get_ref(3)?),
+                "size": number(r.get_ref(4)?),
+                "inline": number(r.get_ref(5)?),
             }))
         },
     )?;
     Ok(list(items.len() as i64, 0, items))
+}
+
+/// The part of a stored file name after the last `/`, so no result shows
+/// where the file lies inside the profile directory.
+fn own_name(filename: &str) -> &str {
+    filename.rsplit('/').next().unwrap_or(filename)
+}
+
+/// [`field`] of the file's own name.
+fn own_name_field(v: ValueRef) -> Value {
+    lossy(v).map_or(Value::Null, |s| {
+        Value::String(cap(own_name(&s), MAX_FIELD).0)
+    })
 }
 
 /// A required string argument of 1 to `max` chars.
@@ -964,8 +979,9 @@ mod tests {
     use super::*;
     use crate::props::guid_hex;
     use crate::testutil::{
-        fake_status, mail_store, mail_store_without_calendar, FakeOp, FakeRefresher, MAIL_EVENTS,
-        MAIL_EVENT_TIMES, MAIL_MSGS, MAIL_SENT, MAIL_VIEW_TOP, NOW,
+        fake_status, mail_store, mail_store_with_attachments, mail_store_without_calendar, FakeOp,
+        FakeRefresher, TestAttachment, MAIL_ATTACHMENTS, MAIL_EVENTS, MAIL_EVENT_TIMES, MAIL_MSGS,
+        MAIL_SENT, MAIL_VIEW_TOP, NOW,
     };
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1435,6 +1451,68 @@ mod tests {
         let v = f.ok("list_attachments", json!({"message_guid": msg(1)}));
         assert_eq!(v["total"], 0);
         assert!(v["items"].as_array().unwrap().is_empty());
+    }
+
+    /// The guids of the items of a `list_attachments` result.
+    fn attachment_guids(v: &Value) -> Vec<String> {
+        v["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|it| it["guid"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn list_attachments_gives_guids() {
+        let mut f = fixture();
+        let v = f.ok("list_attachments", json!({"message_guid": msg(0)}));
+        let want: Vec<String> = MAIL_ATTACHMENTS.iter().map(guid_hex).collect();
+        assert_eq!(attachment_guids(&v), want);
+        for g in &want {
+            assert_eq!(g.len(), 32);
+            assert!(g.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')));
+        }
+        let items = v["items"].as_array().unwrap();
+        assert_eq!(items[0]["filename"], "report.pdf");
+        assert_eq!(items[0]["display_name"], "Report");
+        assert_eq!(items[0]["content_type"], "application/pdf");
+        assert_eq!(items[0]["size"], 12_345);
+        assert!(items[0].get("inline").is_some());
+        assert_eq!(items[1]["filename"], "chart.png");
+        assert_eq!(items[1]["display_name"], "Chart");
+    }
+
+    #[test]
+    fn list_attachments_gives_the_file_name_without_a_directory() {
+        let mut f = fixture_of(mail_store_with_attachments(&[TestAttachment {
+            guid: [0x43; 16],
+            filename: Some("~/Files/S0/3/Attachments/0/report[7].pdf"),
+            display_name: Some("Report"),
+            content_type: "application/pdf",
+            size: 7,
+            inline: 0,
+            download_status: 2,
+        }]));
+        let v = f.ok("list_attachments", json!({"message_guid": msg(1)}));
+        assert_eq!(v["total"], 1);
+        assert_eq!(v["items"][0]["filename"], "report[7].pdf");
+        assert_eq!(v["items"][0]["guid"], guid_hex(&[0x43; 16]));
+        let text = v.to_string();
+        assert!(!text.contains("Files/"), "{text}");
+        assert!(!text.contains("~/"), "{text}");
+    }
+
+    #[test]
+    fn attachment_guids_survive_a_rebuild() {
+        let mut f = fixture();
+        let before = attachment_guids(&f.ok("list_attachments", json!({"message_guid": msg(0)})));
+        let builds = f.cache.builds;
+        f.ok("refresh", Value::Null);
+        assert!(f.cache.builds > builds);
+        let after = attachment_guids(&f.ok("list_attachments", json!({"message_guid": msg(0)})));
+        assert_eq!(before.len(), 2);
+        assert_eq!(before, after);
     }
 
     // --- arguments ---
