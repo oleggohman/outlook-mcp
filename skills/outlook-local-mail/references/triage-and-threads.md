@@ -77,17 +77,12 @@ one can be closed.
 
 ## 3. Attachments
 
-- `list_attachments` returns embedded body images (signatures, logos,
-  inline screenshots) beside the files, with a `guid` per entry. Report
-  the entries with `inline: 0` as the attached files; group the rest as
-  "embedded images" unless the user asks for them. This holds for nearly
-  all entries, not all: when a file the user expects is missing, look at
-  the names in the other group too.
+- `list_attachments` returns embedded body images beside the files, with
+  a `guid` per entry: tell them apart as "Attachments" in SKILL.md says.
 - To answer a question about a file's content, call `get_attachment` with
   the `guid` of that one entry and follow "Attachments" in SKILL.md. Read
   only the attachment asked about, not every entry and not the embedded
   images, unless the user asks for them.
-- To answer "what did I send", read the attachments of the user's own
-  message in `Sent Items`, not of the inbound one.
-- In triage, open an attachment only when the message cannot be judged
-  without it.
+- "What did I send": see "Attachments" in SKILL.md.
+- In triage, read an attachment with `get_attachment` only when the
+  message cannot be judged without it.

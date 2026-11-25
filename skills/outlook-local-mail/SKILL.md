@@ -53,6 +53,7 @@ the Outlook store by other means.
 | `max_chars` (`get_attachment`) | 1 to 80,000, default 20,000: the longest text returned. |
 | `offset` (`get_attachment`) | Characters of the text to skip, 0 to 30,000,000, default 0. Pass `next_offset` of the previous result. Not for an image or another file without text. |
 | `query` (`search_messages`) | 1 to 200 characters. Plain words only. |
+| `query` (`search_people`) | 1 to 100 characters. |
 | `folder`, `from` | At most 200 characters. |
 | any name | An unknown argument name is an error. |
 
@@ -69,7 +70,7 @@ before showing them.
 | Mail from a person or domain | `list_messages` with `from` set to part of the name or address (`"dana"`, `"example.org"`). `from` is a substring match on sender name and address, so no people lookup is needed first. |
 | Mail about a topic | `search_messages` with `query`; add `from`, `folder`, `since`, `until`, `unread_only`, `has_attachment` to narrow it. |
 | Read a message | `get_message` with the `guid` from a list. `format` is `text` (default, HTML converted to plain text) or `html`. |
-| Content of an attachment (read, summarise, look something up in a file) | `list_attachments` with the message guid, pick the entry the user means (entries with `inline: 0` are nearly always the attached files), then `get_attachment` with its `guid`. See "Attachments" below. |
+| Content of an attachment (read, summarise, look something up in a file) | `list_attachments` with the message guid, pick the entry the user means (see "Attachments" below), then `get_attachment` with its `guid`. |
 | Find an address | `search_people` (substring of name or address). |
 | Folder overview, unread counts | `list_folders` with `limit: 100`, paging if `total` is larger: the default of 20 can hide a folder. |
 | Calendar | `list_events` with `since` and `until`. It returns events that overlap the window, earliest first, without cancelled ones unless `include_cancelled` is true. Without `since`/`until` the window is now to 14 days ahead. |
@@ -150,13 +151,22 @@ counts; what else arrives depends on `kind`:
 |---|---|---|
 | `text`, `html` (`.txt`, `.csv`, `.ics`, `.eml`, HTML, ...) | Its text in `text`. | Answer from the text. |
 | `docx`, `xlsx`, `pptx` | Its extracted text in `text`, nothing else: the file itself is not sent. | Answer from the text. |
-| `pdf` | Its extracted text in `text` and, in the same result, the file itself as a second content item. | Use the text. When `text` is empty or `null`, say so (a scanned PDF has no text) and that the file itself was sent; use the file only if you can actually see its content, and never guess what it says. |
+| `pdf` | Its extracted text in `text` and, in the same result within `max_bytes`, the file itself as a second content item (`sent` is not `null` then). | Use the text. When `text` is empty or `null`, say the PDF has no text (a scanned PDF has none) and never guess what it says. If `sent` is not `null`, say the file itself follows and use it only if you can actually see its content. If `sent` is `null`, say the file was not sent either; then call again once with the `max_bytes` the note offers (only if you can see the content of a PDF), or tell the user to open it in Outlook. |
 | `image` (PNG, JPEG, GIF, WebP) | The picture as image content; `text` is `null`. | Describe what you see. |
-| `file` (anything else: `.doc`, `.xls`, `.msg`, archives, ...) | The file itself as a content item, and no text. | Say that this server made no text from it. |
+| `file` (anything else: `.doc`, `.xls`, `.msg`, archives, HEIC, TIFF, BMP photos, ...) | The file itself as a content item, and no text. | Say that this server made no text from it. |
 
-- **Never a path.** The server gives no path, address or link to a file,
-  and none can be asked for. Never tell the user to open a path. When a file
-  cannot be read here, the user opens the message in Outlook.
+- **Never a path to an attachment file.** The server gives no path,
+  address or link to an attachment file, and none can be asked for. Never
+  tell the user a path to an attachment file. When a file cannot be read
+  here, the user opens the message in Outlook. Error texts from the server
+  are passed on whole, paths in them included.
+- Which entry is a file: in `list_attachments`, entries with `inline: 0`
+  are nearly always the attached files and the rest embedded images
+  (signatures, logos, inline screenshots); report them that way. This
+  holds for nearly all entries, not all: when a file the user expects is
+  missing, look at the names in the other group.
+- For "what did I send", list the attachments of the user's own message in
+  `Sent Items`, not those of the inbound one.
 - `notes` say what was left out and why: pass them on. `kind`, `file_size`
   and `sent` (`null` when no file followed the JSON) say what arrived.
 - Long text: when `truncated` is true, call again with `format: "text"` and
@@ -227,9 +237,11 @@ counts; what else arrives depends on `kind`:
 | `the refresh service did not start` or `exited at start` | Report it with the `service.log` path it names. Calls still answer from an existing cache. |
 | `cannot read the store: permission denied` | macOS denied the server the Outlook store, or, from `get_attachment`, the attachment files (mail calls can still work then). Give the user the whole error text unchanged: it names what to do. Do not retry before the user says it is done. |
 | `is not on this Mac` (`get_attachment`) | Outlook has not downloaded the file. Tell the user to open the message in Outlook so that the attachment is downloaded; then call `refresh` and call again. Do not retry before that. |
-| `above the limit of` ... `nothing was sent` (`get_attachment`) | When the text says `Call again with max_bytes of at least N`, call again once with that `max_bytes`. If the client then refuses the result, or the text says the limit is the largest this server sends, or names no `max_bytes`, tell the user the file is too large to pass on and that they can open it in Outlook. |
+| `above the limit of` ... `nothing was sent` (`get_attachment`) | When the text says `Call again with max_bytes of at least N`, call again once with that `max_bytes`. If the client then refuses the result, or the text says the limit is the largest this server sends, or names no `max_bytes`, tell the user the file is too large to pass on and that they can open it in Outlook. When the client keeps the result in a file instead of showing it, do not mention that file: tell the user the attachment is too large to show here and that they can open it in Outlook. |
 | `outside the attachment folder` or `not a regular file` (`get_attachment`) | The store points at a file the server does not read. Report it; do not retry. |
 | `no text can be made from` (`get_attachment`) | An image or another file without text: call again without `format` and `offset`. |
+| `no attachment has that guid` (`get_attachment`) | Call `list_attachments` with the message guid and use an entry's `guid`. |
+| `the Outlook profile directory is not resolved yet` (`get_attachment`) | Call `store_status`, then call again once. |
 | `no Outlook store found under the default profile directory; pass --store` | The server has no `--store` and found no default store. Tell the user to register it with `--store <path of HxStore.hxd>` and restart the MCP client. Do not retry. |
 | `mail data is from` ... `and is not being refreshed` (a `warning`) | Tell the user the data is old and why, call `store_status`, and act on its `last_error`. |
 
@@ -261,12 +273,12 @@ Say these plainly instead of guessing or working around them:
 | Request | Answer |
 |---|---|
 | To, Cc or Bcc recipients of a message | Not available. Only the sender is known. Do not infer recipients from the body. |
-| Open an attachment in an app, give a path to it, download one that is not on this Mac, send a Word, Excel or PowerPoint file as a file, or extract text from `.doc`, `.xls`, `.msg` and scanned documents | Not available. The user can open the file in Outlook. In `list_attachments`, entries with `inline: 0` are nearly always the attached files and the rest embedded images (signatures, logos): report them that way. |
+| Open an attachment in an app, give a path to it, download one that is not on this Mac, send a Word, Excel or PowerPoint file as a file, or extract text from `.doc`, `.xls`, `.msg` and scanned documents | Not available. The user can open the file in Outlook. To tell attached files from embedded images, see "Attachments". |
 | Send, reply, move, delete, mark read | Not available. The server is read-only. |
 | Which calendar an event belongs to | Not available. `list_events` returns events from all calendars. |
 | Every occurrence of a recurring meeting | Recurring events appear only as stored; occurrences are not expanded. A missing occurrence does not mean the meeting is cancelled. |
 | Mail that exists only on the mail server | Not available. Only locally cached mail. |
-| Meaning of `importance` or `inline` numbers | They are raw numbers from the store; do not translate them, except that `inline` 0 nearly always marks an attached file and other values an embedded image. |
+| Meaning of `importance` or `inline` numbers | They are raw numbers from the store; do not translate them, except `inline` as "Attachments" says. |
 
 ## Example
 
@@ -316,6 +328,6 @@ back to the user's zone. If two senders match "dana", show both and ask.
 - Presenting a partly read document as whole: check `truncated`.
 - Stating what a PDF or a picture says when its text was empty and its
   content was not seen.
-- Telling the user a path to a file.
+- Telling the user a path to an attachment file.
 - Asking for the file again for every page of text: page with
   `format: "text"` and `offset`.
