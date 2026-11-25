@@ -939,3 +939,249 @@ fn usage_does_not_name_pdf_text() {
     assert!(all.contains("usage:"), "{all}");
     assert!(!all.contains("pdf-text"), "{all}");
 }
+
+// --- a PDF the whole way: server, child, library ---
+
+/// Standard base64 with padding, decoded; `None` for anything else.
+fn base64_decode(s: &str) -> Option<Vec<u8>> {
+    const ABC: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let b = s.as_bytes();
+    if !b.len().is_multiple_of(4) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(b.len() / 4 * 3);
+    for chunk in b.chunks(4) {
+        let pad = chunk.iter().rev().take_while(|&&c| c == b'=').count();
+        let mut n = 0u32;
+        for &c in &chunk[..4 - pad] {
+            n = n << 6 | ABC.iter().position(|&x| x == c)? as u32;
+        }
+        n <<= 6 * pad as u32;
+        out.extend_from_slice(&n.to_be_bytes()[1..4 - pad]);
+    }
+    Some(out)
+}
+
+/// A running `hxprobe mcp` (fallback mode) on the store of `d`, asked one
+/// request at a time.
+struct Session {
+    child: Running,
+    stdin: Option<std::process::ChildStdin>,
+    stdout: std::io::BufReader<std::process::ChildStdout>,
+    stderr: Option<JoinHandle<Vec<u8>>>,
+    next_id: i64,
+}
+
+impl Session {
+    fn start(d: &Dir) -> Session {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_hxprobe"));
+        cmd.arg("mcp")
+            .arg("--store")
+            .arg(d.path("HxStore.hxd"))
+            .arg("--cache-dir")
+            .arg(d.path("cache"))
+            .env("HXPROBE_SERVICE", "0")
+            .env("HOME", &d.0)
+            .env_remove("HXPROBE_TEST_BUILD_DELAY_MS")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = Running(cmd.spawn().unwrap());
+        let stdin = child.0.stdin.take();
+        let stdout = std::io::BufReader::new(child.0.stdout.take().unwrap());
+        let stderr = Some(drain(child.0.stderr.take().unwrap()));
+        let mut s = Session {
+            child,
+            stdin,
+            stdout,
+            stderr,
+            next_id: 1,
+        };
+        s.send(
+            "initialize",
+            json!({"protocolVersion": "2025-06-18", "capabilities": {},
+                   "clientInfo": {"name": "test", "version": "0"}}),
+        );
+        s
+    }
+
+    fn pid(&self) -> u32 {
+        self.child.0.id()
+    }
+
+    /// The response line to one request, as text.
+    fn send_raw(&mut self, method: &str, params: Value) -> String {
+        use std::io::BufRead;
+        let id = self.next_id;
+        self.next_id += 1;
+        let stdin = self.stdin.as_mut().unwrap();
+        stdin
+            .write_all(request(id, method, params).as_bytes())
+            .unwrap();
+        stdin.flush().unwrap();
+        let mut line = String::new();
+        self.stdout.read_line(&mut line).unwrap();
+        line
+    }
+
+    fn send(&mut self, method: &str, params: Value) -> Value {
+        let line = self.send_raw(method, params);
+        serde_json::from_str(&line).unwrap_or_else(|e| panic!("{e}: {line}"))
+    }
+
+    fn attachment(&mut self, args: Value) -> (Value, String) {
+        let line = self.send_raw(
+            "tools/call",
+            json!({"name": "get_attachment", "arguments": args}),
+        );
+        (serde_json::from_str(&line).unwrap(), line)
+    }
+
+    /// Close stdin, wait for the exit; the status and stderr.
+    fn finish(mut self) -> (ExitStatus, String) {
+        drop(self.stdin.take());
+        let started = Instant::now();
+        let status = loop {
+            if let Some(s) = self.child.0.try_wait().unwrap() {
+                break s;
+            }
+            assert!(started.elapsed() < TIMEOUT, "hxprobe mcp did not exit");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let err = self.stderr.take().unwrap().join().unwrap();
+        (status, String::from_utf8_lossy(&err).into_owned())
+    }
+}
+
+/// The children of process `pid`, by `pgrep -P`.
+fn children_of(pid: u32) -> String {
+    let out = Command::new("/usr/bin/pgrep")
+        .args(["-P", &pid.to_string()])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// A profile directory with the PDF `data` as the attachment
+/// `report[3].pdf` of guid `[0x95; 16]`.
+fn pdf_profile(name: &str, data: &[u8]) -> Dir {
+    let d = Dir::new(name);
+    std::fs::write(
+        d.path("HxStore.hxd"),
+        attachment_store(&[(
+            [0x95; 16],
+            "report[3].pdf",
+            "Report",
+            "application/pdf",
+            data.len(),
+        )]),
+    )
+    .unwrap();
+    std::fs::create_dir_all(d.path(ATT_DIR)).unwrap();
+    std::fs::write(d.path(ATT_DIR).join("report[3].pdf"), data).unwrap();
+    d
+}
+
+#[test]
+fn mcp_sends_a_pdf_as_text_and_bytes_through_the_real_child() {
+    let pdf = one_page_pdf();
+    let d = pdf_profile("pdf-whole-way", &pdf);
+    let mut s = Session::start(&d);
+    let g = hex(&[0x95; 16]);
+
+    let (r, line) = s.attachment(json!({ "guid": g }));
+    let items = r["result"]["content"].as_array().unwrap();
+    assert_eq!(items.len(), 2, "{r}");
+    let v = tool_result(&r);
+    assert_eq!(v["kind"], "pdf");
+    assert_eq!(v["text"].as_str().unwrap().trim(), PDF_LINE, "{v}");
+    assert_eq!(v["notes"], json!([]), "{v}");
+    assert_eq!(items[1]["type"], "resource");
+    assert_eq!(
+        items[1]["resource"]["uri"],
+        format!("hxprobe://attachment/{g}")
+    );
+    assert_eq!(items[1]["resource"]["mimeType"], "application/pdf");
+    let blob = items[1]["resource"]["blob"].as_str().unwrap();
+    assert_eq!(base64_decode(blob).unwrap(), pdf);
+    assert_no_path(&line, &d.0);
+
+    let (r, line) = s.attachment(json!({ "guid": g, "format": "text" }));
+    assert_eq!(r["result"]["content"].as_array().unwrap().len(), 1, "{r}");
+    let v = tool_result(&r);
+    assert_eq!(v["text"].as_str().unwrap().trim(), PDF_LINE, "{v}");
+    assert_eq!(v["sent"], Value::Null);
+    assert_no_path(&line, &d.0);
+
+    let (status, _) = s.finish();
+    assert_eq!(status.code(), Some(0));
+}
+
+#[test]
+fn mcp_leaves_no_pdf_child_and_logs_no_content() {
+    let pdf = one_page_pdf();
+    let d = pdf_profile("pdf-left-behind", &pdf);
+    let mut s = Session::start(&d);
+    let g = hex(&[0x95; 16]);
+    for args in [
+        json!({ "guid": g }),
+        json!({ "guid": g, "format": "text" }),
+        json!({ "guid": g, "offset": 5 }),
+    ] {
+        let (r, _) = s.attachment(args);
+        assert_eq!(r["result"]["isError"], false, "{r}");
+    }
+    // Every child of the server was reaped before its call returned.
+    assert_eq!(children_of(s.pid()), "");
+
+    let (status, err) = s.finish();
+    assert_eq!(status.code(), Some(0), "stderr: {err}");
+    for line in err.lines() {
+        assert!(
+            line.starts_with("hxprobe mcp: "),
+            "not a line of the server: {line:?}"
+        );
+    }
+    assert!(err.contains("pdf child ok"), "{err}");
+    let lower = err.to_lowercase();
+    for word in ["report[3]", "quarterly", "figures", "attached"] {
+        assert!(!lower.contains(word), "{word:?} in stderr: {err}");
+    }
+}
+
+#[test]
+fn mcp_answers_on_after_a_damaged_pdf() {
+    let mut bad = b"%PDF-1.7\n".to_vec();
+    bad.extend((0..5000u32).map(|i| (i * 13) as u8));
+    let d = pdf_profile("pdf-damaged", &bad);
+    let mut s = Session::start(&d);
+    let g = hex(&[0x95; 16]);
+
+    let (r, _) = s.attachment(json!({ "guid": g }));
+    let items = r["result"]["content"].as_array().unwrap();
+    assert_eq!(items.len(), 2, "{r}");
+    let v = tool_result(&r);
+    assert_eq!(v["text"], Value::Null, "{v}");
+    assert_eq!(
+        v["notes"],
+        json!([
+            "no text could be extracted from this file; its bytes are in the next content item"
+        ])
+    );
+    let blob = items[1]["resource"]["blob"].as_str().unwrap();
+    assert_eq!(base64_decode(blob).unwrap(), bad);
+
+    // The next call is answered.
+    let r = s.send(
+        "tools/call",
+        json!({"name": "list_attachments", "arguments": {"message_guid": hex(&ATT_MESSAGE)}}),
+    );
+    assert_eq!(tool_result(&r)["total"], 1, "{r}");
+    assert_eq!(children_of(s.pid()), "");
+    let (status, err) = s.finish();
+    assert_eq!(status.code(), Some(0), "stderr: {err}");
+    assert!(
+        err.contains("pdf child exit") || err.contains("pdf child signal"),
+        "{err}"
+    );
+}
