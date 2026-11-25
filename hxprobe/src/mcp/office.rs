@@ -7,6 +7,8 @@
 //! mail, so every offset and length is checked, every allocation stays under
 //! a stated limit, and every failure is an error value, never a panic.
 
+use std::borrow::Cow;
+
 /// Most entries an archive may have.
 pub const MAX_ENTRIES: usize = 10_000;
 /// Most bytes one entry may inflate to.
@@ -214,6 +216,255 @@ fn entry_with(
     let out = read(archive, r, max_entry.min(*budget))?;
     *budget -= out.len();
     Ok(Some(out))
+}
+
+/// One event of the XML scanner.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Event<'a> {
+    /// A start tag; an empty tag (`<a/>`) is a start tag followed by its end.
+    Start(Tag<'a>),
+    /// An end tag, by its name.
+    End(&'a [u8]),
+    /// Text or CDATA, entities decoded.
+    Text(Cow<'a, str>),
+}
+
+/// A start tag: its name (prefix included, as written) and its attributes.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Tag<'a> {
+    pub name: &'a [u8],
+    /// The bytes between the name and the end of the tag.
+    attrs: &'a [u8],
+}
+
+impl<'a> Tag<'a> {
+    /// The decoded value of the attribute `name`, if the tag has it; `None`
+    /// also once the attributes stop being well formed.
+    // Used by the readers of the next steps; until then by the tests only.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn attr(&self, name: &str) -> Option<Cow<'a, str>> {
+        let b = self.attrs;
+        let mut i = 0;
+        loop {
+            while b.get(i).is_some_and(|c| c.is_ascii_whitespace()) {
+                i += 1;
+            }
+            let start = i;
+            while b
+                .get(i)
+                .is_some_and(|c| !c.is_ascii_whitespace() && !matches!(c, b'=' | b'/'))
+            {
+                i += 1;
+            }
+            let key = &b[start..i];
+            while b.get(i).is_some_and(|c| c.is_ascii_whitespace()) {
+                i += 1;
+            }
+            if key.is_empty() || b.get(i) != Some(&b'=') {
+                return None;
+            }
+            i += 1;
+            while b.get(i).is_some_and(|c| c.is_ascii_whitespace()) {
+                i += 1;
+            }
+            let quote = *b.get(i).filter(|q| matches!(q, b'"' | b'\''))?;
+            let value_start = i + 1;
+            let value_end = value_start + memchr::memchr(quote, b.get(value_start..)?)?;
+            i = value_end + 1;
+            if key == name.as_bytes() {
+                return Some(decode(&b[value_start..value_end]));
+            }
+        }
+    }
+}
+
+/// Longest entity looked at after `&`, `;` included.
+const MAX_ENTITY_LEN: usize = 32;
+
+/// Text of XML bytes: invalid UTF-8 replaced, the five named entities and
+/// numeric ones decoded. An unknown or unterminated entity stays as written;
+/// an invalid numeric one becomes the replacement character.
+fn decode(b: &[u8]) -> Cow<'_, str> {
+    let text = String::from_utf8_lossy(b);
+    if !text.contains('&') {
+        return text;
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut rest: &str = &text;
+    while let Some(amp) = rest.find('&') {
+        out.push_str(&rest[..amp]);
+        rest = &rest[amp..];
+        let window = &rest.as_bytes()[..rest.len().min(MAX_ENTITY_LEN)];
+        let Some(semi) = memchr::memchr(b';', window) else {
+            out.push('&');
+            rest = &rest[1..];
+            continue;
+        };
+        let name = &rest[1..semi];
+        let c = match name {
+            "lt" => Some('<'),
+            "gt" => Some('>'),
+            "amp" => Some('&'),
+            "quot" => Some('"'),
+            "apos" => Some('\''),
+            _ => name.strip_prefix('#').map(numeric),
+        };
+        match c {
+            Some(c) => {
+                out.push(c);
+                rest = &rest[semi + 1..];
+            }
+            None => {
+                out.push('&');
+                rest = &rest[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    Cow::Owned(out)
+}
+
+/// The character of a numeric entity after its `#`; the replacement
+/// character for one that is not a character XML allows.
+fn numeric(digits: &str) -> char {
+    let (digits, radix) = match digits.strip_prefix(['x', 'X']) {
+        Some(hex) => (hex, 16),
+        None => (digits, 10),
+    };
+    let value = if digits.is_empty() {
+        None
+    } else {
+        digits.chars().try_fold(0u32, |v, c| {
+            v.checked_mul(radix)?.checked_add(c.to_digit(radix)?)
+        })
+    };
+    value
+        .filter(|v| *v != 0)
+        .and_then(char::from_u32)
+        .unwrap_or(char::REPLACEMENT_CHARACTER)
+}
+
+/// An XML scanner over bytes: an iterator of [`Event`]s, without recursion
+/// and linear in its input. A document type declaration is an error (so no
+/// entity is ever expanded); input that ends inside markup ends the events.
+pub(crate) struct Xml<'a> {
+    b: &'a [u8],
+    at: usize,
+    /// The end event of an empty tag, given after its start.
+    pending: Option<&'a [u8]>,
+    done: bool,
+}
+
+impl<'a> Xml<'a> {
+    // Used by the readers of the next steps; until then by the tests only.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn new(b: &'a [u8]) -> Xml<'a> {
+        Xml {
+            b,
+            at: 0,
+            pending: None,
+            done: false,
+        }
+    }
+}
+
+/// Offset in `b` of the `>` that ends a start tag, outside quoted values.
+fn tag_end(b: &[u8]) -> Option<usize> {
+    let mut i = 0;
+    loop {
+        i += memchr::memchr3(b'>', b'"', b'\'', b.get(i..)?)?;
+        match b[i] {
+            b'>' => return Some(i),
+            q => i += 1 + memchr::memchr(q, b.get(i + 1..)?)? + 1,
+        }
+    }
+}
+
+/// `b` without trailing ASCII whitespace.
+fn trim_end(b: &[u8]) -> &[u8] {
+    let n = b
+        .iter()
+        .rposition(|c| !c.is_ascii_whitespace())
+        .map_or(0, |i| i + 1);
+    &b[..n]
+}
+
+impl<'a> Iterator for Xml<'a> {
+    type Item = Result<Event<'a>, ()>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(name) = self.pending.take() {
+            return Some(Ok(Event::End(name)));
+        }
+        loop {
+            if self.done {
+                return None;
+            }
+            let rest = self.b.get(self.at..).filter(|r| !r.is_empty())?;
+            if rest[0] != b'<' {
+                let n = memchr::memchr(b'<', rest).unwrap_or(rest.len());
+                self.at += n;
+                return Some(Ok(Event::Text(decode(&rest[..n]))));
+            }
+            // Markup whose end is never found ends the events: nothing after
+            // it can be read either, and stopping keeps the scan linear.
+            let skip_to = |from: usize, end: &[u8]| {
+                memchr::memmem::find(rest.get(from..)?, end).map(|i| from + i)
+            };
+            if rest.starts_with(b"<?") || rest.starts_with(b"<!--") {
+                let (from, end): (usize, &[u8]) = if rest[1] == b'?' {
+                    (2, b"?>")
+                } else {
+                    (4, b"-->")
+                };
+                match skip_to(from, end) {
+                    Some(i) => self.at += i + end.len(),
+                    None => self.done = true,
+                }
+                continue;
+            }
+            if rest.starts_with(b"<![CDATA[") {
+                let Some(i) = skip_to(9, b"]]>") else {
+                    self.done = true;
+                    continue;
+                };
+                self.at += i + 3;
+                return Some(Ok(Event::Text(String::from_utf8_lossy(&rest[9..i]))));
+            }
+            if rest.starts_with(b"<!") {
+                // A document type declaration, or another declaration.
+                self.done = true;
+                return Some(Err(()));
+            }
+            if rest.starts_with(b"</") {
+                let Some(i) = memchr::memchr(b'>', rest) else {
+                    self.done = true;
+                    continue;
+                };
+                self.at += i + 1;
+                return Some(Ok(Event::End(trim_end(&rest[2..i]))));
+            }
+            let Some(i) = tag_end(rest) else {
+                self.done = true;
+                continue;
+            };
+            self.at += i + 1;
+            let mut inner = &rest[1..i];
+            let empty = inner.last() == Some(&b'/');
+            if empty {
+                inner = &inner[..inner.len() - 1];
+            }
+            let n = inner
+                .iter()
+                .position(|c| c.is_ascii_whitespace() || *c == b'/')
+                .unwrap_or(inner.len());
+            let (name, attrs) = inner.split_at(n);
+            if empty {
+                self.pending = Some(name);
+            }
+            return Some(Ok(Event::Start(Tag { name, attrs })));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -633,5 +884,215 @@ mod tests {
                 let _ = kind_of(&a);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod xml_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// The events of `xml` in a short form: `<name`, `>name` (end) and the
+    /// text; `!` for an error (the last event then).
+    fn events(xml: &str) -> Vec<String> {
+        Xml::new(xml.as_bytes())
+            .map(|e| match e {
+                Ok(Event::Start(t)) => format!("<{}", String::from_utf8_lossy(t.name)),
+                Ok(Event::End(n)) => format!(">{}", String::from_utf8_lossy(n)),
+                Ok(Event::Text(t)) => t.into_owned(),
+                Err(()) => "!".to_string(),
+            })
+            .collect()
+    }
+
+    /// The first start tag of `xml`.
+    fn first_tag(xml: &str) -> Tag<'_> {
+        Xml::new(xml.as_bytes())
+            .find_map(|e| match e {
+                Ok(Event::Start(t)) => Some(t),
+                _ => None,
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn tags_with_and_without_attributes() {
+        assert_eq!(
+            events("<a><b x=\"1\">t</b><c/></a>"),
+            ["<a", "<b", "t", ">b", "<c", ">c", ">a"]
+        );
+        assert_eq!(
+            events("<w:p><w:r><w:t xml:space='preserve'> x </w:t></w:r></w:p>"),
+            ["<w:p", "<w:r", "<w:t", " x ", ">w:t", ">w:r", ">w:p"]
+        );
+        assert_eq!(events("<a:t>s</a:t >"), ["<a:t", "s", ">a:t"]);
+        assert_eq!(events("<x\n\tk = \"v\"\n/>"), ["<x", ">x"]);
+        assert_eq!(events("plain"), ["plain"]);
+        assert!(events("").is_empty());
+    }
+
+    #[test]
+    fn attributes_in_single_and_double_quotes() {
+        let t = first_tag("<c r=\"B7\" t='s' s=\"3\"><v>1</v></c>");
+        assert_eq!(t.name, b"c");
+        assert_eq!(t.attr("r").as_deref(), Some("B7"));
+        assert_eq!(t.attr("t").as_deref(), Some("s"));
+        assert_eq!(t.attr("s").as_deref(), Some("3"));
+        assert_eq!(t.attr("x"), None);
+        let t = first_tag("<sheet name=\"A &amp; B &#x5D0;\" r:id = 'rId2' sheetId=\"1\"/>");
+        assert_eq!(t.attr("name").as_deref(), Some("A & B א"));
+        assert_eq!(t.attr("r:id").as_deref(), Some("rId2"));
+        assert_eq!(t.attr("id"), None);
+        // A `>` and the other quote inside a value.
+        let t = first_tag("<a q=\"x > 'y'\" z='\"'>after</a>");
+        assert_eq!(t.attr("q").as_deref(), Some("x > 'y'"));
+        assert_eq!(t.attr("z").as_deref(), Some("\""));
+        assert_eq!(events("<a q=\"x > y\">after</a>"), ["<a", "after", ">a"]);
+        // Malformed attributes give nothing, without a panic.
+        for bad in ["<a r>", "<a r=>", "<a r=x>", "<a =\"x\">", "<a r=\"x>"] {
+            let _ = Xml::new(bad.as_bytes()).count();
+            if let Some(Ok(Event::Start(t))) = Xml::new(bad.as_bytes()).next() {
+                assert_eq!(t.attr("r"), None, "{bad}");
+            }
+        }
+    }
+
+    #[test]
+    fn entities_are_decoded() {
+        assert_eq!(
+            events("<t>&lt;&gt;&amp;&quot;&apos;</t>"),
+            ["<t", "<>&\"'", ">t"]
+        );
+        assert_eq!(
+            events("<t>&#65;&#x42;&#X43;&#x5d0;</t>"),
+            ["<t", "ABCא", ">t"]
+        );
+        // Invalid numeric entities: the replacement character.
+        for bad in [
+            "&#0;",
+            "&#xD800;",
+            "&#x110000;",
+            "&#99999999999999999999;",
+            "&#;",
+            "&#x;",
+            "&#12a;",
+        ] {
+            assert_eq!(
+                events(&format!("<t>{bad}</t>")),
+                ["<t", "\u{FFFD}", ">t"],
+                "{bad}"
+            );
+        }
+        // An unknown name or no `;`: the text as written.
+        assert_eq!(
+            events("<t>&nbsp; & x &amp</t>"),
+            ["<t", "&nbsp; & x &amp", ">t"]
+        );
+    }
+
+    #[test]
+    fn cdata_comments_and_instructions() {
+        assert_eq!(
+            events("<?xml version=\"1.0\"?><a><!-- <b>x</b> --><![CDATA[<x> & y]]></a>"),
+            ["<a", "<x> & y", ">a"]
+        );
+        assert_eq!(events("<a>x<?pi ?>y</a>"), ["<a", "x", "y", ">a"]);
+        assert_eq!(events("<t>שלום עולם</t>"), ["<t", "שלום עולם", ">t"]);
+        // Bytes that are not UTF-8 are replaced.
+        let texts: Vec<String> = Xml::new(b"<t>a\xffb</t>")
+            .filter_map(|e| match e {
+                Ok(Event::Text(t)) => Some(t.into_owned()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, ["a\u{FFFD}b"]);
+    }
+
+    #[test]
+    fn a_document_type_declaration_is_an_error() {
+        assert_eq!(
+            events("<?xml version=\"1.0\"?><!DOCTYPE x [<!ENTITY e \"bomb\">]><x>&e;</x>"),
+            ["!"]
+        );
+        assert_eq!(events("<a>x</a><!doctype y>"), ["<a", "x", ">a", "!"]);
+        assert_eq!(events("<!ELEMENT a ANY>"), ["!"]);
+    }
+
+    #[test]
+    fn cut_input_ends_without_a_panic() {
+        let full = "<?xml version=\"1.0\"?><a k=\"v&amp;w\" j='x'><!-- c --><b>t&#x5D0;u\
+                    <![CDATA[d]]></b><c/></a>";
+        for cut in 0..=full.len() {
+            let _ = events(&full[..cut]);
+            let _ = events(std::str::from_utf8(&full.as_bytes()[..cut]).unwrap_or(""));
+        }
+        assert_eq!(events("<a"), Vec::<String>::new());
+        assert_eq!(events("<a k=\"v"), Vec::<String>::new());
+        assert_eq!(events("<a>x&#x5"), ["<a", "x&#x5"]);
+        assert_eq!(events("<a><![CDATA[abc"), ["<a"]);
+        assert_eq!(events("<a><!-- abc"), ["<a"]);
+        assert_eq!(events("<a></a"), ["<a"]);
+        assert_eq!(events("<a><?pi"), ["<a"]);
+    }
+
+    /// Hostile inputs of about `n` bytes.
+    fn hostile(n: usize) -> Vec<Vec<u8>> {
+        let mut v: Vec<Vec<u8>> = [
+            "<",
+            "<a",
+            "<a>",
+            "</a",
+            "<!--",
+            "<![CDATA[",
+            "<?",
+            "&#",
+            "&",
+            "&#x5d0;",
+            "<a k='",
+            "<a k=\"v\" ",
+        ]
+        .iter()
+        .map(|u| u.repeat(n / u.len()).into_bytes())
+        .collect();
+        // Deep nesting, never closed.
+        v.push("<a>".repeat(n / 3).into_bytes());
+        // One very long attribute, and a long attribute list.
+        v.push(format!("<a k=\"{}\">", "x".repeat(n)).into_bytes());
+        v.push(format!("<a {}>", "k=\"v\" ".repeat(n / 6)).into_bytes());
+        v
+    }
+
+    /// Shortest of three times of scanning `b` and asking a tag for an
+    /// attribute it does not have.
+    fn best_time(b: &[u8]) -> Duration {
+        (0..3)
+            .map(|_| {
+                let t = Instant::now();
+                for e in Xml::new(std::hint::black_box(b)) {
+                    if let Ok(Event::Start(t)) = e {
+                        std::hint::black_box(t.attr("zz"));
+                    }
+                }
+                t.elapsed()
+            })
+            .min()
+            .unwrap()
+    }
+
+    #[test]
+    fn pathological_input_is_linear() {
+        // Eight times the input must not take much more than eight times as
+        // long; a quadratic scan takes 64 times as long.
+        const N: usize = 1 << 15;
+        let started = Instant::now();
+        for (small, large) in hostile(N).iter().zip(hostile(8 * N)) {
+            let (t_small, t_large) = (best_time(small), best_time(&large));
+            assert!(
+                t_large <= t_small * 24 + Duration::from_millis(20),
+                "not linear: {t_small:?} for n, {t_large:?} for 8 n, input starts {:?}",
+                String::from_utf8_lossy(&small[..16])
+            );
+        }
+        assert!(started.elapsed() < Duration::from_secs(30));
     }
 }
