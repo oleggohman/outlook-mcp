@@ -7,6 +7,7 @@
 //! `limit` and `offset`. Strings that come from mail are capped; times are
 //! ISO strings in UTC.
 
+use std::path::Path;
 use std::sync::Arc;
 
 use rusqlite::types::{Value as SqlValue, ValueRef};
@@ -16,6 +17,7 @@ use serde_json::{json, Map, Value};
 use crate::mcp::attach;
 use crate::mcp::cache::Cache;
 use crate::mcp::office;
+use crate::mcp::pdf;
 use crate::mcp::text::{cap, html_to_text, integer, iso, lossy, parse_time};
 
 /// The sentence every description ends with.
@@ -1150,6 +1152,23 @@ thread_local! {
     static OFFICE_TEST_PANIC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only: a shorter deadline for the PDF child.
+    static PDF_TEST_DEADLINE: std::cell::Cell<Option<std::time::Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// How long the PDF child may take ([`pdf::PDF_DEADLINE`]; tests may set a
+/// shorter one).
+fn pdf_deadline() -> std::time::Duration {
+    #[cfg(test)]
+    if let Some(d) = PDF_TEST_DEADLINE.with(|d| d.get()) {
+        return d;
+    }
+    pdf::PDF_DEADLINE
+}
+
 /// The text limit of the Office readers ([`office::OFFICE_MAX_TEXT`]; tests
 /// may set a smaller one).
 fn office_limit() -> usize {
@@ -1232,6 +1251,8 @@ fn get_attachment(cache: &mut Cache, now: i64, args: &Args) -> Result<Output, To
     let full = usize::try_from(len).unwrap_or(usize::MAX);
     // The kind in the result; an archive is refined below.
     let mut label = kind_name(kind);
+    // How the PDF child ended, for the log.
+    let mut ended: Option<pdf::Ended> = None;
     let no_text = || {
         failed(format!(
             "no text can be made from {att} ({}); call without format and offset to get its bytes",
@@ -1274,31 +1295,81 @@ fn get_attachment(cache: &mut Cache, now: i64, args: &Args) -> Result<Output, To
             (None, Some(bytes))
         }
         attach::Kind::Pdf => {
-            // PDF text is not extracted yet.
-            let text: Option<String> = None;
+            let helper = cache.text_helper().map(Path::to_path_buf);
+            let want_bytes = a.format == Format::Auto && a.offset == 0;
+            let over = over_limit(&att, len, a.max_bytes, attach::MAX_SEND_BYTES);
+            if want_bytes && helper.is_none() {
+                // No text can come: above the limit nothing is left to send.
+                if let Some(e) = over {
+                    return Err(failed(e));
+                }
+            }
+            // Read once; the same bytes go to the child and into the result.
+            let data = if helper.is_some() || (want_bytes && over.is_none()) {
+                Some(Arc::new(
+                    attach::read_head(&mut file, full).map_err(read_failed)?,
+                ))
+            } else {
+                None
+            };
+            let text = match (&helper, &data) {
+                (Some(program), Some(data)) => {
+                    let (text, how) = pdf::text_with(
+                        program,
+                        Arc::clone(data),
+                        pdf_deadline(),
+                        pdf::PDF_MAX_TEXT,
+                    );
+                    ended = Some(how);
+                    text
+                }
+                _ => {
+                    ended = Some(pdf::Ended::NotStarted);
+                    None
+                }
+            };
             let mut bytes = None;
             if a.format == Format::Auto && a.offset > 0 {
                 notes.push("the bytes are sent with offset 0 only".into());
-            } else if a.format == Format::Auto {
-                if let Some(e) = over_limit(&att, len, a.max_bytes, attach::MAX_SEND_BYTES) {
-                    return Err(failed(e));
+            } else if want_bytes {
+                match (over, &text) {
+                    (Some(e), None) => return Err(failed(e)),
+                    (Some(_), Some(_)) => {
+                        let limit = a.max_bytes.min(attach::MAX_SEND_BYTES);
+                        let largest = attach::MAX_SEND_BYTES;
+                        let mut note = format!(
+                            "the file is {len} bytes, above the limit of {limit} bytes for one \
+                             call; its bytes were not sent, only its text"
+                        );
+                        if len <= u64::try_from(largest).unwrap_or(0) {
+                            note.push_str(&format!(" (max_bytes can be raised to {largest})"));
+                        }
+                        notes.push(note);
+                    }
+                    (None, _) => {
+                        bytes = data.map(|data| Bytes {
+                            item: BytesItem::Resource,
+                            mime: "application/pdf",
+                            uri: format!("hxprobe://attachment/{}", rec.guid),
+                            data,
+                        });
+                    }
                 }
-                let data = attach::read_head(&mut file, full).map_err(read_failed)?;
-                bytes = Some(Bytes {
-                    item: BytesItem::Resource,
-                    mime: "application/pdf",
-                    uri: format!("hxprobe://attachment/{}", rec.guid),
-                    data: Arc::new(data),
-                });
             }
-            if text.is_none() {
-                notes.push(if bytes.is_some() {
-                    "no text could be extracted from this file; its bytes are in the next \
-                     content item"
-                        .into()
-                } else {
-                    "no text could be extracted from this file".into()
-                });
+            // The second half only when the bytes follow.
+            let follows = if bytes.is_some() {
+                "; its bytes are in the next content item"
+            } else {
+                ""
+            };
+            match &text {
+                None => notes.push(format!(
+                    "no text could be extracted from this file{follows}"
+                )),
+                Some(t) if t.trim().is_empty() => notes.push(format!(
+                    "the file has no text (a scanned document has none){follows}"
+                )),
+                Some(_) => {}
             }
             (text, bytes)
         }
@@ -1361,6 +1432,13 @@ fn get_attachment(cache: &mut Cache, now: i64, args: &Args) -> Result<Output, To
         }
     };
     let page = text.map(|t| attach::page(&t, a.offset, a.max_chars));
+    if kind == attach::Kind::Pdf && a.format == Format::Auto {
+        if let Some(n) = page.as_ref().and_then(|p| p.next_offset) {
+            notes.push(format!(
+                "the text is cut at max_chars; read on with format \"text\" and offset {n}"
+            ));
+        }
+    }
     let sent = bytes.as_ref().map(|b| {
         let item = match b.item {
             BytesItem::Image => "image",
@@ -1389,12 +1467,14 @@ fn get_attachment(cache: &mut Cache, now: i64, args: &Args) -> Result<Output, To
         "notes": notes,
         "untrusted": ATTACHMENT_UNTRUSTED,
     });
-    // Counts and the kind only: no name, no path, no content.
+    // Counts, the kind and how the child ended only: no name, no path, no
+    // content, no text of the child.
     crate::mcp::log(&format!(
-        "get_attachment {} {len} bytes {} chars in {} ms",
+        "get_attachment {} {len} bytes {} chars in {} ms{}",
         label,
         page.as_ref().map_or(0, |p| p.total_chars),
-        started.elapsed().as_millis()
+        started.elapsed().as_millis(),
+        ended.map_or(String::new(), |e| format!(", pdf child {}", e.as_str()))
     ));
     Ok(Output { json: v, bytes })
 }
@@ -1555,8 +1635,10 @@ mod tests {
         FakeOp, FakeRefresher, TestAttachment, MAIL_ATTACHMENTS, MAIL_EVENTS, MAIL_EVENT_TIMES,
         MAIL_MSGS, MAIL_SENT, MAIL_VIEW_TOP, NOW,
     };
+    use crate::testutil::{process_lock, stand_in};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     const NOW_I: i64 = NOW as i64;
 
@@ -1574,6 +1656,11 @@ mod tests {
     }
 
     fn fixture_of(store: Vec<u8>) -> Fixture {
+        fixture_with(store, None)
+    }
+
+    /// [`fixture_of`] whose cache starts `helper` for PDF text.
+    fn fixture_with(store: Vec<u8>, helper: Option<PathBuf>) -> Fixture {
         static N: AtomicUsize = AtomicUsize::new(0);
         let dir = std::env::temp_dir().join(format!(
             "hxprobe-tools-test-{}-{}",
@@ -1585,6 +1672,9 @@ mod tests {
         let store_path = dir.join("HxStore.hxd");
         std::fs::write(&store_path, store).unwrap();
         let mut cache = Cache::new(&dir.join("cache"), &store_path).unwrap();
+        if let Some(h) = helper {
+            cache = cache.with_text_helper(h);
+        }
         cache.connection_at(NOW_I).unwrap();
         Fixture { dir, cache }
     }
@@ -2128,7 +2218,16 @@ mod tests {
     /// A fixture whose store also has the records `atts` and whose
     /// attachment folder holds `files` (name in the folder, content).
     fn attachment_fixture(atts: &[TestAttachment], files: &[(&str, &[u8])]) -> Fixture {
-        let f = fixture_of(mail_store_with_attachments(atts));
+        attachment_fixture_with(atts, files, None)
+    }
+
+    /// [`attachment_fixture`] whose cache starts `helper` for PDF text.
+    fn attachment_fixture_with(
+        atts: &[TestAttachment],
+        files: &[(&str, &[u8])],
+        helper: Option<PathBuf>,
+    ) -> Fixture {
+        let f = fixture_with(mail_store_with_attachments(atts), helper);
         let folder = f.dir.join(ATT_DIR);
         std::fs::create_dir_all(&folder).unwrap();
         for (name, data) in files {
@@ -3067,6 +3166,297 @@ mod tests {
             "{notes:?}"
         );
         assert!(notes.contains(&json!(NO_TEXT)), "{notes:?}");
+    }
+
+    // --- PDF text through a stand-in helper ---
+
+    /// A stand-in helper for PDF text in a directory of its own. What it
+    /// does is read from its file `mode` at each start, so one cache can
+    /// meet a failing and then a good child: `print` (the default) prints
+    /// the file `text`, `crash` ends by a signal, `hang` sleeps, `noise`
+    /// prints noise and exits 1, `empty` prints nothing.
+    struct Helper(PathBuf);
+
+    impl Helper {
+        fn new(text: &str) -> Helper {
+            static N: AtomicUsize = AtomicUsize::new(0);
+            let d = std::env::temp_dir().join(format!(
+                "hxprobe-helper-{}-{}",
+                std::process::id(),
+                N.fetch_add(1, Ordering::Relaxed)
+            ));
+            let _ = std::fs::remove_dir_all(&d);
+            std::fs::create_dir_all(&d).unwrap();
+            let h = Helper(d);
+            std::fs::write(h.0.join("text"), text).unwrap();
+            h.mode("print");
+            h
+        }
+
+        fn mode(&self, mode: &str) {
+            std::fs::write(self.0.join("mode"), mode).unwrap();
+        }
+
+        fn program(&self) -> PathBuf {
+            let dir = self.0.display();
+            stand_in(
+                &self.0,
+                "helper",
+                &format!(
+                    "mode=$(/bin/cat '{dir}/mode')\n\
+                     case \"$mode\" in\n\
+                     crash) exec /bin/kill -KILL $$ ;;\n\
+                     hang) exec /bin/sleep 60 ;;\n\
+                     noise) /bin/cat > /dev/null; echo NOISE-OUT; echo NOISE-ERR >&2; exit 1 ;;\n\
+                     empty) /bin/cat > /dev/null; exit 0 ;;\n\
+                     esac\n\
+                     /bin/cat > /dev/null\n\
+                     exec /bin/cat '{dir}/text'"
+                ),
+            )
+        }
+    }
+
+    impl Drop for Helper {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A PDF record `0xb0` of `data` and a fixture with the helper `h`.
+    fn pdf_fixture(h: &Helper, data: &[u8]) -> Fixture {
+        let name = stored("report[7].pdf");
+        attachment_fixture_with(
+            &[att(0xb0, &name, "application/pdf", data.len())],
+            &[("report[7].pdf", data)],
+            Some(h.program()),
+        )
+    }
+
+    const PDF_LINE: &str = "Quarterly figures are attached.";
+
+    #[test]
+    fn get_attachment_sends_pdf_text_and_bytes() {
+        let _p = process_lock();
+        let h = Helper::new(PDF_LINE);
+        let data = signed(PDF);
+        let mut f = pdf_fixture(&h, &data);
+        let g = att_guid(0xb0);
+
+        let out = f.attachment(json!({ "guid": g }));
+        let v = &out.json;
+        assert_eq!(v["kind"], "pdf");
+        assert_eq!(v["text"], PDF_LINE);
+        assert_eq!(v["total_chars"], PDF_LINE.chars().count());
+        assert_eq!(v["truncated"], false);
+        assert_eq!(v["next_offset"], Value::Null);
+        assert_eq!(
+            v["sent"],
+            json!({"type": "resource", "mime_type": "application/pdf", "bytes": data.len()})
+        );
+        assert_eq!(v["notes"], json!([]));
+        let b = out.bytes.expect("bytes");
+        assert_eq!(b.item, BytesItem::Resource);
+        assert_eq!(b.uri, format!("hxprobe://attachment/{g}"));
+        assert_eq!(*b.data, data);
+
+        let out = f.attachment(json!({ "guid": g, "format": "text" }));
+        assert!(out.bytes.is_none());
+        assert_eq!(out.json["text"], PDF_LINE);
+        assert_eq!(out.json["sent"], Value::Null);
+        assert_eq!(out.json["notes"], json!([]));
+    }
+
+    #[test]
+    fn get_attachment_pages_pdf_text() {
+        let _p = process_lock();
+        let text = "0123456789abcdefghijklmnopqrstuvwxyz";
+        let h = Helper::new(text);
+        let data = signed(PDF);
+        let mut f = pdf_fixture(&h, &data);
+        let g = att_guid(0xb0);
+
+        // Cut in auto: the bytes and a note how to read on.
+        let out = f.attachment(json!({ "guid": g, "max_chars": 10 }));
+        assert!(out.bytes.is_some());
+        assert_eq!(out.json["text"], "0123456789");
+        assert_eq!(out.json["truncated"], true);
+        assert_eq!(out.json["next_offset"], 10);
+        assert_eq!(
+            out.json["notes"],
+            json!([r#"the text is cut at max_chars; read on with format "text" and offset 10"#])
+        );
+
+        // An offset in auto: no bytes again, with the note.
+        let out = f.attachment(json!({ "guid": g, "offset": 30 }));
+        assert!(out.bytes.is_none());
+        assert_eq!(out.json["sent"], Value::Null);
+        assert_eq!(out.json["text"], "uvwxyz");
+        assert_eq!(
+            out.json["notes"],
+            json!(["the bytes are sent with offset 0 only"])
+        );
+
+        // Page by page with format "text": the whole text, no note.
+        let (mut got, mut offset) = (String::new(), 0);
+        loop {
+            let out = f.attachment(
+                json!({ "guid": g, "format": "text", "max_chars": 7, "offset": offset }),
+            );
+            assert!(out.bytes.is_none());
+            assert_eq!(out.json["notes"], json!([]));
+            got.push_str(out.json["text"].as_str().unwrap());
+            match out.json["next_offset"].as_u64() {
+                Some(n) => offset = n,
+                None => break,
+            }
+        }
+        assert_eq!(got, text);
+    }
+
+    #[test]
+    fn get_attachment_does_not_take_the_record_for_a_pdf() {
+        let _p = process_lock();
+        let h = Helper::new(PDF_LINE);
+        let data = signed(PDF);
+        let name = stored("notes[2].txt");
+        let mut f = attachment_fixture_with(
+            &[att(0xb1, &name, "text/plain", data.len())],
+            &[("notes[2].txt", &data)],
+            Some(h.program()),
+        );
+        let out = f.attachment(json!({ "guid": att_guid(0xb1) }));
+        assert_eq!(out.json["kind"], "pdf");
+        assert_eq!(out.json["text"], PDF_LINE);
+        assert_eq!(out.bytes.expect("bytes").mime, "application/pdf");
+    }
+
+    /// The result of a PDF whose child gave no text: `text` null, the note,
+    /// and still the bytes.
+    fn assert_no_text_with_bytes(out: &Output, data: &[u8]) {
+        for k in ["text", "total_chars", "truncated", "next_offset"] {
+            assert_eq!(out.json[k], Value::Null, "{k}");
+        }
+        assert_eq!(out.json["notes"], json!([NO_TEXT_BYTES]));
+        assert_eq!(**out.bytes.as_ref().expect("bytes").data, *data);
+    }
+
+    #[test]
+    fn get_attachment_of_a_pdf_whose_child_fails() {
+        let _p = process_lock();
+        let h = Helper::new(PDF_LINE);
+        let data = signed(PDF);
+        let mut f = pdf_fixture(&h, &data);
+        let g = att_guid(0xb0);
+
+        h.mode("crash");
+        assert_no_text_with_bytes(&f.attachment(json!({ "guid": g })), &data);
+        h.mode("print");
+        assert_eq!(f.attachment(json!({ "guid": g })).json["text"], PDF_LINE);
+
+        h.mode("hang");
+        PDF_TEST_DEADLINE.with(|d| d.set(Some(Duration::from_millis(300))));
+        let started = std::time::Instant::now();
+        let out = f.attachment(json!({ "guid": g }));
+        PDF_TEST_DEADLINE.with(|d| d.set(None));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_no_text_with_bytes(&out, &data);
+        h.mode("print");
+        assert_eq!(f.attachment(json!({ "guid": g })).json["text"], PDF_LINE);
+
+        h.mode("noise");
+        let out = f.attachment(json!({ "guid": g }));
+        assert_no_text_with_bytes(&out, &data);
+        let all = out.json.to_string();
+        assert!(!all.contains("NOISE"), "{all}");
+
+        h.mode("empty");
+        let out = f.attachment(json!({ "guid": g }));
+        assert_eq!(out.json["text"], "");
+        assert_eq!(
+            out.json["notes"],
+            json!([
+                "the file has no text (a scanned document has none); its bytes are in the next \
+                 content item"
+            ])
+        );
+        assert!(out.bytes.is_some());
+        let out = f.attachment(json!({ "guid": g, "format": "text" }));
+        assert_eq!(
+            out.json["notes"],
+            json!(["the file has no text (a scanned document has none)"])
+        );
+    }
+
+    #[test]
+    fn get_attachment_of_a_pdf_without_a_helper_has_no_text() {
+        let data = signed(PDF);
+        let name = stored("report[7].pdf");
+        let mut f = attachment_fixture(
+            &[att(0xb0, &name, "application/pdf", data.len())],
+            &[("report[7].pdf", &data)],
+        );
+        assert_eq!(f.cache.text_helper(), None);
+        assert_no_text_with_bytes(&f.attachment(json!({ "guid": att_guid(0xb0) })), &data);
+    }
+
+    #[test]
+    fn get_attachment_sends_the_text_of_a_pdf_above_the_limit() {
+        let _p = process_lock();
+        let h = Helper::new(PDF_LINE);
+        let default = attach::DEFAULT_SEND_BYTES as u64;
+        let largest = attach::MAX_SEND_BYTES as u64;
+        let name = stored("big[1].pdf");
+        let huge = stored("huge[2].pdf");
+        let mut f = attachment_fixture_with(
+            &[
+                att(0xb2, &name, "application/pdf", default as usize + 1),
+                att(0xb3, &huge, "application/pdf", largest as usize + 1),
+            ],
+            &[],
+            Some(h.program()),
+        );
+        sparse(&f, "big[1].pdf", PDF, default + 1);
+        sparse(&f, "huge[2].pdf", PDF, largest + 1);
+
+        let out = f.attachment(json!({ "guid": att_guid(0xb2) }));
+        assert!(out.bytes.is_none());
+        assert_eq!(out.json["sent"], Value::Null);
+        assert_eq!(out.json["text"], PDF_LINE);
+        assert_eq!(
+            out.json["notes"],
+            json!([format!(
+                "the file is {} bytes, above the limit of {default} bytes for one call; its \
+                 bytes were not sent, only its text (max_bytes can be raised to {largest})",
+                default + 1
+            )])
+        );
+
+        // Above the largest value: the part in brackets is left out.
+        let out = f.attachment(json!({ "guid": att_guid(0xb3), "max_bytes": largest }));
+        assert!(out.bytes.is_none());
+        assert_eq!(out.json["text"], PDF_LINE);
+        assert_eq!(
+            out.json["notes"],
+            json!([format!(
+                "the file is {} bytes, above the limit of {largest} bytes for one call; its \
+                 bytes were not sent, only its text",
+                largest + 1
+            )])
+        );
+
+        // Without text, the size error.
+        h.mode("crash");
+        assert_eq!(
+            f.attachment_err(json!({ "guid": att_guid(0xb2) })),
+            format!(
+                "{} is {} bytes, above the limit of {default} bytes for one call; nothing was \
+                 sent. Call again with max_bytes of at least {}.",
+                named(0xb2),
+                default + 1,
+                default + 1
+            )
+        );
     }
 
     // --- Office files ---

@@ -237,6 +237,9 @@ pub struct Cache {
     /// What the error of a build denied the store names (see
     /// [`Cache::with_remedy`]).
     remedy: Remedy,
+    /// The program file started for the text of a PDF attachment (see
+    /// [`Cache::with_text_helper`]); without one a PDF has no text.
+    text_helper: Option<PathBuf>,
     /// Called at the start of every build, with the lock held.
     #[cfg(test)]
     pub(crate) build_hook: Option<fn()>,
@@ -342,6 +345,7 @@ impl Cache {
             service: None,
             first_build_wait: (proto::FIRST_BUILD_WAIT, proto::FIRST_BUILD_POLL),
             remedy: Remedy::default(),
+            text_helper: None,
             #[cfg(test)]
             build_hook: None,
             #[cfg(test)]
@@ -431,6 +435,18 @@ impl Cache {
     pub fn with_remedy(mut self, remedy: Remedy) -> Cache {
         self.remedy = remedy;
         self
+    }
+
+    /// Start `program` as `<program> pdf-text` for the text of a PDF
+    /// attachment (`hxprobe mcp` gives its own program file).
+    pub fn with_text_helper(mut self, program: PathBuf) -> Cache {
+        self.text_helper = Some(program);
+        self
+    }
+
+    /// The program file started for the text of a PDF attachment.
+    pub fn text_helper(&self) -> Option<&Path> {
+        self.text_helper.as_deref()
     }
 
     /// The error text of a read this server was denied: the remedy text of
@@ -2029,6 +2045,16 @@ mod tests {
         assert_eq!(c.profile_dir(), Ok(std::fs::canonicalize(&t.0).unwrap()));
         // Without a call of resolve_again, nothing else changed.
         assert!(matches!(c.store_state, StoreState::DeniedDefault(_)));
+    }
+
+    #[test]
+    fn text_helper_is_none_until_given() {
+        let t = TestDir::new("text-helper");
+        let c = Cache::new(&t.cache_dir(), &t.0.join("HxStore.hxd")).unwrap();
+        assert_eq!(c.text_helper(), None);
+        let program = t.0.join("hxprobe");
+        let c = c.with_text_helper(program.clone());
+        assert_eq!(c.text_helper(), Some(program.as_path()));
     }
 
     #[test]

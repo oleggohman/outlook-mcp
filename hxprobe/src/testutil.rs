@@ -18,6 +18,35 @@ pub fn process_lock() -> std::sync::MutexGuard<'static, ()> {
     LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// A stand-in program `dir/name` (mode 0700): `body` under `/bin/sh`, for
+/// tests of a child process. The child's environment is empty, so `body`
+/// calls every command by its absolute path.
+///
+/// It is run once with the argument `warm`, which ends it at once: the
+/// first start of a new file takes about 250 ms while the system checks
+/// it, which would eat a short deadline.
+pub fn stand_in(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::{Command, Stdio};
+    let p = dir.join(name);
+    std::fs::write(
+        &p,
+        format!("#!/bin/sh\n[ \"$1\" = warm ] && exit 0\n{body}\n"),
+    )
+    .unwrap();
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let warm = Command::new(&p)
+        .arg("warm")
+        .env_clear()
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap();
+    assert!(warm.success());
+    p
+}
+
 /// Encode `data` as a single literal-only LZ4 sequence.
 ///
 /// Token `min(len, 15) << 4`; when `len >= 15` the 255-continuation for

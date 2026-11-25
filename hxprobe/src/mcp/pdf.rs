@@ -173,8 +173,7 @@ impl Drop for Report {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::process_lock;
-    use std::os::unix::fs::PermissionsExt;
+    use crate::testutil::{process_lock, stand_in};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Instant;
@@ -195,28 +194,9 @@ mod tests {
             Dir(std::fs::canonicalize(&p).unwrap())
         }
 
-        /// A stand-in `name` (mode 0700) running `body` under `/bin/sh`.
-        /// It is run once with the argument `warm`, which ends it at once:
-        /// the first start of a new file takes about 250 ms while the
-        /// system checks it, which would eat a short deadline.
+        /// A stand-in `name` running `body` ([`stand_in`]).
         fn stand_in(&self, name: &str, body: &str) -> PathBuf {
-            let p = self.0.join(name);
-            std::fs::write(
-                &p,
-                format!("#!/bin/sh\n[ \"$1\" = warm ] && exit 0\n{body}\n"),
-            )
-            .unwrap();
-            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700)).unwrap();
-            let warm = Command::new(&p)
-                .arg("warm")
-                .env_clear()
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .unwrap();
-            assert!(warm.success());
-            p
+            stand_in(&self.0, name, body)
         }
 
         fn file(&self, name: &str) -> PathBuf {
