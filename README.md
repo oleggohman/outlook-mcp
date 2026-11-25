@@ -515,8 +515,14 @@ Claude Code documentation (https://code.claude.com/docs/en/mcp, the
 sections on MCP output limits), Claude Code moves a result without image
 content into a file of its own once it passes 50,000 characters or
 `MAX_MCP_OUTPUT_TOKENS`, unless the tool declares a larger size this way (up
-to 500,000 characters); a client that does not know the key ignores it. The default `max_bytes` of 250,000 keeps a default PDF result
-under 400,000 characters: 333,336 base64 characters, a text of at most
+to 500,000 characters); a client that does not know the key ignores it.
+The same documentation says that this raise applies to text content only:
+a result with image data stays under the token limit
+(`MAX_MCP_OUTPUT_TOKENS`), and Claude Code shows an image inline and also
+saves its bytes to a file in its session directory. The default
+`max_bytes` for an image may therefore have to be lower than for a PDF;
+the hand check in the clients measures it. The default `max_bytes` of
+250,000 keeps a default PDF result under 400,000 characters: 333,336 base64 characters, a text of at most
 20,000 characters (at most about 40,000 after JSON escaping) and the fixed
 keys. This default is provisional: whether results of this size stay inline
 in Claude Code and Claude Desktop, and what each client does with a
