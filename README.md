@@ -433,8 +433,9 @@ number unique per file. The attachment record names its file in the property
 record names, read-only and in place, during the call. The file is not
 copied into the cache, and a file that no record names is never read.
 
-**The content is in the result; a path never is.** No result and no error
-carries a path, a `file://` address or a link to the file: a client would
+**The content is in the result; its path never is.** No result and no
+error carries the path of an attachment file, a `file://` address or a link
+to the file: a client would
 need a permission of its own to open a path, and the Outlook folder is
 protected by macOS. `filename` is the file's own name without its folders,
 and errors name an attachment by its display name and guid.
@@ -510,8 +511,9 @@ mp3, wav, mp4, mov`), else `application/octet-stream`.
 
 **Size of a result.** `get_attachment` is the one tool whose `tools/list`
 entry declares `"_meta": {"anthropic/maxResultSizeChars": 500000}`. By the
-Claude Code documentation, Claude Code moves a result without image content
-into a file of its own once it passes 50,000 characters or
+Claude Code documentation (https://code.claude.com/docs/en/mcp, the
+sections on MCP output limits), Claude Code moves a result without image
+content into a file of its own once it passes 50,000 characters or
 `MAX_MCP_OUTPUT_TOKENS`, unless the tool declares a larger size this way (up
 to 500,000 characters); a client that does not know the key ignores it. The default `max_bytes` of 250,000 keeps a default PDF result
 under 400,000 characters: 333,336 base64 characters, a text of at most
@@ -1333,8 +1335,8 @@ The next tool call builds it again.
   inflate to far more than the file) it exits at once with status 4.
 * **The file's bytes leave the server only in the tool result**, to the
   client that asked. A client may keep what a tool returns in files of its
-  own (Claude Code keeps images and large results in its session
-  directory); that is outside the server's control.
+  own (by its documentation, Claude Code keeps images and large results in
+  its session directory); that is outside the server's control.
 * **Owner-only files.** The cache directory is mode `0700` and its files
   `0600`. An existing cache directory that is a symbolic link, not a
   directory, or owned by another user is refused; a wider mode is tightened

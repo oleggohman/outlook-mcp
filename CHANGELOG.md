@@ -15,8 +15,9 @@ All notable changes to this project are listed here. The format follows
   as an MCP `image` item, a Word, Excel or PowerPoint file (`.docx`,
   `.xlsx`, `.pptx`) as its text only, a PDF as its text and, in the same
   result, as an embedded `resource` with its bytes, and any other file as an
-  embedded `resource`. The kind comes from the file's first bytes, never
-  from the content type of the record alone.
+  embedded `resource`. The kind comes from the file's first bytes where the
+  format has a signature; the content type of the record never overrides a
+  signature.
 - Arguments of `get_attachment`: `format` (`auto` or `text`, the text only
   without bytes), `max_bytes` (1 to 10,000,000, default 250,000; an image at
   most 3,750,000), `max_chars` (1 to 80,000, default 20,000) and `offset`
@@ -27,8 +28,8 @@ All notable changes to this project are listed here. The format follows
   `truncated`, `next_offset`, `sent`, `notes`, `size`, `file_size` and
   `download_status`.
 - `get_attachment` declares `_meta` `{"anthropic/maxResultSizeChars": 500000}`
-  in `tools/list`, so that Claude Code keeps results up to that size in the
-  conversation. The default `max_bytes` is provisional until it is checked
+  in `tools/list`, meant to let Claude Code keep results up to that size in
+  the conversation (not yet checked in the clients). The default `max_bytes` is provisional until it is checked
   in the clients.
 - `list_attachments` returns a `guid` per attachment.
 - The hidden subcommand `hxprobe pdf-text`, which the server starts for one
@@ -75,8 +76,8 @@ All notable changes to this project are listed here. The format follows
   folder must be a real directory and the file a regular one, not a
   symbolic link; its real path must lie inside the folder; it is opened
   read-only without following a link and checked to be the same file.
-- No result, error or log line carries a path, a `file://` address or a link
-  to a file. The `uri` of a `resource` item is `hxprobe://attachment/<guid>`,
+- No result, error or log line carries the path of an attachment file, a
+  `file://` address or a link to a file. The `uri` of a `resource` item is `hxprobe://attachment/<guid>`,
   an id that cannot be opened.
 - PDF text is made in a child process, never inside the server: an empty
   environment, no argument but `pdf-text`, the bytes on its input, at most
