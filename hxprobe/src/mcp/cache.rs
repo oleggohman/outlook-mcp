@@ -28,6 +28,7 @@ use crate::export::{self, ExportStats};
 use crate::header;
 use crate::item;
 use crate::kv::Store;
+use crate::mcp::attach;
 use crate::mcp::log;
 use crate::mcp::proto::{self, Denied, Refresher, Remedy, ServiceStatus};
 use crate::mcp::text::{cap, html_to_text, iso, lossy};
@@ -78,6 +79,11 @@ pub const OLDER_SERVER: &str = "this server is older than the mail cache; restar
 /// or several (see [`find_default_store_in`]).
 pub const NO_DEFAULT_STORE: &str =
     "no Outlook store found under the default profile directory; pass --store";
+
+/// Error of [`Cache::profile_dir`] when the store path is not resolved, for
+/// another reason than a denial.
+pub const PROFILE_NOT_RESOLVED: &str =
+    "the Outlook profile directory is not resolved yet; call store_status";
 
 /// Longest body text put in the search index, in chars.
 const MAX_FTS_BODY: usize = 200_000;
@@ -425,6 +431,38 @@ impl Cache {
     pub fn with_remedy(mut self, remedy: Remedy) -> Cache {
         self.remedy = remedy;
         self
+    }
+
+    /// The error text of a read this server was denied: the remedy text of
+    /// [`proto::denied_text`] for this server, with `cause`.
+    pub fn denied_here(&self, cause: &str) -> String {
+        proto::denied_text(Denied::Server { cause }, &self.remedy, &self.dir)
+    }
+
+    /// The Outlook profile directory, the canonical directory that holds the
+    /// store; the error is the text of a tool error.
+    ///
+    /// A resolved store path never changes, so its parent is the answer.
+    /// Otherwise the store path is made canonical once more for this call
+    /// (the state stays as it is; [`Cache::resolve_again`] changes it on
+    /// the next call): a denial gives [`Cache::denied_here`] with
+    /// [`attach::ATTACHMENTS_DENIED`], any other failure
+    /// [`PROFILE_NOT_RESOLVED`].
+    pub fn profile_dir(&self) -> Result<PathBuf, String> {
+        let store = match self.store_state {
+            StoreState::Resolved => self.store.clone(),
+            _ => std::fs::canonicalize(&self.store).map_err(|e| {
+                if e.kind() == ErrorKind::PermissionDenied {
+                    self.denied_here(attach::ATTACHMENTS_DENIED)
+                } else {
+                    PROFILE_NOT_RESOLVED.to_string()
+                }
+            })?,
+        };
+        store
+            .parent()
+            .map(Path::to_path_buf)
+            .ok_or_else(|| PROFILE_NOT_RESOLVED.to_string())
     }
 
     /// Set the shortest time between two builds of a changed store; 0
@@ -1936,6 +1974,83 @@ mod tests {
             );
         }
         assert_eq!(find_default_store_in(&base), StoreLookup::Missing);
+    }
+
+    #[test]
+    fn profile_dir_of_a_resolved_store_is_its_canonical_parent() {
+        let t = TestDir::new("profile-dir");
+        let store = t.store(&mail_store());
+        let c = Cache::new(&t.cache_dir(), &store)
+            .unwrap()
+            .with_profiles_base(Some(t.0.join("profiles")));
+        assert_eq!(c.profile_dir(), Ok(std::fs::canonicalize(&t.0).unwrap()));
+    }
+
+    #[test]
+    fn profile_dir_of_a_denied_store_is_the_denial() {
+        if is_root() {
+            return;
+        }
+        let t = TestDir::new("profile-dir-denied");
+        let profile = t.0.join("profile");
+        std::fs::create_dir(&profile).unwrap();
+        let store = profile.join("HxStore.hxd");
+        std::fs::write(&store, mail_store()).unwrap();
+        let _l = Locked::new(&profile, 0o000);
+        let remedy = Remedy {
+            program: Some(t.0.join("hxprobe")),
+            ..Remedy::default()
+        };
+        let c = Cache::new(&t.cache_dir(), &store)
+            .unwrap()
+            .with_remedy(remedy);
+        assert_eq!(c.store_state, StoreState::Unresolved);
+        let e = c.profile_dir().unwrap_err();
+        assert_eq!(e, c.denied_here(attach::ATTACHMENTS_DENIED));
+        assert!(
+            e.starts_with("this server cannot read the store: permission denied"),
+            "{e}"
+        );
+        assert!(!e.contains(&profile.display().to_string()), "{e}");
+    }
+
+    #[test]
+    fn profile_dir_of_an_unresolved_store_looks_again() {
+        let t = TestDir::new("profile-dir-later");
+        let store = t.0.join("HxStore.hxd");
+        let c = Cache::new(&t.cache_dir(), &store)
+            .unwrap()
+            .with_profiles_base(Some(t.0.join("profiles")));
+        assert_eq!(
+            c.profile_dir(),
+            Err("the Outlook profile directory is not resolved yet; call store_status".into())
+        );
+        t.store(&mail_store());
+        assert_eq!(c.profile_dir(), Ok(std::fs::canonicalize(&t.0).unwrap()));
+        // Without a call of resolve_again, nothing else changed.
+        assert!(matches!(c.store_state, StoreState::DeniedDefault(_)));
+    }
+
+    #[test]
+    fn denied_here_is_the_server_denial_text() {
+        let t = TestDir::new("denied-here");
+        let remedy = Remedy {
+            program: Some(t.0.join("hxprobe")),
+            note: Some("ask the admin".into()),
+        };
+        let c = Cache::new(&t.cache_dir(), &t.0.join("HxStore.hxd"))
+            .unwrap()
+            .with_remedy(remedy.clone());
+        let cause = "some cause";
+        assert_eq!(
+            c.denied_here(cause),
+            proto::denied_text(Denied::Server { cause }, &remedy, &t.cache_dir())
+        );
+        assert!(
+            c.denied_here(cause).contains("Cause: some cause"),
+            "{}",
+            c.denied_here(cause)
+        );
     }
 
     /// A refresher that records the paths given to `set_store` and answers

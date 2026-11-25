@@ -1,6 +1,7 @@
 //! `hxprobe mcp`: a local, read-only MCP server over the SQLite export of the
 //! store.
 
+pub mod attach;
 pub mod cache;
 pub mod client;
 pub mod proto;

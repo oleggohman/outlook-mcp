@@ -11,6 +11,7 @@ use rusqlite::types::{Value as SqlValue, ValueRef};
 use rusqlite::{params_from_iter, Connection, Row};
 use serde_json::{json, Map, Value};
 
+use crate::mcp::attach;
 use crate::mcp::cache::Cache;
 use crate::mcp::text::{cap, html_to_text, integer, iso, lossy, parse_time};
 
@@ -814,16 +815,11 @@ fn list_attachments(conn: &Connection, _now: i64, args: &Args) -> Result<Value, 
     Ok(list(items.len() as i64, 0, items))
 }
 
-/// The part of a stored file name after the last `/`, so no result shows
-/// where the file lies inside the profile directory.
-fn own_name(filename: &str) -> &str {
-    filename.rsplit('/').next().unwrap_or(filename)
-}
-
-/// [`field`] of the file's own name.
+/// [`field`] of the file's own name (see [`attach::own_name`]), so no
+/// result shows where the file lies inside the profile directory.
 fn own_name_field(v: ValueRef) -> Value {
     lossy(v).map_or(Value::Null, |s| {
-        Value::String(cap(own_name(&s), MAX_FIELD).0)
+        Value::String(cap(attach::own_name(&s), MAX_FIELD).0)
     })
 }
 
