@@ -543,7 +543,7 @@ own instead of showing it.
   PDF in `auto` whose text goes on
 * `the extracted text stops at 16000000 bytes; the rest of the file was not read`:
   a Word, Excel or PowerPoint file whose text reached the output limit
-* `bytes that are not valid UTF-8 were replaced; the file may use another encoding`
+* `bytes that could not be decoded as text were replaced; the file may use another encoding`
 
 **Limits.**
 

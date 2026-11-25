@@ -1265,8 +1265,8 @@ fn get_attachment(cache: &mut Cache, now: i64, args: &Args) -> Result<Output, To
             let (text, replaced) = attach::decode_text(&data);
             if replaced {
                 notes.push(
-                    "bytes that are not valid UTF-8 were replaced; the file may use another \
-                     encoding"
+                    "bytes that could not be decoded as text were replaced; the file may use \
+                     another encoding"
                         .into(),
                 );
             }
@@ -2524,7 +2524,7 @@ mod tests {
         assert_eq!(
             v["notes"],
             json!([
-                "bytes that are not valid UTF-8 were replaced; the file may use another encoding"
+                "bytes that could not be decoded as text were replaced; the file may use another encoding"
             ])
         );
     }
