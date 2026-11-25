@@ -935,6 +935,10 @@ fn cmd_mcp(args: &[String]) {
     if denied_default {
         cache = cache.with_denied_default();
     }
+    // PDF text is made by this program's own file, started as `pdf-text`.
+    if let Ok(program) = client::service_program() {
+        cache = cache.with_text_helper(program);
+    }
     log(&format!(
         "serving {} with cache {}",
         cache.store_path().display(),
@@ -1292,7 +1296,88 @@ fn cmd_service(args: &[String]) {
     std::process::exit(exit.code());
 }
 
+/// `hxprobe pdf-text` (hidden, not in the usage text): the text of the PDF
+/// on stdin, written to stdout; started by `hxprobe mcp` for one PDF
+/// attachment (`mcp/pdf.rs`), so that the PDF library never runs inside
+/// the server.
+///
+/// It takes no argument (`extra` of them: exit 2, nothing read), reads only
+/// its stdin (more than [`hxprobe::mcp::attach::MAX_SOURCE_BYTES`]: exit
+/// 3), opens no file other than `/dev/null`, reads no environment variable
+/// and prints nothing to stderr. Before the library is touched, descriptor
+/// 1 is duplicated for the result and pointed at `/dev/null`, so nothing
+/// the library prints can reach the result. Text: exit 0; an error, a
+/// panic or empty input: exit 1 and nothing written.
+fn cmd_pdf_text(extra: usize) -> ! {
+    use std::io::Write;
+    use std::os::fd::FromRawFd;
+    use std::process::exit;
+
+    if extra > 0 {
+        exit(2);
+    }
+    // A panic message could hold content of the file: print nothing.
+    std::panic::set_hook(Box::new(|_| {}));
+    // SAFETY: fcntl() duplicates descriptor 1 into a new descriptor of at
+    // least 3, close-on-exec; no other thread exists yet.
+    let result_fd = unsafe { libc::fcntl(1, libc::F_DUPFD_CLOEXEC, 3) };
+    if result_fd < 0 {
+        exit(1);
+    }
+    // SAFETY: open() of a constant, NUL-terminated path; dup2() replaces
+    // descriptor 1 with it; close() of the descriptor open() returned, which
+    // nothing else owns. No other thread exists yet.
+    unsafe {
+        let null = libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC);
+        if null < 0 || libc::dup2(null, 1) < 0 {
+            exit(1);
+        }
+        libc::close(null);
+    }
+    // SAFETY: `result_fd` is a fresh descriptor owned by nothing else.
+    let mut result = unsafe { File::from_raw_fd(result_fd) };
+
+    let max = hxprobe::mcp::attach::MAX_SOURCE_BYTES;
+    let mut input = Vec::new();
+    if std::io::stdin()
+        .lock()
+        .take(max + 1)
+        .read_to_end(&mut input)
+        .is_err()
+    {
+        exit(1);
+    }
+    if input.len() as u64 > max {
+        exit(3);
+    }
+    if input.is_empty() {
+        exit(1);
+    }
+    // A deep document may need a deep stack; a panic is caught, an abort
+    // ends the process, which the server sees as no text.
+    let text = std::thread::Builder::new()
+        .stack_size(64 << 20)
+        .spawn(move || {
+            std::panic::catch_unwind(|| pdf_extract::extract_text_from_mem(&input).ok())
+                .ok()
+                .flatten()
+        })
+        .ok()
+        .and_then(|h| h.join().ok())
+        .flatten();
+    match text {
+        Some(t) if result.write_all(t.as_bytes()).is_ok() => exit(0),
+        _ => exit(1),
+    }
+}
+
 fn main() {
+    // `pdf-text` before any other work, from the raw arguments (one that
+    // is not UTF-8 is still an argument, refused).
+    let mut raw = env::args_os();
+    if raw.nth(1).as_deref() == Some(std::ffi::OsStr::new("pdf-text")) {
+        cmd_pdf_text(raw.count());
+    }
     let args: Vec<String> = env::args().collect();
     if args.get(1).map(String::as_str) == Some("--version") {
         println!("hxprobe {}", hxprobe::mcp::proto::VERSION);

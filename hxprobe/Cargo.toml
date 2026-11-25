@@ -20,6 +20,10 @@ libc = "0.2"
 # `.xlsx` and `.pptx` attachments. Pure Rust without `unsafe`; the archive
 # and the XML are read by this crate's own code (`mcp/office.rs`).
 miniz_oxide = { version = "0.8", default-features = false, features = ["with-alloc"] }
+# Text of PDF attachments. Runs only in the short-lived `hxprobe pdf-text`
+# child, never inside the server; pinned with every package of its tree in
+# Cargo.lock. It has no features and takes `lopdf` without its defaults.
+pdf-extract = "=0.12.1"
 
 [profile.release]
 opt-level = 3

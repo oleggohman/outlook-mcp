@@ -790,3 +790,152 @@ fn mcp_reads_text_image_and_pdf_attachments() {
         assert!(!err.contains(word), "{word:?} in stderr: {err}");
     }
 }
+
+// --- the hidden `pdf-text` subcommand ---
+
+/// The line of text of [`one_page_pdf`].
+const PDF_LINE: &str = "Quarterly figures are attached";
+
+/// A one-page PDF with [`PDF_LINE`] in Helvetica: four objects, a
+/// cross-reference table with their offsets, a trailer, and an
+/// uncompressed content stream.
+fn one_page_pdf() -> Vec<u8> {
+    let content = format!("BT /F1 24 Tf 72 720 Td ({PDF_LINE}) Tj ET");
+    let objects = [
+        "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R \
+         /Resources << /Font << /F1 5 0 R >> >> >>"
+            .to_string(),
+        format!(
+            "<< /Length {} >>\nstream\n{content}\nendstream",
+            content.len()
+        ),
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_string(),
+    ];
+    let mut pdf = b"%PDF-1.4\n".to_vec();
+    let mut offsets = Vec::new();
+    for (i, body) in objects.iter().enumerate() {
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(format!("{} 0 obj\n{body}\nendobj\n", i + 1).as_bytes());
+    }
+    let xref = pdf.len();
+    let mut table = format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1);
+    for o in offsets {
+        table += &format!("{o:010} 00000 n \n");
+    }
+    table += &format!(
+        "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+        objects.len() + 1
+    );
+    pdf.extend_from_slice(table.as_bytes());
+    pdf
+}
+
+/// Run `hxprobe pdf-text <extra>` with `input` on stdin (then closed) and
+/// an empty environment; exit status, stdout and stderr.
+fn pdf_text(extra: &[&str], input: &[u8]) -> (ExitStatus, Vec<u8>, Vec<u8>) {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_hxprobe"));
+    cmd.arg("pdf-text")
+        .args(extra)
+        .env_clear()
+        .current_dir("/")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = Running(cmd.spawn().unwrap());
+    let out = drain(child.0.stdout.take().unwrap());
+    let err = drain(child.0.stderr.take().unwrap());
+    {
+        let mut stdin = child.0.stdin.take().unwrap();
+        let _ = stdin.write_all(input);
+    }
+    let started = Instant::now();
+    let status = loop {
+        if let Some(s) = child.0.try_wait().unwrap() {
+            break s;
+        }
+        assert!(started.elapsed() < TIMEOUT, "pdf-text did not exit");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    (status, out.join().unwrap(), err.join().unwrap())
+}
+
+#[test]
+fn pdf_text_gives_the_text_of_a_pdf() {
+    let (status, out, err) = pdf_text(&[], &one_page_pdf());
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&err)
+    );
+    let text = String::from_utf8(out).unwrap();
+    assert_eq!(text.trim(), PDF_LINE, "{text:?}");
+    assert!(err.is_empty(), "{}", String::from_utf8_lossy(&err));
+}
+
+#[test]
+fn pdf_text_of_a_damaged_pdf_fails_silently() {
+    let mut bad = b"%PDF-1.7\n".to_vec();
+    bad.extend((0..5000u32).map(|i| (i * 13) as u8));
+    let (status, out, err) = pdf_text(&[], &bad);
+    assert!(!status.success(), "{status:?}");
+    assert!(out.is_empty(), "{out:?}");
+    assert!(err.is_empty(), "{}", String::from_utf8_lossy(&err));
+}
+
+#[test]
+fn pdf_text_of_empty_input_fails() {
+    let (status, out, _) = pdf_text(&[], b"");
+    assert!(!status.success(), "{status:?}");
+    assert!(out.is_empty(), "{out:?}");
+}
+
+#[test]
+fn pdf_text_with_an_argument_fails_without_reading() {
+    // Stdin stays open and nothing is written: a subcommand that read its
+    // input would wait for ever.
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_hxprobe"));
+    cmd.args(["pdf-text", "/etc/hosts"])
+        .env_clear()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = Running(cmd.spawn().unwrap());
+    let started = Instant::now();
+    let status = loop {
+        if let Some(s) = child.0.try_wait().unwrap() {
+            break s;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "pdf-text with an argument waited for input"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(status.code(), Some(2));
+    let mut out = Vec::new();
+    child
+        .0
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_end(&mut out)
+        .unwrap();
+    assert!(out.is_empty(), "{out:?}");
+}
+
+#[test]
+fn usage_does_not_name_pdf_text() {
+    let out = Command::new(env!("CARGO_BIN_EXE_hxprobe"))
+        .output()
+        .unwrap();
+    let all = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(all.contains("usage:"), "{all}");
+    assert!(!all.contains("pdf-text"), "{all}");
+}
