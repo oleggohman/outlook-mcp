@@ -11,9 +11,10 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Map, Value};
 
+use crate::mcp::attach;
 use crate::mcp::cache::Cache;
 use crate::mcp::log;
-use crate::mcp::tools::{self, ToolError, TOOLS};
+use crate::mcp::tools::{self, BytesItem, ToolError, TOOLS};
 
 /// Longest request line, in bytes (without the newline).
 pub const MAX_LINE: usize = 1 << 20;
@@ -189,9 +190,9 @@ fn tools_call(server: &mut Server, now: i64, params: &Value) -> Result<Value, (i
     let name = p.get("name").and_then(Value::as_str).ok_or_else(bad)?;
     let args = p.get("arguments").unwrap_or(&Value::Null);
     let started = Instant::now();
-    let (text, is_error) = match tools::call_output(&mut server.cache, now, name, args) {
-        Ok(o) => (o.json.to_string(), false),
-        Err(ToolError::Failed(msg)) => (msg, true),
+    let (text, bytes, is_error) = match tools::call_output(&mut server.cache, now, name, args) {
+        Ok(o) => (o.json.to_string(), o.bytes, false),
+        Err(ToolError::Failed(msg)) => (msg, None, true),
         Err(ToolError::Unknown) => return Err((INVALID_PARAMS, "unknown tool".to_string())),
     };
     // Only names from the fixed tool list reach the log.
@@ -200,8 +201,19 @@ fn tools_call(server: &mut Server, now: i64, params: &Value) -> Result<Value, (i
         if is_error { "failed" } else { "ok" },
         started.elapsed().as_millis()
     ));
+    let mut content = vec![json!({ "type": "text", "text": text })];
+    // The bytes of a file follow the JSON as an item of their own.
+    if let Some(b) = bytes {
+        let data = attach::base64(&b.data);
+        match b.item {
+            BytesItem::Image => {
+                content.push(json!({ "type": "image", "data": data, "mimeType": b.mime }));
+            }
+            BytesItem::Resource => {}
+        }
+    }
     Ok(json!({
-        "content": [{ "type": "text", "text": text }],
+        "content": content,
         "isError": is_error,
     }))
 }
@@ -320,7 +332,9 @@ pub fn run<R: BufRead, W: Write>(server: &mut Server, reader: R, writer: W) -> s
 mod tests {
     use super::*;
     use crate::props::guid_hex;
-    use crate::testutil::{mail_store, MAIL_MSGS, NOW};
+    use crate::testutil::{
+        mail_store, mail_store_with_attachments, no_path, TestAttachment, MAIL_MSGS, NOW,
+    };
     use serde_json::json;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -391,6 +405,155 @@ mod tests {
             };
             (v, is_error)
         }
+    }
+
+    /// The attachment folder of a fixture, relative to its directory.
+    const ATT_DIR: &str = "Files/S0/3/Attachments/0";
+
+    /// A downloaded attachment `[b; 16]` of `MAIL_MSGS[1]` named `stored`.
+    fn att(b: u8, stored: &str, size: usize) -> TestAttachment<'_> {
+        TestAttachment {
+            guid: [b; 16],
+            filename: Some(stored),
+            display_name: Some("Shared file"),
+            content_type: "application/octet-stream",
+            size: size as i64,
+            inline: 0,
+            download_status: 2,
+        }
+    }
+
+    /// A fixture whose store also has the records `atts` and whose
+    /// attachment folder holds `files` (name in the folder, content).
+    fn attachment_fixture(atts: &[TestAttachment], files: &[(&str, &[u8])]) -> Fixture {
+        let f = fixture_of(&mail_store_with_attachments(atts));
+        let folder = f.dir.join(ATT_DIR);
+        std::fs::create_dir_all(&folder).unwrap();
+        for (name, data) in files {
+            std::fs::write(folder.join(name), data).unwrap();
+        }
+        f
+    }
+
+    /// Standard base64 with padding, decoded; panics on anything else.
+    fn unbase64(s: &str) -> Vec<u8> {
+        const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        assert_eq!(s.len() % 4, 0, "length {}", s.len());
+        let mut out = Vec::new();
+        for chunk in s.as_bytes().chunks(4) {
+            let pad = chunk.iter().filter(|&&c| c == b'=').count();
+            let mut n = 0u32;
+            for &c in chunk {
+                let v = if c == b'=' {
+                    0
+                } else {
+                    ALPHABET
+                        .iter()
+                        .position(|&a| a == c)
+                        .expect("a base64 char") as u32
+                };
+                n = n << 6 | v;
+            }
+            out.extend_from_slice(&n.to_be_bytes()[1..4 - pad]);
+        }
+        out
+    }
+
+    impl Fixture {
+        /// The response line of a `tools/call`; one line.
+        fn call_line(&mut self, name: &str, args: Value) -> String {
+            let req = json!({"jsonrpc": "2.0", "id": 8, "method": "tools/call",
+                             "params": {"name": name, "arguments": args}});
+            let line = handle_line_at(&mut self.server, NOW_I, &req.to_string()).unwrap();
+            assert!(!line.contains('\n'), "a response is one line");
+            line
+        }
+    }
+
+    const PNG: &[u8] = b"\x89PNG\r\n\x1a\n";
+
+    /// An image file: the PNG signature, then filler bytes.
+    fn png() -> Vec<u8> {
+        let mut v = PNG.to_vec();
+        v.extend((0..500u32).map(|i| (i * 13) as u8));
+        v
+    }
+
+    #[test]
+    fn tools_call_of_an_image_has_an_image_item() {
+        let data = png();
+        let name = format!("~/{ATT_DIR}/chart[1].png");
+        let mut f = attachment_fixture(&[att(0x90, &name, data.len())], &[("chart[1].png", &data)]);
+        let line = f.call_line("get_attachment", json!({"guid": guid_hex(&[0x90; 16])}));
+        no_path(&line, &f.dir);
+        let r: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(r["result"]["isError"], false);
+        let content = r["result"]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["type"], "text");
+        let v: Value = serde_json::from_str(content[0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(v["kind"], "image");
+        assert_eq!(
+            v["sent"],
+            json!({"type": "image", "mime_type": "image/png", "bytes": data.len()})
+        );
+        let item = content[1].as_object().unwrap();
+        let mut keys: Vec<&str> = item.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["data", "mimeType", "type"]);
+        assert_eq!(item["type"], "image");
+        assert_eq!(item["mimeType"], "image/png");
+        assert_eq!(unbase64(item["data"].as_str().unwrap()), data);
+    }
+
+    #[test]
+    fn other_results_have_one_content_item() {
+        let data = png();
+        let (img, txt) = (
+            format!("~/{ATT_DIR}/chart[1].png"),
+            format!("~/{ATT_DIR}/notes[2].txt"),
+        );
+        let mut f = attachment_fixture(
+            &[att(0x91, &img, data.len()), att(0x92, &txt, 5)],
+            &[("chart[1].png", &data), ("notes[2].txt", b"words")],
+        );
+        let (image, text) = (guid_hex(&[0x91; 16]), guid_hex(&[0x92; 16]));
+        // `call` checks that there is exactly one text item.
+        for (name, args, error) in [
+            ("store_status", json!({}), false),
+            ("list_messages", json!({}), false),
+            (
+                "list_attachments",
+                json!({"message_guid": guid_hex(&MAIL_MSGS[1])}),
+                false,
+            ),
+            ("get_attachment", json!({ "guid": text }), false),
+            (
+                "get_attachment",
+                json!({"guid": text, "format": "text"}),
+                false,
+            ),
+            (
+                "get_attachment",
+                json!({"guid": image, "format": "text"}),
+                true,
+            ),
+            (
+                "get_attachment",
+                json!({"guid": image, "max_bytes": 10}),
+                true,
+            ),
+            ("get_attachment", json!({"guid": "nope"}), true),
+        ] {
+            let (v, is_error) = f.call(name, args.clone());
+            assert_eq!(is_error, error, "{name} {args}: {v}");
+            if name == "get_attachment" {
+                no_path(&v.to_string(), &f.dir);
+            }
+        }
+        let r = f.send(json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                              "params": {"protocolVersion": "2025-06-18"}}));
+        assert_eq!(r["result"]["capabilities"], json!({"tools": {}}));
     }
 
     fn error_code(r: &Value) -> i64 {
