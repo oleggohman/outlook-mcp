@@ -86,6 +86,8 @@ fn checked(profile: &Path, filename: &str) -> Result<(PathBuf, u64, u64), Refuse
     if !real.starts_with(&folder) || real == folder {
         return Err(Refused::Outside);
     }
+    // The identity of the path that is opened.
+    let m = std::fs::symlink_metadata(&real).map_err(|e| refused(&e))?;
     Ok((real, m.dev(), m.ino()))
 }
 
@@ -122,10 +124,10 @@ fn refused(e: &std::io::Error) -> Refused {
 pub fn open(profile: &Path, filename: &str) -> Result<(File, u64), Refused> {
     let (path, dev, ino) = checked(profile, filename)?;
     // Step 6: read-only; a link put in place meanwhile fails with ELOOP, a
-    // FIFO does not block the open.
+    // FIFO does not block the open, a terminal does not become ours.
     let file = std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY)
         .open(&path)
         .map_err(|e| refused(&e))?;
     let m = file.metadata().map_err(|e| refused(&e))?;
