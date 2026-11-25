@@ -1317,7 +1317,8 @@ The next tool call builds it again.
   the file must be a regular file, not a symbolic link, directory, device,
   FIFO or socket; its real path must lie inside the attachment folder; and it
   is opened read-only without following a link, then checked to be the same
-  file. A name that fails a step is never opened. The path stays inside the
+  file the checks saw and, by the path macOS gives for the open file, to lie
+  inside the attachment folder. A name that fails a step is never read. The path stays inside the
   server: it is in no result, no error, no log line and is not given to the
   PDF child.
 * **The PDF child.** The text of a PDF is made outside the server: for one

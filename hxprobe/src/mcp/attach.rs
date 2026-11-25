@@ -81,13 +81,19 @@ fn checked(profile: &Path, filename: &str) -> Result<(PathBuf, u64, u64), Refuse
     if !regular(&m) {
         return Err(Refused::NotRegular);
     }
+    #[cfg(test)]
+    run_hook(&AFTER_STEP_4);
     // Step 5: no directory on the way leads out of the folder.
     let real = std::fs::canonicalize(&candidate).map_err(|e| refused(&e))?;
     if !real.starts_with(&folder) || real == folder {
         return Err(Refused::Outside);
     }
-    // The identity of the path that is opened.
-    let m = std::fs::symlink_metadata(&real).map_err(|e| refused(&e))?;
+    // The canonical path is still the file step 4 saw: a swap between the
+    // two looks is refused.
+    let r = std::fs::symlink_metadata(&real).map_err(|e| refused(&e))?;
+    if r.dev() != m.dev() || r.ino() != m.ino() {
+        return Err(Refused::NotRegular);
+    }
     Ok((real, m.dev(), m.ino()))
 }
 
@@ -123,6 +129,8 @@ fn refused(e: &std::io::Error) -> Refused {
 /// length. The path is not returned.
 pub fn open(profile: &Path, filename: &str) -> Result<(File, u64), Refused> {
     let (path, dev, ino) = checked(profile, filename)?;
+    #[cfg(test)]
+    run_hook(&BEFORE_OPEN);
     // Step 6: read-only; a link put in place meanwhile fails with ELOOP, a
     // FIFO does not block the open, a terminal does not become ours.
     let file = std::fs::OpenOptions::new()
@@ -134,7 +142,47 @@ pub fn open(profile: &Path, filename: &str) -> Result<(File, u64), Refused> {
     if !regular(&m) || m.dev() != dev || m.ino() != ino {
         return Err(Refused::NotRegular);
     }
+    // The open file itself lies in the folder: a directory on the way that
+    // became a link after the check would show here.
+    #[cfg(target_os = "macos")]
+    if !path_of(&file).is_some_and(|p| p.starts_with(profile.join("Files"))) {
+        return Err(Refused::NotRegular);
+    }
     Ok((file, m.len()))
+}
+
+/// The path the system gives for the open `file` (`F_GETPATH`).
+#[cfg(target_os = "macos")]
+fn path_of(file: &File) -> Option<PathBuf> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
+    let mut buf = vec![0u8; libc::PATH_MAX as usize];
+    // SAFETY: F_GETPATH writes a NUL-terminated path of at most PATH_MAX
+    // bytes into `buf`, which holds PATH_MAX bytes.
+    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETPATH, buf.as_mut_ptr()) } < 0 {
+        return None;
+    }
+    let n = buf.iter().position(|&b| b == 0)?;
+    Some(PathBuf::from(std::ffi::OsStr::from_bytes(&buf[..n])))
+}
+
+#[cfg(test)]
+type Hook = std::cell::RefCell<Option<Box<dyn FnOnce()>>>;
+
+#[cfg(test)]
+thread_local! {
+    /// Run once between step 4 and step 5 of [`checked`] (tests).
+    static AFTER_STEP_4: Hook = const { std::cell::RefCell::new(None) };
+    /// Run once between [`checked`] and the open in [`open`] (tests).
+    static BEFORE_OPEN: Hook = const { std::cell::RefCell::new(None) };
+}
+
+/// Take the hook in `key` and run it, if one is set.
+#[cfg(test)]
+fn run_hook(key: &'static std::thread::LocalKey<Hook>) {
+    if let Some(f) = key.with(|h| h.borrow_mut().take()) {
+        f();
+    }
 }
 
 /// At most `max` bytes from the start of `file`.
@@ -613,6 +661,44 @@ mod tests {
         );
         let (_, len) = open(&p.root, &stored("in/y.txt")).unwrap();
         assert_eq!(len, 2);
+    }
+
+    #[test]
+    fn a_file_swapped_after_step_4_is_refused() {
+        let p = Profile::new("swap-file");
+        let file = p.file("a[1].txt", b"first");
+        let other = p.file("b[1].txt", b"second");
+        AFTER_STEP_4.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || std::fs::rename(&other, &file).unwrap()))
+        });
+        assert_eq!(
+            open(&p.root, &stored("a[1].txt")).err(),
+            Some(Refused::NotRegular)
+        );
+    }
+
+    #[test]
+    fn a_directory_swapped_for_a_link_before_the_open_is_refused() {
+        // The outside file is a hard link of the checked one: same device
+        // and inode, so only where the open file lies tells them apart.
+        let p = Profile::new("swap-dir");
+        let sub = p.root.join(ATT).join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(sub.join("x.txt"), b"x").unwrap();
+        let out = p.outside();
+        std::fs::hard_link(sub.join("x.txt"), out.join("x.txt")).unwrap();
+        let aside = p.root.join(ATT).join("aside");
+        let (s, a) = (sub.clone(), aside.clone());
+        BEFORE_OPEN.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                std::fs::rename(&s, &a).unwrap();
+                std::os::unix::fs::symlink(&out, &s).unwrap();
+            }))
+        });
+        assert_eq!(
+            open(&p.root, &stored("sub/x.txt")).err(),
+            Some(Refused::NotRegular)
+        );
     }
 
     #[test]

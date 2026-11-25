@@ -75,7 +75,8 @@ All notable changes to this project are listed here. The format follows
   profile, with no empty, `.` or `..` part and no NUL byte; the attachment
   folder must be a real directory and the file a regular one, not a
   symbolic link; its real path must lie inside the folder; it is opened
-  read-only without following a link and checked to be the same file.
+  read-only without following a link and checked to be the same file, and
+  by the path macOS gives for the open file to lie inside the folder.
 - No result, error or log line carries the path of an attachment file, a
   `file://` address or a link to a file. The `uri` of a `resource` item is `hxprobe://attachment/<guid>`,
   an id that cannot be opened.
