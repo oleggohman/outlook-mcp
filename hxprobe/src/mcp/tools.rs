@@ -1230,7 +1230,52 @@ fn get_attachment(cache: &mut Cache, now: i64, args: &Args) -> Result<Output, To
             };
             (None, Some(bytes))
         }
-        _ => return Err(failed("no reader yet")),
+        attach::Kind::Pdf => {
+            // PDF text is not extracted yet.
+            let text: Option<String> = None;
+            let mut bytes = None;
+            if a.format == Format::Auto && a.offset > 0 {
+                notes.push("the bytes are sent with offset 0 only".into());
+            } else if a.format == Format::Auto {
+                if let Some(e) = over_limit(&att, len, a.max_bytes, attach::MAX_SEND_BYTES) {
+                    return Err(failed(e));
+                }
+                let data = attach::read_head(&mut file, full).map_err(read_failed)?;
+                bytes = Some(Bytes {
+                    item: BytesItem::Resource,
+                    mime: "application/pdf",
+                    uri: format!("hxprobe://attachment/{}", rec.guid),
+                    data: Arc::new(data),
+                });
+            }
+            if text.is_none() {
+                notes.push(if bytes.is_some() {
+                    "no text could be extracted from this file; its bytes are in the next \
+                     content item"
+                        .into()
+                } else {
+                    "no text could be extracted from this file".into()
+                });
+            }
+            (text, bytes)
+        }
+        // Until the Office readers exist, an archive is a file.
+        attach::Kind::Zip | attach::Kind::File => {
+            if a.format == Format::Text || a.offset > 0 {
+                return Err(no_text());
+            }
+            if let Some(e) = over_limit(&att, len, a.max_bytes, attach::MAX_SEND_BYTES) {
+                return Err(failed(e));
+            }
+            let data = attach::read_head(&mut file, full).map_err(read_failed)?;
+            let bytes = Bytes {
+                item: BytesItem::Resource,
+                mime: attach::media_type(extension),
+                uri: format!("hxprobe://attachment/{}", rec.guid),
+                data: Arc::new(data),
+            };
+            (None, Some(bytes))
+        }
     };
     let page = text.map(|t| attach::page(&t, a.offset, a.max_chars));
     let sent = bytes.as_ref().map(|b| {
@@ -2747,6 +2792,198 @@ mod tests {
                 "{extra}"
             );
         }
+    }
+
+    const PDF: &[u8] = b"%PDF-1.7\n";
+    const NO_TEXT: &str = "no text could be extracted from this file";
+    const NO_TEXT_BYTES: &str =
+        "no text could be extracted from this file; its bytes are in the next content item";
+
+    #[test]
+    fn get_attachment_sends_a_pdf_as_a_resource() {
+        let data = signed(PDF);
+        let name = stored("report[7].pdf");
+        let mut f = attachment_fixture(
+            &[att(0xa0, &name, "application/pdf", data.len())],
+            &[("report[7].pdf", &data)],
+        );
+        let g = att_guid(0xa0);
+        let out = f.attachment(json!({ "guid": g }));
+        let v = &out.json;
+        assert_eq!(v["kind"], "pdf");
+        assert_eq!(v["filename"], "report[7].pdf");
+        for k in ["text", "total_chars", "truncated", "next_offset"] {
+            assert_eq!(v[k], Value::Null, "{k}");
+        }
+        assert_eq!(
+            v["sent"],
+            json!({"type": "resource", "mime_type": "application/pdf", "bytes": data.len()})
+        );
+        assert_eq!(v["notes"], json!([NO_TEXT_BYTES]));
+        let b = out.bytes.expect("bytes");
+        assert_eq!(b.item, BytesItem::Resource);
+        assert_eq!(b.mime, "application/pdf");
+        assert_eq!(b.uri, format!("hxprobe://attachment/{g}"));
+        assert_eq!(*b.data, data);
+    }
+
+    #[test]
+    fn get_attachment_sends_other_files_as_resources() {
+        let doc = signed(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1\x00\x00");
+        let zip = signed(b"PK\x03\x04\x14\x00");
+        let raw = signed(b"\x00\x01\x02");
+        let cases: [(&str, &str, &[u8], &str); 4] = [
+            (
+                "old[1].doc",
+                "application/msword",
+                &doc,
+                "application/msword",
+            ),
+            ("pack[2].zip", "application/zip", &zip, "application/zip"),
+            // The media type never comes from the record.
+            ("pack[3].zip", "application/pdf", &zip, "application/zip"),
+            ("data[4]", "text/plain", &raw, "application/octet-stream"),
+        ];
+        let names: Vec<String> = cases.iter().map(|c| stored(c.0)).collect();
+        let atts: Vec<TestAttachment> = cases
+            .iter()
+            .zip(&names)
+            .enumerate()
+            .map(|(i, (c, n))| att(0xa1 + i as u8, n, c.1, c.2.len()))
+            .collect();
+        let files: Vec<(&str, &[u8])> = cases.iter().map(|c| (c.0, c.2)).collect();
+        let mut f = attachment_fixture(&atts, &files);
+        for (i, (name, _, data, mime)) in cases.iter().enumerate() {
+            let g = att_guid(0xa1 + i as u8);
+            let out = f.attachment(json!({ "guid": g }));
+            let v = &out.json;
+            assert_eq!(v["kind"], "file", "{name}");
+            assert_eq!(v["text"], Value::Null, "{name}");
+            assert_eq!(
+                v["sent"],
+                json!({"type": "resource", "mime_type": mime, "bytes": data.len()}),
+                "{name}"
+            );
+            assert_eq!(v["notes"], json!([]), "{name}");
+            let b = out.bytes.expect("bytes");
+            assert_eq!(b.item, BytesItem::Resource);
+            assert_eq!(b.mime, *mime, "{name}");
+            assert_eq!(b.uri, format!("hxprobe://attachment/{g}"));
+            assert_eq!(*b.data, **data, "{name}");
+        }
+    }
+
+    #[test]
+    fn get_attachment_limits_pdfs_and_files() {
+        let default = attach::DEFAULT_SEND_BYTES as u64;
+        let largest = attach::MAX_SEND_BYTES as u64;
+        let source = attach::MAX_SOURCE_BYTES;
+        let cases: [(u8, &str, &[u8], u64); 4] = [
+            (0xa8, "big[1].bin", b"\x00\x01", default + 1),
+            (0xa9, "big[2].pdf", PDF, default + 1),
+            (0xaa, "huge[3].bin", b"\x00\x01", largest + 1),
+            (0xab, "vast[4].bin", b"\x00\x01", source + 1),
+        ];
+        let names: Vec<String> = cases.iter().map(|c| stored(c.1)).collect();
+        let atts: Vec<TestAttachment> = cases
+            .iter()
+            .zip(&names)
+            .map(|(c, n)| att(c.0, n, "application/octet-stream", c.3 as usize))
+            .collect();
+        let mut f = attachment_fixture(&atts, &[]);
+        for (_, name, signature, len) in cases {
+            sparse(&f, name, signature, len);
+        }
+
+        // Above the default, a PDF without text included.
+        for b in [0xa8, 0xa9] {
+            attach::bytes_read_reset();
+            let e = f.attachment_err(json!({"guid": att_guid(b)}));
+            assert!(attach::bytes_read() <= attach::HEAD_BYTES as u64);
+            assert_eq!(
+                e,
+                format!(
+                    "{} is {} bytes, above the limit of {default} bytes for one call; nothing \
+                     was sent. Call again with max_bytes of at least {}.",
+                    named(b),
+                    default + 1,
+                    default + 1
+                )
+            );
+            let out = f.attachment(json!({"guid": att_guid(b), "max_bytes": default + 1}));
+            let data = out.bytes.expect("bytes").data;
+            assert_eq!(data.len() as u64, default + 1);
+            assert_eq!(out.json["sent"]["bytes"], default + 1);
+        }
+
+        attach::bytes_read_reset();
+        let e = f.attachment_err(json!({"guid": att_guid(0xaa), "max_bytes": largest}));
+        assert!(attach::bytes_read() <= attach::HEAD_BYTES as u64);
+        assert_eq!(
+            e,
+            format!(
+                "{} is {} bytes, above the limit of {largest} bytes for one call; nothing was \
+                 sent. {largest} is the largest this server sends.",
+                named(0xaa),
+                largest + 1
+            )
+        );
+
+        attach::bytes_read_reset();
+        let e = f.attachment_err(json!({"guid": att_guid(0xab), "max_bytes": largest}));
+        assert_eq!(attach::bytes_read(), 0);
+        assert_eq!(
+            e,
+            format!(
+                "{} is {} bytes, above the limit of {source} bytes; nothing was sent.",
+                named(0xab),
+                source + 1
+            )
+        );
+    }
+
+    #[test]
+    fn get_attachment_format_and_offset_of_pdfs_and_files() {
+        let (pdf, raw) = (signed(PDF), signed(b"\x00\x01"));
+        let (a, b) = (stored("report[1].pdf"), stored("data[2].bin"));
+        let mut f = attachment_fixture(
+            &[
+                att(0xac, &a, "application/pdf", pdf.len()),
+                att(0xad, &b, "application/octet-stream", raw.len()),
+            ],
+            &[("report[1].pdf", &pdf), ("data[2].bin", &raw)],
+        );
+        for extra in [json!({"format": "text"}), json!({"offset": 5})] {
+            let mut args = extra.clone();
+            args["guid"] = json!(att_guid(0xad));
+            assert_eq!(
+                f.attachment_err(args),
+                format!(
+                    "no text can be made from {} (file); call without format and offset to get \
+                     its bytes",
+                    named(0xad)
+                ),
+                "{extra}"
+            );
+        }
+
+        let out = f.attachment(json!({"guid": att_guid(0xac), "format": "text"}));
+        assert!(out.bytes.is_none());
+        assert_eq!(out.json["kind"], "pdf");
+        assert_eq!(out.json["text"], Value::Null);
+        assert_eq!(out.json["sent"], Value::Null);
+        assert_eq!(out.json["notes"], json!([NO_TEXT]));
+
+        let out = f.attachment(json!({"guid": att_guid(0xac), "offset": 5}));
+        assert!(out.bytes.is_none());
+        assert_eq!(out.json["sent"], Value::Null);
+        assert_eq!(out.json["offset"], 5);
+        let notes = out.json["notes"].as_array().unwrap();
+        assert!(
+            notes.contains(&json!("the bytes are sent with offset 0 only")),
+            "{notes:?}"
+        );
+        assert!(notes.contains(&json!(NO_TEXT)), "{notes:?}");
     }
 
     // --- arguments ---

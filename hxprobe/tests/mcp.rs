@@ -669,23 +669,46 @@ fn assert_no_path(text: &str, dir: &Path) {
 }
 
 #[test]
-fn mcp_reads_a_text_attachment() {
+fn mcp_reads_text_image_and_pdf_attachments() {
     let d = Dir::new("attachment");
     let content = "Quarterly budget figures\r\nsecond line\n";
     let guid = [0x91; 16];
+    let (image_guid, pdf_guid) = ([0x92; 16], [0x93; 16]);
+    let mut image = b"\x89PNG\r\n\x1a\n".to_vec();
+    image.extend((0..1000u32).map(|i| (i * 7) as u8));
+    let mut pdf = b"%PDF-1.7\n".to_vec();
+    pdf.extend((0..2001u32).map(|i| (i * 11) as u8));
     std::fs::write(
         d.path("HxStore.hxd"),
-        attachment_store(&[(
-            guid,
-            "notes[1].txt",
-            "Budget notes",
-            "text/plain",
-            content.len(),
-        )]),
+        attachment_store(&[
+            (
+                guid,
+                "notes[1].txt",
+                "Budget notes",
+                "text/plain",
+                content.len(),
+            ),
+            (
+                image_guid,
+                "chart[2].png",
+                "Chart",
+                "image/png",
+                image.len(),
+            ),
+            (
+                pdf_guid,
+                "report[3].pdf",
+                "Report",
+                "application/pdf",
+                pdf.len(),
+            ),
+        ]),
     )
     .unwrap();
     std::fs::create_dir_all(d.path(ATT_DIR)).unwrap();
     std::fs::write(d.path(ATT_DIR).join("notes[1].txt"), content).unwrap();
+    std::fs::write(d.path(ATT_DIR).join("chart[2].png"), &image).unwrap();
+    std::fs::write(d.path(ATT_DIR).join("report[3].pdf"), &pdf).unwrap();
 
     let mut input = request(
         1,
@@ -699,11 +722,13 @@ fn mcp_reads_a_text_attachment() {
         "tools/call",
         json!({"name": "list_attachments", "arguments": {"message_guid": hex(&ATT_MESSAGE)}}),
     );
-    input += &request(
-        3,
-        "tools/call",
-        json!({"name": "get_attachment", "arguments": {"guid": hex(&guid)}}),
-    );
+    for (id, g) in [(3, guid), (4, image_guid), (5, pdf_guid)] {
+        input += &request(
+            id,
+            "tools/call",
+            json!({"name": "get_attachment", "arguments": {"guid": hex(&g)}}),
+        );
+    }
     let store = d.path("HxStore.hxd");
     let cache = d.path("cache");
     let (status, out, err) = mcp(
@@ -718,10 +743,10 @@ fn mcp_reads_a_text_attachment() {
     );
     assert_eq!(status.code(), Some(0), "stderr: {err}");
     let lines = responses(&out);
-    assert_eq!(lines.len(), 3, "{out}");
+    assert_eq!(lines.len(), 5, "{out}");
 
     let list = tool_result(&lines[1]);
-    assert_eq!(list["total"], 1, "{list}");
+    assert_eq!(list["total"], 3, "{list}");
     assert_eq!(list["items"][0]["guid"], hex(&guid));
     assert_eq!(list["items"][0]["filename"], "notes[1].txt");
 
@@ -733,6 +758,31 @@ fn mcp_reads_a_text_attachment() {
     assert_eq!(v["text"], content.replace('\r', ""));
     assert_eq!(v["filename"], "notes[1].txt");
     assert_eq!(v["file_size"], content.len());
+
+    // An image and a PDF: the JSON, then the bytes as base64 of the length
+    // the file's size gives.
+    for (line, kind, len, item, data) in [
+        (
+            &lines[3],
+            "image",
+            image.len(),
+            "image",
+            &lines[3]["result"]["content"][1]["data"],
+        ),
+        (
+            &lines[4],
+            "pdf",
+            pdf.len(),
+            "resource",
+            &lines[4]["result"]["content"][1]["resource"]["blob"],
+        ),
+    ] {
+        let items = line["result"]["content"].as_array().unwrap();
+        assert_eq!(items.len(), 2, "{line}");
+        assert_eq!(tool_result(line)["kind"], kind);
+        assert_eq!(items[1]["type"], item);
+        assert_eq!(data.as_str().unwrap().len(), len.div_ceil(3) * 4, "{kind}");
+    }
 
     assert_no_path(&out, &d.0);
     let err = err.to_lowercase();

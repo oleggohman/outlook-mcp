@@ -209,7 +209,11 @@ fn tools_call(server: &mut Server, now: i64, params: &Value) -> Result<Value, (i
             BytesItem::Image => {
                 content.push(json!({ "type": "image", "data": data, "mimeType": b.mime }));
             }
-            BytesItem::Resource => {}
+            BytesItem::Resource => {
+                content.push(json!({ "type": "resource", "resource": {
+                    "uri": b.uri, "mimeType": b.mime, "blob": data,
+                }}));
+            }
         }
     }
     Ok(json!({
@@ -504,6 +508,36 @@ mod tests {
         assert_eq!(item["type"], "image");
         assert_eq!(item["mimeType"], "image/png");
         assert_eq!(unbase64(item["data"].as_str().unwrap()), data);
+    }
+
+    #[test]
+    fn tools_call_of_a_pdf_has_a_resource_item() {
+        let mut data = b"%PDF-1.7\n".to_vec();
+        data.extend((0..400u32).map(|i| (i * 11) as u8));
+        let name = format!("~/{ATT_DIR}/report[7].pdf");
+        let mut f =
+            attachment_fixture(&[att(0x93, &name, data.len())], &[("report[7].pdf", &data)]);
+        let g = guid_hex(&[0x93; 16]);
+        let line = f.call_line("get_attachment", json!({ "guid": g }));
+        // The whole line, the uri included.
+        no_path(&line, &f.dir);
+        let r: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(r["result"]["isError"], false);
+        let content = r["result"]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["type"], "text");
+        let v: Value = serde_json::from_str(content[0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(v["kind"], "pdf");
+        let blob = content[1]["resource"]["blob"].as_str().unwrap().to_string();
+        assert_eq!(
+            content[1],
+            json!({"type": "resource", "resource": {
+                "uri": format!("hxprobe://attachment/{g}"),
+                "mimeType": "application/pdf",
+                "blob": blob,
+            }})
+        );
+        assert_eq!(unbase64(&blob), data);
     }
 
     #[test]
