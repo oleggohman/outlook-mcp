@@ -161,11 +161,17 @@ fn tools_list() -> Value {
     let tools: Vec<Value> = TOOLS
         .iter()
         .map(|t| {
-            json!({
+            let mut v = json!({
                 "name": t.name,
                 "description": t.description,
                 "inputSchema": t.input_schema(),
-            })
+            });
+            // Claude Code keeps a result of up to this many chars inline;
+            // other clients ignore `_meta`.
+            if let Some(n) = t.max_result_chars {
+                v["_meta"] = json!({ "anthropic/maxResultSizeChars": n });
+            }
+            v
         })
         .collect();
     json!({ "tools": tools })
@@ -183,8 +189,8 @@ fn tools_call(server: &mut Server, now: i64, params: &Value) -> Result<Value, (i
     let name = p.get("name").and_then(Value::as_str).ok_or_else(bad)?;
     let args = p.get("arguments").unwrap_or(&Value::Null);
     let started = Instant::now();
-    let (text, is_error) = match tools::call(&mut server.cache, now, name, args) {
-        Ok(v) => (v.to_string(), false),
+    let (text, is_error) = match tools::call_output(&mut server.cache, now, name, args) {
+        Ok(o) => (o.json.to_string(), false),
         Err(ToolError::Failed(msg)) => (msg, true),
         Err(ToolError::Unknown) => return Err((INVALID_PARAMS, "unknown tool".to_string())),
     };
@@ -459,8 +465,14 @@ mod tests {
         let mut f = fixture();
         let r = f.send(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}));
         let tools = r["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 9);
+        assert_eq!(tools.len(), 10);
         for t in tools {
+            // Only get_attachment declares the larger result size.
+            if t["name"] == "get_attachment" {
+                assert_eq!(t["_meta"], json!({"anthropic/maxResultSizeChars": 500000}));
+            } else {
+                assert!(t.get("_meta").is_none(), "{t}");
+            }
             assert!(t["name"].is_string());
             let d = t["description"].as_str().unwrap();
             assert!(d.contains("untrusted"), "{d}");
@@ -626,7 +638,7 @@ mod tests {
         assert_eq!(a[0]["id"], 1);
         assert_eq!(a[0]["result"], json!({}));
         assert_eq!(a[1]["id"], "b");
-        assert_eq!(a[1]["result"]["tools"].as_array().unwrap().len(), 9);
+        assert_eq!(a[1]["result"]["tools"].as_array().unwrap().len(), 10);
 
         let r = f.send(json!([]));
         assert_eq!(error_code(&r), -32600);

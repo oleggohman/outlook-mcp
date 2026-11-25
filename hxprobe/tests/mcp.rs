@@ -201,7 +201,7 @@ fn mcp_session_on_an_empty_store() {
 
     assert_eq!(lines[0]["result"]["serverInfo"]["name"], "hxprobe-outlook");
     assert_eq!(lines[0]["result"]["protocolVersion"], "2025-06-18");
-    assert_eq!(lines[1]["result"]["tools"].as_array().unwrap().len(), 9);
+    assert_eq!(lines[1]["result"]["tools"].as_array().unwrap().len(), 10);
     let status_v = tool_result(&lines[2]);
     assert_eq!(status_v["messages"], 0);
     assert_eq!(status_v["last_error"], Value::Null);

@@ -656,6 +656,22 @@ pub fn mail_store_with_attachments(extra: &[TestAttachment]) -> Vec<u8> {
     store_of(items)
 }
 
+/// Fail when `text` shows where a file lies: the directory `dir` of the
+/// fixture (as given or canonical), `Files/`, `~/` or `file:`.
+pub fn no_path(text: &str, dir: &std::path::Path) {
+    let mut dirs = vec![dir.to_string_lossy().into_owned()];
+    if let Ok(real) = std::fs::canonicalize(dir) {
+        dirs.push(real.to_string_lossy().into_owned());
+    }
+    for bad in dirs
+        .iter()
+        .map(String::as_str)
+        .chain(["Files/", "~/", "file:"])
+    {
+        assert!(!text.contains(bad), "{bad:?} in {text}");
+    }
+}
+
 /// [`mail_store`] without attachments and appointments.
 pub fn mail_store_without_calendar() -> Vec<u8> {
     store_of(mail_items())
