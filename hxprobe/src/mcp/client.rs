@@ -571,37 +571,69 @@ fn open_log(dir: &Path) -> io::Result<File> {
         .open(&path)
 }
 
-/// Most descriptors [`spawn_detached`] marks close-on-exec.
+/// Most descriptors [`inherit_only_std`] marks close-on-exec.
 const MAX_FDS: libc::c_int = 4096;
 
 /// Start `program` with `args` in a session of its own, stdin null and
 /// stdout and stderr to `log`, in `dir`. It inherits no descriptor beyond
-/// these three: std marks a new descriptor close-on-exec only after
-/// creating it on some systems, so one made by another thread meanwhile
-/// would leak into the child.
+/// these three ([`inherit_only_std`]).
 fn spawn_detached(program: &Path, args: &[&OsStr], dir: &Path, log: File) -> io::Result<Child> {
-    let limit = fd_limit();
     let mut cmd = Command::new(program);
     cmd.args(args)
         .stdin(Stdio::null())
         .stdout(log.try_clone()?)
         .stderr(log)
         .current_dir(dir);
-    // SAFETY: the closure calls only async-signal-safe functions (setsid,
-    // fcntl) and allocates nothing. Descriptors are marked, not closed:
-    // `Command` reports a failed exec through a close-on-exec pipe.
+    // SAFETY: the closure calls only an async-signal-safe function (setsid)
+    // and allocates nothing.
     unsafe {
-        cmd.pre_exec(move || {
+        cmd.pre_exec(|| {
             if libc::setsid() == -1 {
                 return Err(io::Error::last_os_error());
             }
+            Ok(())
+        });
+    }
+    inherit_only_std(&mut cmd);
+    cmd.spawn()
+}
+
+/// Let a child started by `cmd` inherit no descriptor beyond its standard
+/// three: every descriptor from 3 up to the soft limit (at most
+/// [`MAX_FDS`]) is marked close-on-exec just before the exec. std marks a
+/// new descriptor close-on-exec only after creating it on some systems, so
+/// one made by another thread meanwhile would otherwise leak into the
+/// child. Shared by the service start and the PDF child (`pdf.rs`).
+pub(crate) fn inherit_only_std(cmd: &mut Command) {
+    let limit = fd_limit();
+    // SAFETY: the closure calls only an async-signal-safe function (fcntl)
+    // and allocates nothing. Descriptors are marked, not closed: `Command`
+    // reports a failed exec through a close-on-exec pipe.
+    unsafe {
+        cmd.pre_exec(move || {
             for fd in 3..limit {
                 libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
             }
             Ok(())
         });
     }
-    cmd.spawn()
+}
+
+/// Send `SIGKILL` to the process group `pgid`; whether it was sent. A
+/// `pgid` of 0 (the caller's own group), 1 (`kill(-1)` is every process),
+/// one that does not fit `i32`, and the caller's own group are refused:
+/// false, nothing sent.
+pub(crate) fn kill_group(pgid: u32) -> bool {
+    let Ok(id) = libc::pid_t::try_from(pgid) else {
+        return false;
+    };
+    // SAFETY: getpgrp() has no preconditions.
+    if id <= 1 || id == unsafe { libc::getpgrp() } {
+        return false;
+    }
+    // SAFETY: kill() with a negative id signals exactly the group `id`;
+    // `id` is above 1, so it is never "every process" or the own group.
+    unsafe { libc::kill(-id, libc::SIGKILL) == 0 }
 }
 
 /// The soft limit of open descriptors, at most [`MAX_FDS`].
@@ -1491,6 +1523,117 @@ mod tests {
         let cwd = std::fs::canonicalize(t.cache()).unwrap();
         assert!(text.contains(cwd.to_str().unwrap()), "{text}");
         assert!(text.contains("err"), "{text}");
+    }
+
+    #[test]
+    fn inherit_only_std_closes_other_descriptors_in_the_child() {
+        let _p = process_lock();
+        let t = TestDir::new();
+        let path = t.0.join("extra.sock");
+        let extra = UnixListener::bind(&path).unwrap();
+        // As if another thread created it and was not yet done marking it
+        // close-on-exec.
+        // SAFETY: fcntl() on a descriptor owned by `extra`.
+        assert_eq!(
+            unsafe { libc::fcntl(extra.as_raw_fd(), libc::F_SETFD, 0) },
+            0
+        );
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", "echo up; exec /bin/sleep 5"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        inherit_only_std(&mut cmd);
+        let mut child = cmd.spawn().unwrap();
+        // Once the child runs its own code, its exec is over.
+        let mut line = String::new();
+        BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        assert_eq!(line, "up\n");
+        drop(extra);
+        let r = UnixStream::connect(&path);
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(r.is_err(), "the child kept the listening socket open");
+    }
+
+    /// Whether process `pid` is gone, waiting up to 5 s (a reparented
+    /// grandchild is reaped by the system a moment after its end).
+    fn gone_within(pid: libc::pid_t) -> bool {
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_secs(5) {
+            // SAFETY: kill() with signal 0 only checks that `pid` exists.
+            if unsafe { libc::kill(pid, 0) } == -1
+                && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+            {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        false
+    }
+
+    #[test]
+    fn kill_group_ends_a_child_and_its_background_grandchild() {
+        let _p = process_lock();
+        let t = TestDir::new();
+        let pid_file = t.0.join("grandchild");
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c")
+            .arg(format!(
+                "/bin/sleep 60 & echo $! > '{}'; exec /bin/sleep 60",
+                pid_file.display()
+            ))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0);
+        let mut child = cmd.spawn().unwrap();
+        let started = Instant::now();
+        let grandchild: libc::pid_t = loop {
+            if let Some(n) = std::fs::read_to_string(&pid_file)
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+            {
+                break n;
+            }
+            assert!(started.elapsed() < Duration::from_secs(5));
+            thread::sleep(Duration::from_millis(5));
+        };
+        let killed = kill_group(child.id());
+        // Bounded wait, so a kill that sent nothing fails instead of hanging.
+        let started = Instant::now();
+        let mut in_time = false;
+        while started.elapsed() < Duration::from_secs(5) {
+            if child.try_wait().unwrap().is_some() {
+                in_time = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        if !in_time {
+            let _ = child.kill();
+            // SAFETY: kill() of the grandchild this test started.
+            unsafe { libc::kill(grandchild, libc::SIGKILL) };
+        }
+        let status = child.wait().unwrap();
+        assert!(killed);
+        assert!(in_time, "the child was not ended by kill_group");
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
+        assert!(gone_within(grandchild), "the grandchild is still running");
+    }
+
+    #[test]
+    fn kill_group_refuses_groups_it_must_never_signal() {
+        assert!(!kill_group(0));
+        assert!(!kill_group(1));
+        assert!(!kill_group(u32::MAX));
+        assert!(!kill_group(i32::MAX as u32 + 1));
+        // The own group of the test process: never signalled.
+        // SAFETY: getpgrp() has no preconditions.
+        let own = unsafe { libc::getpgrp() } as u32;
+        assert!(!kill_group(own));
     }
 
     #[test]

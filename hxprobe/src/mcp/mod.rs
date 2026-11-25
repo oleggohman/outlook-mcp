@@ -5,6 +5,7 @@ pub mod attach;
 pub mod cache;
 pub mod client;
 pub mod office;
+pub mod pdf;
 pub mod proto;
 pub mod rpc;
 pub mod service;
