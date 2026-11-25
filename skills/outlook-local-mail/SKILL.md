@@ -2,12 +2,12 @@
 name: outlook-local-mail
 description: "Use when the user asks about their Outlook mail, contacts or meetings (check the inbox, find or read an email, read or summarise an attachment, triage what is urgent, analyze a thread, check for a reply) and the local hxprobe Outlook MCP tools are available, or when one of those tools returns an error, a warning, or empty or stale results."
 metadata:
-  version: "0.2.4"
+  version: "0.3.0"
 ---
 
 # Outlook local mail (hxprobe MCP)
 
-Skill version: 0.2.4. It matches the hxprobe program and plugin of the same
+Skill version: 0.3.0. It matches the hxprobe program and plugin of the same
 version; when the user asks which version of this skill is in use, say this
 number.
 

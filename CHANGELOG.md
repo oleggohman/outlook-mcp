@@ -4,6 +4,98 @@ All notable changes to this project are listed here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-11-25
+
+### Added
+
+- The tool `get_attachment` sends the content of one attachment that Outlook
+  has downloaded, by the `guid` that `list_attachments` returns, in the tool
+  result itself: a text or HTML file as text, a PNG, JPEG, GIF or WebP image
+  as an MCP `image` item, a Word, Excel or PowerPoint file (`.docx`,
+  `.xlsx`, `.pptx`) as its text only, a PDF as its text and, in the same
+  result, as an embedded `resource` with its bytes, and any other file as an
+  embedded `resource`. The kind comes from the file's first bytes, never
+  from the content type of the record alone.
+- Arguments of `get_attachment`: `format` (`auto` or `text`, the text only
+  without bytes), `max_bytes` (1 to 10,000,000, default 250,000; an image at
+  most 3,750,000), `max_chars` (1 to 80,000, default 20,000) and `offset`
+  (0 to 30,000,000 characters of the text, to read a long text page by page
+  with `next_offset`). Bytes are sent whole or not at all; a PDF above the
+  limit comes with its text and a note; no file above 30,000,000 bytes is
+  read. Every result has the fields `kind`, `text`, `total_chars`,
+  `truncated`, `next_offset`, `sent`, `notes`, `size`, `file_size` and
+  `download_status`.
+- `get_attachment` declares `_meta` `{"anthropic/maxResultSizeChars": 500000}`
+  in `tools/list`, so that Claude Code keeps results up to that size in the
+  conversation. The default `max_bytes` is provisional until it is checked
+  in the clients.
+- `list_attachments` returns a `guid` per attachment.
+- The hidden subcommand `hxprobe pdf-text`, which the server starts for one
+  PDF to make its text (not in the usage text).
+- Dependencies: `miniz_oxide` 0.8 (`MIT OR Zlib OR Apache-2.0`) for the
+  entries of Word, Excel and PowerPoint files, whose archive and XML are
+  read by this crate's own code; `pdf-extract` 0.12.1 (MIT) for the text of
+  PDF files, used in the `pdf-text` child only. `Cargo.lock` gains 64
+  packages (2 for `miniz_oxide`, 62 for `pdf-extract`), among them crates
+  for encrypted PDFs and crates that only WebAssembly builds use. Every one
+  of their licences is MIT, Zlib, or an expression that MIT or Apache-2.0
+  satisfies, in three packages together with BSD-3-Clause or Unicode-3.0. The
+  release program grows from about 3.4 MB to about 4.9 MB. The minimum Rust
+  version stays 1.88.
+
+### Changed
+
+- `filename` of `list_attachments` is the file's own name (`report[7].pdf`)
+  and no longer the whole value stored in the record with its folders. A
+  name without folders is unchanged.
+- The MCP instructions name the content of downloaded attachments and say
+  that message and attachment content is untrusted.
+- The `warning` key is carried by eight mail tools, `get_attachment`
+  included.
+- The skill covers attachment content: its description names attachments
+  (341 characters), a new section says what arrives for each kind of file
+  and what to do with it, and the argument table, the error table, "What
+  the server cannot do" and "Common mistakes" follow the new tool. The
+  reference file `references/triage-and-threads.md` sends questions about a
+  file's content to `get_attachment` and no longer says attachments cannot
+  be read. `scripts/test-repo.sh` checks the description's length and that
+  it names attachments, and that no file under `skills/` holds a local path
+  or a file address.
+- The README no longer says attachments cannot be read. It has a section
+  "Attachment content" (the attachment folder, what is sent, the result,
+  notes, limits and errors) and covers the new tool in "Full Disk Access",
+  "Privacy and safety", "Limits" and "Build".
+
+### Security
+
+- The file name an attachment record gives comes from mail, so it is
+  checked before any file is opened: it must lie under `~/Files/` of the
+  profile, with no empty, `.` or `..` part and no NUL byte; the attachment
+  folder must be a real directory and the file a regular one, not a
+  symbolic link; its real path must lie inside the folder; it is opened
+  read-only without following a link and checked to be the same file.
+- No result, error or log line carries a path, a `file://` address or a link
+  to a file. The `uri` of a `resource` item is `hxprobe://attachment/<guid>`,
+  an id that cannot be opened.
+- PDF text is made in a child process, never inside the server: an empty
+  environment, no argument but `pdf-text`, the bytes on its input, at most
+  20 seconds and 16,000,000 bytes of text, and its whole process group
+  killed when a limit is passed. Any failure means "no text" for that call.
+  The Word, Excel and PowerPoint readers bound the entries, the inflated
+  bytes and the text they produce.
+- Attachment content is marked untrusted in the instructions, in the tool
+  description and with the key `untrusted` in every `get_attachment` result.
+- Nothing is written and nothing is copied into the cache: a file is read in
+  place, read-only, at call time. No network.
+
+### Upgrade notes
+
+- The cache format and the service are unchanged; a server of 0.2.x and one
+  of 0.3.0 can share a cache directory.
+- Restart the MCP client to get the new tool.
+- Attachments are read by the server itself, not by the service: after a
+  Full Disk Access grant, restart the MCP client before reading attachments.
+
 ## [0.2.4] - 2026-11-24
 
 The hxprobe program has no functional change; its version follows the plugin.
@@ -199,6 +291,7 @@ Plugin release; the hxprobe program stays at 0.2.0.
 - Prebuilt program for Apple Silicon Macs, verified by the launcher against
   `release/SHA256SUMS`.
 
+[0.3.0]: https://github.com/oleggohman/outlook-mcp/compare/v0.2.4...v0.3.0
 [0.2.4]: https://github.com/oleggohman/outlook-mcp/compare/v0.2.3...v0.2.4
 [0.2.3]: https://github.com/oleggohman/outlook-mcp/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/oleggohman/outlook-mcp/compare/v0.2.1...v0.2.2
