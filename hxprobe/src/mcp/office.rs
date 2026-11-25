@@ -244,8 +244,6 @@ pub(crate) struct Tag<'a> {
 impl<'a> Tag<'a> {
     /// The decoded value of the attribute `name`, if the tag has it; `None`
     /// also once the attributes stop being well formed.
-    // Used by the workbook reader of the next step.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn attr(&self, name: &str) -> Option<Cow<'a, str>> {
         let b = self.attrs;
         let mut i = 0;
@@ -522,8 +520,6 @@ impl TextOut {
 
     /// `n` times `c` (padding), checked as a whole first; never builds a
     /// string of `n` characters.
-    // Used by the workbook reader of the next step.
-    #[cfg_attr(not(test), allow(dead_code))]
     fn push_n(&mut self, c: char, n: usize) {
         if self.fits(c.len_utf8().checked_mul(n)) {
             for _ in 0..n {
@@ -688,6 +684,318 @@ fn pptx_text_limited(archive: &[u8], limit: usize) -> Result<Cut, ()> {
             Event::Text(t) if in_t => out.push_str(&t),
             _ => {}
         })?;
+        if out.full {
+            break;
+        }
+    }
+    Ok(out.finish())
+}
+
+/// Most shared strings of a workbook kept; later ones read as empty cells.
+const MAX_SHARED: usize = 1_000_000;
+/// Largest column of a workbook (`XFD`).
+const MAX_COLUMN: u32 = 16_384;
+/// Largest row of a workbook.
+const MAX_ROW: u64 = 1_048_576;
+
+/// The shared strings of a workbook: one `String` and the byte range of
+/// each entry in it, so an empty entry costs 8 bytes and no allocation.
+struct Shared {
+    pool: String,
+    ranges: Vec<(u32, u32)>,
+}
+
+impl Shared {
+    /// Entry `i`; empty for one that was not kept or does not exist.
+    fn get(&self, i: usize) -> &str {
+        self.ranges
+            .get(i)
+            .and_then(|&(a, b)| self.pool.get(a as usize..b as usize))
+            .unwrap_or_default()
+    }
+}
+
+/// The name of an element without its prefix (`x:row` is `row`).
+fn local(name: &[u8]) -> &[u8] {
+    name.iter()
+        .position(|c| *c == b':')
+        .map_or(name, |i| &name[i + 1..])
+}
+
+/// The shared strings of `xml` (`xl/sharedStrings.xml`): the text of the `t`
+/// elements of each `si`, phonetic runs (`rPh`) left out. At most
+/// [`MAX_SHARED`] entries and [`MAX_ENTRY_BYTES`] bytes of text are kept;
+/// what comes after reads as empty.
+fn shared_strings(xml: &[u8]) -> Result<Shared, ()> {
+    let mut s = Shared {
+        pool: String::new(),
+        ranges: Vec::new(),
+    };
+    let (mut start, mut in_si, mut in_t, mut phonetic) = (0usize, false, false, 0usize);
+    for e in Xml::new(xml) {
+        match e? {
+            Event::Start(t) => match local(t.name) {
+                b"si" => {
+                    in_si = true;
+                    start = s.pool.len();
+                }
+                b"t" => in_t = true,
+                b"rPh" => phonetic += 1,
+                _ => {}
+            },
+            Event::End(name) => match local(name) {
+                b"si" => {
+                    in_si = false;
+                    // Both ends fit: the pool never passes MAX_ENTRY_BYTES.
+                    s.ranges.push((start as u32, s.pool.len() as u32));
+                    if s.ranges.len() >= MAX_SHARED {
+                        break;
+                    }
+                }
+                b"t" => in_t = false,
+                b"rPh" => phonetic = phonetic.saturating_sub(1),
+                _ => {}
+            },
+            Event::Text(t) if in_si && in_t && phonetic == 0 => {
+                if s.pool.len() + t.len() <= MAX_ENTRY_BYTES {
+                    s.pool.push_str(&t);
+                }
+            }
+            Event::Text(_) => {}
+        }
+    }
+    Ok(s)
+}
+
+/// The column of a cell reference (`C7` is 3): at most three letters, at
+/// most [`MAX_COLUMN`]; `None` for any other reference.
+fn column(reference: &str) -> Option<u32> {
+    let letters = reference
+        .bytes()
+        .take_while(u8::is_ascii_alphabetic)
+        .take(4)
+        .collect::<Vec<u8>>();
+    if letters.is_empty() || letters.len() > 3 {
+        return None;
+    }
+    let n = letters.iter().fold(0u32, |n, c| {
+        n * 26 + u32::from(c.to_ascii_uppercase() - b'A' + 1)
+    });
+    (n <= MAX_COLUMN).then_some(n)
+}
+
+/// A row number, capped at [`MAX_ROW`]; `None` for one that is not a
+/// number.
+fn row_number(r: &str) -> Option<u64> {
+    if r.is_empty() || !r.bytes().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    Some(r.bytes().fold(0u64, |n, c| {
+        n.saturating_mul(10)
+            .saturating_add(u64::from(c - b'0'))
+            .min(MAX_ROW)
+    }))
+}
+
+/// How the value of a cell is read.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CellType {
+    /// An index into the shared strings.
+    Shared,
+    /// `TRUE` or `FALSE`.
+    Bool,
+    /// The text of `is`.
+    Inline,
+    /// The stored value as written.
+    Plain,
+}
+
+/// The rows of one worksheet into `out`: one line per row, cells at their
+/// column, separated by tabs; empty lines for a gap in row numbers.
+fn sheet_rows(xml: &[u8], shared: &Shared, out: &mut TextOut) -> Result<(), ()> {
+    let mut row = 0u64;
+    // The column of the last cell seen and of the last cell written.
+    let (mut seen, mut written) = (0u32, 0u32);
+    // The open cell: its column (`None`: skipped) and type.
+    let mut cell: Option<(Option<u32>, CellType)> = None;
+    let (mut in_v, mut in_is, mut in_t, mut phonetic) = (false, false, false, 0usize);
+    let mut value = String::new();
+    for e in Xml::new(xml) {
+        match e? {
+            Event::Start(t) => match local(t.name) {
+                b"row" => {
+                    let next = (row + 1).min(MAX_ROW);
+                    let n = t.attr("r").and_then(|r| row_number(&r)).unwrap_or(next);
+                    if n > row + 1 {
+                        // At most MAX_ROW, so it fits a usize.
+                        out.push_n('\n', (n - row - 1) as usize);
+                    }
+                    row = n;
+                    (seen, written) = (0, 0);
+                }
+                b"c" => {
+                    let col = match t.attr("r") {
+                        Some(r) => column(&r),
+                        None => Some(seen + 1),
+                    }
+                    .map(|c| c.max(seen + 1))
+                    .filter(|c| *c <= MAX_COLUMN);
+                    let kind = match t.attr("t").as_deref() {
+                        Some("s") => CellType::Shared,
+                        Some("b") => CellType::Bool,
+                        Some("inlineStr") => CellType::Inline,
+                        _ => CellType::Plain,
+                    };
+                    cell = Some((col, kind));
+                    value.clear();
+                }
+                b"v" => in_v = true,
+                b"is" => in_is = true,
+                b"t" => in_t = true,
+                b"rPh" => phonetic += 1,
+                _ => {}
+            },
+            Event::End(name) => match local(name) {
+                b"row" => out.push('\n'),
+                b"c" => {
+                    if let Some((Some(col), kind)) = cell.take() {
+                        let text = match kind {
+                            CellType::Shared => {
+                                value.trim().parse().map_or("", |i: usize| shared.get(i))
+                            }
+                            CellType::Bool => match value.trim() {
+                                "1" => "TRUE",
+                                "0" => "FALSE",
+                                v => v,
+                            },
+                            CellType::Inline | CellType::Plain => &value,
+                        };
+                        if !text.is_empty() {
+                            out.push_n('\t', (col - written.max(1)) as usize);
+                            out.push_str(text);
+                            written = col;
+                        }
+                        seen = col;
+                    }
+                }
+                b"v" => in_v = false,
+                b"is" => in_is = false,
+                b"t" => in_t = false,
+                b"rPh" => phonetic = phonetic.saturating_sub(1),
+                _ => {}
+            },
+            Event::Text(t) => {
+                let wanted = match cell {
+                    Some((Some(_), CellType::Inline)) => in_is && in_t && phonetic == 0,
+                    Some((Some(_), _)) => in_v,
+                    _ => false,
+                };
+                if wanted {
+                    // A value that cannot fit in what is left of the text
+                    // ends it here, before it is held in memory.
+                    if value.len() + t.len() > out.limit - out.s.len() {
+                        out.fits(None);
+                    } else {
+                        value.push_str(&t);
+                    }
+                }
+            }
+        }
+        if out.full {
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// The part name of a relation target of the workbook part.
+fn part_name(target: &str) -> String {
+    match target.strip_prefix('/') {
+        Some(absolute) => absolute.to_string(),
+        None => format!("xl/{target}"),
+    }
+}
+
+/// The text of a `.xlsx` archive, at most [`OFFICE_MAX_TEXT`] bytes.
+// The error carries nothing on purpose: no detail of a file from mail
+// reaches a result.
+#[allow(clippy::result_unit_err)]
+pub fn xlsx_text(archive: &[u8]) -> Result<Cut, ()> {
+    xlsx_text_limited(archive, OFFICE_MAX_TEXT)
+}
+
+/// [`xlsx_text`] with a given limit. Sheet names and order from
+/// `xl/workbook.xml` and its relations; without a usable relation the
+/// entries `xl/worksheets/sheet<N>.xml` in number order, named `Sheet <N>`.
+/// Per sheet a line `# <name>`, then its rows (see [`sheet_rows`]).
+fn xlsx_text_limited(archive: &[u8], limit: usize) -> Result<Cut, ()> {
+    use std::collections::HashMap;
+    let records = directory(archive)?;
+    let by_name: HashMap<&[u8], &Record> = records.iter().map(|r| (r.name, r)).collect();
+    let mut budget = MAX_INFLATED;
+    let part = |name: &str, budget: &mut usize| match by_name.get(name.as_bytes()) {
+        Some(r) => take(archive, r, budget, MAX_ENTRY_BYTES).map(Some),
+        None => Ok(None),
+    };
+
+    // Relation id to part name, then the sheets in workbook order.
+    let mut targets: HashMap<String, String> = HashMap::new();
+    if let Some(rels) = part("xl/_rels/workbook.xml.rels", &mut budget)? {
+        for e in Xml::new(&rels) {
+            if let Event::Start(t) = e? {
+                if local(t.name) == b"Relationship" && targets.len() < MAX_ENTRIES {
+                    if let (Some(id), Some(target)) = (t.attr("Id"), t.attr("Target")) {
+                        targets.insert(id.into_owned(), part_name(&target));
+                    }
+                }
+            }
+        }
+    }
+    let mut sheets: Vec<(String, &Record)> = Vec::new();
+    if let Some(workbook) = part("xl/workbook.xml", &mut budget)? {
+        for e in Xml::new(&workbook) {
+            if let Event::Start(t) = e? {
+                if local(t.name) != b"sheet" || sheets.len() >= MAX_ENTRIES {
+                    continue;
+                }
+                let target = t.attr("r:id").and_then(|id| targets.get(id.as_ref()));
+                if let Some(r) = target.and_then(|p| by_name.get(p.as_bytes())) {
+                    let name = t.attr("name").unwrap_or_default().into_owned();
+                    sheets.push((name, r));
+                }
+            }
+        }
+    }
+    if sheets.is_empty() {
+        let mut numbered: Vec<(u32, &Record)> = records
+            .iter()
+            .filter_map(|r| Some((numbered(r.name, "xl/worksheets/sheet")?, r)))
+            .collect();
+        numbered.sort_by_key(|(n, _)| *n);
+        numbered.dedup_by_key(|(n, _)| *n);
+        sheets = numbered
+            .into_iter()
+            .map(|(n, r)| (format!("Sheet {n}"), r))
+            .collect();
+    }
+
+    let shared = match part("xl/sharedStrings.xml", &mut budget)? {
+        Some(xml) => shared_strings(&xml)?,
+        None => Shared {
+            pool: String::new(),
+            ranges: Vec::new(),
+        },
+    };
+    let mut out = TextOut::new(limit);
+    for (name, r) in sheets {
+        out.push_str("# ");
+        out.push_str(&name);
+        out.push('\n');
+        if out.full {
+            break;
+        }
+        let xml = take(archive, r, &mut budget, MAX_ENTRY_BYTES)?;
+        sheet_rows(&xml, &shared, &mut out)?;
         if out.full {
             break;
         }
@@ -1586,5 +1894,275 @@ mod reader_tests {
         assert!(c.text.len() <= 1_000);
         assert!(c.text.starts_with("# Slide 1\nline 0\n"));
         assert!(!pptx_text(&a).unwrap().cut);
+    }
+}
+
+#[cfg(test)]
+mod xlsx_tests {
+    use super::testzip::zip;
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    const WORKBOOK: &str = "<workbook xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\"><sheets>\
+         <sheet name=\"Summary &amp; totals\" sheetId=\"2\" r:id=\"rId7\"/>\
+         <sheet name=\"Data\" sheetId=\"1\" r:id=\"rId3\"/></sheets></workbook>";
+    const RELS: &str = "<Relationships>\
+         <Relationship Id=\"rId3\" Type=\"worksheet\" Target=\"worksheets/sheet1.xml\"/>\
+         <Relationship Id=\"rId9\" Type=\"styles\" Target=\"styles.xml\"/>\
+         <Relationship Id=\"rId7\" Type=\"worksheet\" Target=\"/xl/worksheets/sheet2.xml\"/>\
+         </Relationships>";
+
+    /// A worksheet whose `sheetData` holds `rows`.
+    fn sheet(rows: &str) -> String {
+        format!("<worksheet><sheetData>{rows}</sheetData></worksheet>")
+    }
+
+    /// A workbook of the given sheet entries, with or without the workbook
+    /// relations, and with shared strings when given.
+    fn xlsx(rels: bool, shared: Option<&str>, sheets: &[(&str, String)]) -> Vec<u8> {
+        let mut e: Vec<(&str, &[u8], bool)> = vec![("xl/workbook.xml", WORKBOOK.as_bytes(), true)];
+        if rels {
+            e.push(("xl/_rels/workbook.xml.rels", RELS.as_bytes(), true));
+        }
+        if let Some(s) = shared {
+            e.push(("xl/sharedStrings.xml", s.as_bytes(), true));
+        }
+        e.extend(sheets.iter().map(|(n, x)| (*n, x.as_bytes(), true)));
+        zip(&e)
+    }
+
+    #[test]
+    fn sheets_in_workbook_order_with_their_cells() {
+        let shared =
+            "<sst count=\"4\"><si><t>Name</t></si><si><t>alpha</t><rPh><t>phonetic</t></rPh></si>\
+             <si><r><t>beta </t></r><r><rPr><b/></rPr><t>&amp; co</t></r></si><si/></sst>";
+        let summary = sheet(
+            "<row r=\"1\"><c r=\"A1\" t=\"s\"><v>0</v></c><c r=\"B1\" t=\"inlineStr\"><is><t>Count</t></is></c>\
+             <c r=\"D1\" t=\"str\"><v>OK</v></c></row>\
+             <row r=\"2\"><c r=\"A2\" t=\"s\"><v>1</v></c><c r=\"B2\"><v>3.5</v></c>\
+             <c r=\"D2\" t=\"b\"><v>1</v></c><c r=\"E2\" t=\"s\"><v>3</v></c></row>\
+             <row r=\"4\"><c r=\"A4\" t=\"s\"><v>2</v></c><c r=\"B4\"><f>SUM(B1:B2)</f><v>42</v></c>\
+             <c r=\"D4\" t=\"b\"><v>0</v></c><c r=\"C4\" s=\"1\"/></row>",
+        );
+        let data = sheet("<row r=\"1\"><c r=\"A1\"><v>45291</v></c></row>");
+        let a = xlsx(
+            true,
+            Some(shared),
+            &[
+                ("xl/worksheets/sheet1.xml", data),
+                ("xl/worksheets/sheet2.xml", summary),
+            ],
+        );
+        assert_eq!(
+            xlsx_text(&a),
+            Ok(Cut {
+                text: "# Summary & totals\nName\tCount\t\tOK\nalpha\t3.5\t\tTRUE\n\n\
+                       beta & co\t42\t\tFALSE\n# Data\n45291\n"
+                    .into(),
+                cut: false
+            })
+        );
+    }
+
+    #[test]
+    fn without_relations_sheets_come_in_number_order() {
+        let one = |v: &str| sheet(&format!("<row><c><v>{v}</v></c></row>"));
+        let a = xlsx(
+            false,
+            None,
+            &[
+                ("xl/worksheets/sheet10.xml", one("ten")),
+                ("xl/worksheets/sheet2.xml", one("two")),
+                ("xl/worksheets/sheet1.xml", one("one")),
+                ("xl/worksheets/_rels/sheet1.xml.rels", "<x/>".into()),
+            ],
+        );
+        assert_eq!(
+            xlsx_text(&a).unwrap().text,
+            "# Sheet 1\none\n# Sheet 2\ntwo\n# Sheet 10\nten\n"
+        );
+    }
+
+    #[test]
+    fn a_shared_string_past_the_end_is_an_empty_cell() {
+        let a = xlsx(
+            true,
+            Some("<sst><si><t>only</t></si></sst>"),
+            &[(
+                "xl/worksheets/sheet1.xml",
+                sheet(
+                    "<row r=\"1\"><c r=\"A1\" t=\"s\"><v>99</v></c><c r=\"B1\" t=\"s\"><v>x</v></c>\
+                     <c r=\"C1\" t=\"s\"><v>-1</v></c><c r=\"D1\" t=\"s\"><v>99999999999999999999999</v></c>\
+                     <c r=\"E1\" t=\"s\"><v>0</v></c></row>",
+                ),
+            )],
+        );
+        assert_eq!(xlsx_text(&a).unwrap().text, "# Data\n\t\t\t\tonly\n");
+        // No shared strings at all: the same.
+        let a = xlsx(
+            true,
+            None,
+            &[(
+                "xl/worksheets/sheet1.xml",
+                sheet("<row><c t=\"s\"><v>0</v></c></row>"),
+            )],
+        );
+        assert_eq!(xlsx_text(&a).unwrap().text, "# Data\n\n");
+    }
+
+    #[test]
+    fn three_million_empty_shared_strings_are_ranges_only() {
+        let xml = format!(
+            "<sst><si><t>first</t></si>{}</sst>",
+            "<si/>".repeat(3_000_000)
+        );
+        let s = shared_strings(xml.as_bytes()).unwrap();
+        assert_eq!(s.ranges.len(), MAX_SHARED);
+        assert!(s.ranges.capacity() <= 2 * MAX_SHARED);
+        assert!(
+            s.pool.capacity() < 1_000,
+            "pool capacity {}",
+            s.pool.capacity()
+        );
+        assert_eq!(s.get(0), "first");
+        assert_eq!(s.get(1), "");
+        assert_eq!(s.get(2_000_000), "");
+        assert_eq!(s.get(usize::MAX), "");
+        // Through a workbook: entry 2,000,000 is an empty cell.
+        let a = xlsx(
+            true,
+            Some(&xml),
+            &[(
+                "xl/worksheets/sheet1.xml",
+                sheet("<row><c r=\"A1\" t=\"s\"><v>2000000</v></c><c r=\"B1\" t=\"s\"><v>0</v></c></row>"),
+            )],
+        );
+        assert_eq!(xlsx_text(&a).unwrap().text, "# Data\n\tfirst\n");
+    }
+
+    /// The text of a workbook with one sheet of `rows`.
+    fn one_sheet(rows: &str) -> String {
+        xlsx_text(&xlsx(
+            true,
+            None,
+            &[("xl/worksheets/sheet1.xml", sheet(rows))],
+        ))
+        .unwrap()
+        .text
+    }
+
+    #[test]
+    fn column_bounds() {
+        assert_eq!(
+            one_sheet("<row r=\"1\"><c r=\"XFD1\" t=\"str\"><v>last</v></c></row>"),
+            format!("# Data\n{}last\n", "\t".repeat(16_383))
+        );
+        assert_eq!(
+            one_sheet(
+                "<row r=\"1\"><c r=\"XFE1\"><v>1</v></c><c r=\"AAAAAAAAAAAAA7\"><v>2</v></c>\
+                 <c r=\"ZZZZ1\"><v>3</v></c><c r=\"7\"><v>4</v></c><c r=\"B1\"><v>5</v></c></row>"
+            ),
+            "# Data\n\t5\n"
+        );
+        // Lower case letters, and cells out of order: each later cell takes
+        // the next column at least.
+        assert_eq!(
+            one_sheet("<row><c r=\"c1\"><v>c</v></c><c r=\"A1\"><v>a</v></c><c><v>n</v></c></row>"),
+            "# Data\n\t\tc\ta\tn\n"
+        );
+    }
+
+    #[test]
+    fn row_bounds() {
+        let t = one_sheet(
+            "<row r=\"1\"><c><v>a</v></c></row><row r=\"4294967295\"><c><v>b</v></c></row>\
+             <row r=\"99999999999999999999999999\"><c><v>c</v></c></row>",
+        );
+        let empty = 1_048_576 - 2;
+        assert_eq!(t, format!("# Data\na\n{}b\nc\n", "\n".repeat(empty)));
+        // A row not above the previous one gives no gap; a row without a
+        // number follows the previous one.
+        assert_eq!(
+            one_sheet(
+                "<row r=\"5\"><c><v>5</v></c></row><row r=\"3\"><c><v>3</v></c></row>\
+                 <row><c><v>n</v></c></row><row r=\"x\"/><row r=\"6\"/>"
+            ),
+            "# Data\n\n\n\n\n5\n3\nn\n\n\n"
+        );
+    }
+
+    /// Checks of a hostile workbook read with a limit of 1,000,000 bytes.
+    fn bounded(a: &[u8]) {
+        let started = Instant::now();
+        let c = xlsx_text_limited(a, 1_000_000).unwrap();
+        assert!(c.cut);
+        assert!(c.text.len() <= 1_000_000);
+        assert!(
+            c.text.capacity() <= 2_000_000,
+            "capacity {}",
+            c.text.capacity()
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn many_rows_at_the_last_column_stop_at_the_limit() {
+        let rows: String = (1..=100_000)
+            .map(|r| format!("<row r=\"{r}\"><c r=\"XFD{r}\"><v>1</v></c></row>"))
+            .collect();
+        bounded(&xlsx(
+            true,
+            None,
+            &[("xl/worksheets/sheet1.xml", sheet(&rows))],
+        ));
+    }
+
+    #[test]
+    fn the_last_row_in_many_sheets_stops_at_the_limit() {
+        let names: Vec<String> = (1..=20)
+            .map(|n| format!("xl/worksheets/sheet{n}.xml"))
+            .collect();
+        let s = sheet("<row r=\"1048576\"><c><v>1</v></c></row>");
+        let sheets: Vec<(&str, String)> = names.iter().map(|n| (n.as_str(), s.clone())).collect();
+        bounded(&xlsx(false, None, &sheets));
+    }
+
+    #[test]
+    fn many_references_to_one_large_shared_string_stop_at_the_limit() {
+        let shared = format!("<sst><si><t>{}</t></si></sst>", "s".repeat(100_000));
+        let rows: String = (1..=100_000)
+            .map(|r| format!("<row r=\"{r}\"><c r=\"A{r}\" t=\"s\"><v>0</v></c></row>"))
+            .collect();
+        bounded(&xlsx(
+            true,
+            Some(&shared),
+            &[("xl/worksheets/sheet1.xml", sheet(&rows))],
+        ));
+    }
+
+    #[test]
+    fn failures() {
+        assert_eq!(xlsx_text(b"not an archive"), Err(()));
+        let a = xlsx(
+            true,
+            None,
+            &[(
+                "xl/worksheets/sheet1.xml",
+                "<!DOCTYPE x><worksheet/>".into(),
+            )],
+        );
+        assert_eq!(xlsx_text(&a), Err(()));
+        // A workbook without sheets has no text.
+        assert_eq!(
+            xlsx_text(&xlsx(false, None, &[])),
+            Ok(Cut {
+                text: String::new(),
+                cut: false
+            })
+        );
     }
 }
