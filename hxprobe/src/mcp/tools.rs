@@ -1064,6 +1064,47 @@ fn capped(s: Option<&str>) -> Value {
     s.map_or(Value::Null, |s| Value::String(cap(s, MAX_FIELD).0))
 }
 
+/// Longest display name in an error text, in chars.
+const MAX_ERROR_NAME: usize = 80;
+
+/// How an error text names an attachment: `attachment "<display name>"
+/// (<guid>)`, the name on one line and cut at [`MAX_ERROR_NAME`] chars, or
+/// `attachment <guid>` without one. Never the stored file name.
+fn att_label(rec: &AttachmentRecord) -> String {
+    let name: String = rec
+        .display_name
+        .as_deref()
+        .unwrap_or_default()
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .take(MAX_ERROR_NAME)
+        .collect();
+    if name.trim().is_empty() {
+        format!("attachment {}", rec.guid)
+    } else {
+        format!("attachment \"{name}\" ({})", rec.guid)
+    }
+}
+
+/// The error text of a file that is not opened; `att` from [`att_label`].
+fn refused_text(r: attach::Refused, att: &str, cache: &Cache) -> String {
+    match r {
+        attach::Refused::NotOnThisMac => format!(
+            "the file of {att} is not on this Mac: Outlook has not downloaded it, or has \
+             removed it. Open the message in Outlook so that the attachment is downloaded, call \
+             refresh, then call again. This server cannot download it."
+        ),
+        attach::Refused::Outside => format!(
+            "the store names a file outside the attachment folder for {att}; it is not read"
+        ),
+        attach::Refused::NotRegular => {
+            format!("the file of {att} is not a regular file; it is not read")
+        }
+        attach::Refused::Denied => cache.denied_here(attach::ATTACHMENTS_DENIED),
+        attach::Refused::Io(kind) => format!("the file of {att} could not be read: {kind}"),
+    }
+}
+
 /// `get_attachment`: the content of one attachment file, read at call time
 /// from the attachment folder of the profile.
 fn get_attachment(cache: &mut Cache, now: i64, args: &Args) -> Result<Output, ToolError> {
@@ -1075,21 +1116,25 @@ fn get_attachment(cache: &mut Cache, now: i64, args: &Args) -> Result<Output, To
         attachment_record(conn, &a.guid)?
     }
     .ok_or_else(|| failed("no attachment has that guid"))?;
+    let att = att_label(&rec);
     let profile = cache.profile_dir().map_err(ToolError::Failed)?;
     let stored = rec.filename.as_deref().unwrap_or_default();
-    let (mut file, len) = attach::open(&profile, stored).map_err(|_| {
-        failed(format!(
-            "the file of attachment {} could not be opened",
-            rec.guid
-        ))
-    })?;
-    let read_failed = |e: std::io::Error| {
-        failed(format!(
-            "the file of attachment {} could not be read: {}",
-            rec.guid,
-            e.kind()
-        ))
+    // An empty name names no file: Outlook has not downloaded it.
+    let opened = if stored.is_empty() {
+        Err(attach::Refused::NotOnThisMac)
+    } else {
+        attach::open(&profile, stored)
     };
+    let (mut file, len) = opened.map_err(|r| failed(refused_text(r, &att, cache)))?;
+    // The size before any read.
+    if len > attach::MAX_SOURCE_BYTES {
+        return Err(failed(format!(
+            "{att} is {len} bytes, above the limit of {} bytes; nothing was sent.",
+            attach::MAX_SOURCE_BYTES
+        )));
+    }
+    let read_failed =
+        |e: std::io::Error| failed(format!("the file of {att} could not be read: {}", e.kind()));
     let head = attach::read_head(&mut file, attach::HEAD_BYTES).map_err(read_failed)?;
     let name = attach::own_name(stored);
     let extension = name.rsplit_once('.').map(|(_, e)| e);
@@ -1431,10 +1476,18 @@ mod tests {
         assert_eq!(s["messages"], 4);
     }
 
+    /// The attachment record of [`served`], with its file.
+    const SERVED_ATT: u8 = 0x7f;
+
     /// A fixture whose `mail.db` was built by another cache and whose cache
-    /// asks `fake` instead of building.
+    /// asks `fake` instead of building. It also has the text attachment
+    /// [`SERVED_ATT`] with its file.
     fn served(fake: &FakeRefresher) -> Fixture {
-        let mut f = fixture();
+        let name = stored("served[1].txt");
+        let mut f = attachment_fixture(
+            &[att(SERVED_ATT, &name, "text/plain", 11)],
+            &[("served[1].txt", b"served text")],
+        );
         f.cache = Cache::new(&f.dir.join("cache"), &f.dir.join("HxStore.hxd"))
             .unwrap()
             .with_refresher(Box::new(fake.clone()));
@@ -1498,6 +1551,7 @@ mod tests {
             ("search_messages", json!({"query": "zebra"})),
             ("get_message", json!({"guid": msg(0)})),
             ("list_attachments", json!({"message_guid": msg(0)})),
+            ("get_attachment", json!({"guid": att_guid(SERVED_ATT)})),
             ("search_people", json!({"query": "a"})),
             ("list_events", json!({"since": "2020-01-01"})),
         ]
@@ -2183,6 +2237,294 @@ mod tests {
                 "bytes that are not valid UTF-8 were replaced; the file may use another encoding"
             ])
         );
+    }
+
+    impl Fixture {
+        /// A failed `get_attachment`; the rule "no path" is checked on its
+        /// text.
+        fn attachment_err(&mut self, args: Value) -> String {
+            match self.output(args) {
+                Err(ToolError::Failed(e)) => {
+                    no_path(&e, &self.dir);
+                    e
+                }
+                other => panic!("get_attachment: expected a failure, got {other:?}"),
+            }
+        }
+    }
+
+    /// `<att>` of an error text for the record `[b; 16]` made by [`att`].
+    fn named(b: u8) -> String {
+        format!("attachment \"Shared notes\" ({})", att_guid(b))
+    }
+
+    /// The error text for an attachment whose file is not there.
+    fn not_here(att: &str) -> String {
+        format!(
+            "the file of {att} is not on this Mac: Outlook has not downloaded it, or has removed \
+             it. Open the message in Outlook so that the attachment is downloaded, call refresh, \
+             then call again. This server cannot download it."
+        )
+    }
+
+    fn is_root() -> bool {
+        // SAFETY: geteuid() has no preconditions and cannot fail.
+        unsafe { libc::geteuid() == 0 }
+    }
+
+    /// Sets the mode of a directory and gives it mode 0700 back on drop,
+    /// also when the test fails, so the temp dir can be removed.
+    struct Locked(PathBuf);
+
+    impl Locked {
+        fn new(dir: &std::path::Path, mode: u32) -> Locked {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode)).unwrap();
+            Locked(dir.to_path_buf())
+        }
+    }
+
+    impl Drop for Locked {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+
+    #[test]
+    fn get_attachment_checks_arguments_first() {
+        // The record's file is missing: every argument error below comes
+        // before any file access.
+        let name = stored("gone[1].txt");
+        let mut f = attachment_fixture(&[att(0x80, &name, "text/plain", 3)], &[]);
+        let g = att_guid(0x80);
+        for bad in ["xyz", "", &"AB".repeat(16), &format!("{g}0")] {
+            assert_eq!(
+                f.attachment_err(json!({ "guid": bad })),
+                "argument guid must be 32 lowercase hex characters"
+            );
+        }
+        assert_eq!(
+            f.attachment_err(json!({"guid": "ab".repeat(16)})),
+            "no attachment has that guid"
+        );
+        let cases = [
+            (
+                json!({"format": "pdf"}),
+                "argument format must be \"auto\" or \"text\"",
+            ),
+            (
+                json!({"max_chars": 0}),
+                "argument max_chars must be 1 to 80000",
+            ),
+            (
+                json!({"max_chars": 80_001}),
+                "argument max_chars must be 1 to 80000",
+            ),
+            (
+                json!({"offset": -1}),
+                "argument offset must be 0 to 30000000",
+            ),
+            (
+                json!({"offset": 30_000_001}),
+                "argument offset must be 0 to 30000000",
+            ),
+            (
+                json!({"max_bytes": 0}),
+                "argument max_bytes must be 1 to 10000000",
+            ),
+            (
+                json!({"max_bytes": 10_000_001}),
+                "argument max_bytes must be 1 to 10000000",
+            ),
+            (json!({"color": "red"}), "unknown argument \"color\""),
+        ];
+        for (mut args, want) in cases {
+            args["guid"] = json!(g);
+            assert_eq!(f.attachment_err(args.clone()), want, "{args}");
+        }
+        // Unlike the list tools, 100001 is a good offset; the file is next.
+        assert_eq!(
+            f.attachment_err(json!({"guid": g, "offset": 100_001})),
+            not_here(&named(0x80))
+        );
+
+        let mut f = fixture_of(mail_store_without_calendar());
+        assert_eq!(
+            f.attachment_err(json!({ "guid": g })),
+            "no attachment has that guid"
+        );
+    }
+
+    #[test]
+    fn get_attachment_file_errors() {
+        let (missing, link) = (stored("gone[1].txt"), stored("link[2].txt"));
+        let mut unset = att(0x82, "", "text/plain", 3);
+        unset.filename = None;
+        let mut f = attachment_fixture(
+            &[
+                att(0x81, &missing, "text/plain", 3),
+                unset,
+                att(0x83, "", "text/plain", 3),
+                att(0x84, "report.pdf", "text/plain", 3),
+                att(0x85, "~/Files/../../x", "text/plain", 3),
+                att(0x86, "/etc/hosts", "text/plain", 3),
+                att(0x87, &link, "text/plain", 3),
+            ],
+            &[("real[3].txt", b"abc")],
+        );
+        let folder = f.dir.join(ATT_DIR);
+        std::os::unix::fs::symlink(folder.join("real[3].txt"), folder.join("link[2].txt")).unwrap();
+        for b in [0x81, 0x82, 0x83] {
+            assert_eq!(
+                f.attachment_err(json!({"guid": att_guid(b)})),
+                not_here(&named(b))
+            );
+        }
+        for b in [0x84, 0x85, 0x86] {
+            assert_eq!(
+                f.attachment_err(json!({"guid": att_guid(b)})),
+                format!(
+                    "the store names a file outside the attachment folder for {}; it is not read",
+                    named(b)
+                )
+            );
+        }
+        assert_eq!(
+            f.attachment_err(json!({"guid": att_guid(0x87)})),
+            format!(
+                "the file of {} is not a regular file; it is not read",
+                named(0x87)
+            )
+        );
+    }
+
+    #[test]
+    fn get_attachment_of_a_denied_folder_names_the_remedy() {
+        if is_root() {
+            return;
+        }
+        let name = stored("notes[1].txt");
+        let mut f = attachment_fixture(
+            &[att(0x88, &name, "text/plain", 3)],
+            &[("notes[1].txt", b"abc")],
+        );
+        let _l = Locked::new(&f.dir.join("Files"), 0o000);
+        let e = f.attachment_err(json!({"guid": att_guid(0x88)}));
+        assert_eq!(e, f.cache.denied_here(attach::ATTACHMENTS_DENIED));
+        assert!(
+            e.starts_with("this server cannot read the store: permission denied"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn get_attachment_refuses_a_file_above_the_source_limit_unread() {
+        let name = stored("huge[1].txt");
+        let mut f = attachment_fixture(
+            &[att(0x89, &name, "text/plain", 5)],
+            &[("huge[1].txt", b"start")],
+        );
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(f.dir.join(ATT_DIR).join("huge[1].txt"))
+            .unwrap()
+            .set_len(attach::MAX_SOURCE_BYTES + 1)
+            .unwrap();
+        attach::bytes_read_reset();
+        let e = f.attachment_err(json!({"guid": att_guid(0x89)}));
+        assert_eq!(attach::bytes_read(), 0);
+        assert_eq!(
+            e,
+            format!(
+                "{} is 30000001 bytes, above the limit of 30000000 bytes; nothing was sent.",
+                named(0x89)
+            )
+        );
+    }
+
+    #[test]
+    fn get_attachment_names_the_attachment_on_one_line() {
+        let long = format!("first line\nsecond {}", "x".repeat(200));
+        let name = stored("gone[1].txt");
+        let mut a = att(0x8a, &name, "text/plain", 3);
+        a.display_name = Some(&long);
+        let mut b = att(0x8b, &name, "text/plain", 3);
+        b.display_name = None;
+        let mut f = attachment_fixture(&[a, b], &[]);
+        let e = f.attachment_err(json!({"guid": att_guid(0x8a)}));
+        let shown: String = "first line second "
+            .chars()
+            .chain(std::iter::repeat('x'))
+            .take(80)
+            .collect();
+        assert_eq!(
+            e,
+            not_here(&format!("attachment \"{shown}\" ({})", att_guid(0x8a)))
+        );
+        assert!(!e.contains('\n'), "{e}");
+        assert_eq!(
+            f.attachment_err(json!({"guid": att_guid(0x8b)})),
+            not_here(&format!("attachment {}", att_guid(0x8b)))
+        );
+    }
+
+    #[test]
+    fn get_attachment_with_an_unresolved_profile_names_the_remedy() {
+        if is_root() {
+            return;
+        }
+        /// Removes the test directory on drop.
+        struct Gone(PathBuf);
+        impl Drop for Gone {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        // Canonical first: the database records the canonical store path,
+        // while a cache made under mode 000 only makes the path absolute.
+        let base = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("hxprobe-tools-unresolved-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let gone = Gone(base.clone());
+        let profile = base.join("profile");
+        std::fs::create_dir_all(profile.join(ATT_DIR)).unwrap();
+        std::fs::write(profile.join(ATT_DIR).join("notes[1].txt"), b"abc").unwrap();
+        let store = profile.join("HxStore.hxd");
+        let name = stored("notes[1].txt");
+        std::fs::write(
+            &store,
+            mail_store_with_attachments(&[att(0x8c, &name, "text/plain", 3)]),
+        )
+        .unwrap();
+        let cache_dir = base.join("cache");
+        Cache::new(&cache_dir, &store)
+            .unwrap()
+            .connection_at(NOW_I)
+            .unwrap();
+
+        let _l = Locked::new(&profile, 0o000);
+        let fake = FakeRefresher::new(Ok(fake_status(Some(NOW_I))));
+        let mut cache = Cache::new(&cache_dir, &store)
+            .unwrap()
+            .with_refresher(Box::new(fake.clone()));
+        let v = call(
+            &mut cache,
+            NOW_I,
+            "list_attachments",
+            &json!({"message_guid": msg(1)}),
+        )
+        .unwrap();
+        assert_eq!(v["items"][0]["guid"], att_guid(0x8c));
+        let args = json!({"guid": att_guid(0x8c)});
+        match call_output(&mut cache, NOW_I, "get_attachment", &args) {
+            Err(ToolError::Failed(e)) => {
+                assert_eq!(e, cache.denied_here(attach::ATTACHMENTS_DENIED));
+                no_path(&e, &gone.0);
+            }
+            other => panic!("expected the denial, got {other:?}"),
+        }
     }
 
     // --- arguments ---

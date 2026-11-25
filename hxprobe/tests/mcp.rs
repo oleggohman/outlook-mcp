@@ -515,3 +515,228 @@ fn mcp_with_no_service_runs_without_a_service() {
         cmd.env_remove("HXPROBE_SERVICE");
     });
 }
+
+/// A property value of [`typed_item`].
+enum Prop<'a> {
+    Text(&'a str),
+    Int(i64),
+    /// A reference to the object `guid` of type `type_id`.
+    Ref(u16, [u8; 16]),
+}
+
+/// A `u32 size` prefix and an object of the schema type `type_name` with
+/// `guid` and `values`, laid out as the store lays out objects: text of data
+/// type 7 as UTF-16LE in heap B, other text as UTF-8 in heap A, integers and
+/// references in the fixed part.
+fn typed_item(type_name: &str, guid: [u8; 16], values: &[(&str, Prop)]) -> Vec<u8> {
+    let t = hxprobe::props_gen::TYPES
+        .iter()
+        .find(|t| t.name == type_name)
+        .unwrap();
+    let mut item = vec![0u8; t.fixed_len as usize];
+    let (mut heap_a, mut heap_b) = (Vec::new(), Vec::new());
+    for (name, v) in values {
+        let p = t.props.iter().find(|p| p.name == *name).unwrap();
+        let at = p.offset as usize;
+        match v {
+            Prop::Text(s) => {
+                let (heap, data, flag) = if p.dt == 7 {
+                    let d: Vec<u8> = s.encode_utf16().flat_map(u16::to_le_bytes).collect();
+                    (&mut heap_b, d, 0x8000_0000u32)
+                } else {
+                    (&mut heap_a, s.as_bytes().to_vec(), 0)
+                };
+                item[at..at + 4].copy_from_slice(&(heap.len() as u32).to_le_bytes());
+                item[at + 4..at + 8].copy_from_slice(&(data.len() as u32 | flag).to_le_bytes());
+                heap.extend_from_slice(&data);
+            }
+            Prop::Int(i) => {
+                let size = usize::from(p.size);
+                item[at..at + size].copy_from_slice(&i.to_le_bytes()[..size]);
+            }
+            Prop::Ref(type_id, g) => {
+                item[at..at + 2].copy_from_slice(&1u16.to_le_bytes());
+                item[at + 2..at + 4].copy_from_slice(&type_id.to_le_bytes());
+                item[at + 4..at + 20].copy_from_slice(g);
+            }
+        }
+    }
+    if !heap_a.is_empty() {
+        item[0x68..0x6c].copy_from_slice(&(heap_a.len() as u32).to_le_bytes());
+    }
+    let fixed_len = item.len() as u16;
+    item.extend_from_slice(&heap_a);
+    item.extend_from_slice(&heap_b);
+    let size = item.len() as u32;
+    item[0..2].copy_from_slice(&5u16.to_le_bytes());
+    item[2..4].copy_from_slice(&fixed_len.to_le_bytes());
+    item[4..8].copy_from_slice(&size.to_le_bytes());
+    item[10..12].copy_from_slice(&t.type_id.to_le_bytes());
+    item[12..28].copy_from_slice(&guid);
+    let mut out = size.to_le_bytes().to_vec();
+    out.extend_from_slice(&item);
+    out
+}
+
+/// A block of page `page` holding `value` as one literal-only LZ4 sequence.
+fn block(page: u64, value: &[u8]) -> Vec<u8> {
+    use hxprobe::block::{crc32, HEADER, MAGIC};
+    let mut payload = vec![(value.len().min(15) as u8) << 4];
+    if value.len() >= 15 {
+        let mut rest = value.len() - 15;
+        while rest >= 255 {
+            payload.push(0xff);
+            rest -= 255;
+        }
+        payload.push(rest as u8);
+    }
+    payload.extend_from_slice(value);
+    let key = page.to_le_bytes();
+    let mut b = vec![0u8; HEADER];
+    b[0x08..0x10].copy_from_slice(&MAGIC.to_le_bytes());
+    b[0x10..0x14].copy_from_slice(&(key.len() as u32).to_le_bytes());
+    b[0x14..0x18].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+    b[0x18..0x1c].copy_from_slice(&(value.len() as u32).to_le_bytes());
+    b[0x1c..0x20].copy_from_slice(&4u32.to_le_bytes());
+    b.extend_from_slice(&key);
+    b.extend_from_slice(&payload);
+    let body = crc32(&b[0x08..]);
+    b[0x04..0x08].copy_from_slice(&body.to_le_bytes());
+    let head = crc32(&b[0x04..HEADER]);
+    b[0x00..0x04].copy_from_slice(&head.to_le_bytes());
+    b
+}
+
+/// A store of `items`, one block per item on pages 1, 2, ...
+fn store_of(items: &[Vec<u8>]) -> Vec<u8> {
+    let mut s = empty_store();
+    for (i, it) in items.iter().enumerate() {
+        s.extend_from_slice(&block(i as u64 + 1, it));
+        s.resize(s.len().next_multiple_of(512), 0);
+    }
+    s
+}
+
+/// The folder of attachment files inside a profile directory.
+const ATT_DIR: &str = "Files/S0/3/Attachments/0";
+/// The message the attachments of [`attachment_store`] belong to.
+const ATT_MESSAGE: [u8; 16] = [0x21; 16];
+
+/// A store with one downloaded attachment record per `(guid, file name,
+/// display name, content type, size)`, each of [`ATT_MESSAGE`], named
+/// `~/Files/S0/3/Attachments/0/<file name>`.
+fn attachment_store(atts: &[([u8; 16], &str, &str, &str, usize)]) -> Vec<u8> {
+    let items: Vec<Vec<u8>> = atts
+        .iter()
+        .map(|(guid, file, name, ct, size)| {
+            let stored = format!("~/{ATT_DIR}/{file}");
+            typed_item(
+                "AttachmentHeader",
+                *guid,
+                &[
+                    ("Filename", Prop::Text(&stored)),
+                    ("DisplayName", Prop::Text(name)),
+                    ("ContentType", Prop::Text(ct)),
+                    ("Size", Prop::Int(*size as i64)),
+                    ("InlineStatus", Prop::Int(0)),
+                    ("DownloadStatus", Prop::Int(2)),
+                    ("MessageHeader", Prop::Ref(0xc9, ATT_MESSAGE)),
+                ],
+            )
+        })
+        .collect();
+    store_of(&items)
+}
+
+/// Lowercase hex of a guid.
+fn hex(g: &[u8; 16]) -> String {
+    g.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// `text` shows no directory of the test (`dir` as given or canonical),
+/// no part of a stored file name and no `file:` address.
+fn assert_no_path(text: &str, dir: &Path) {
+    let real = std::fs::canonicalize(dir).unwrap();
+    for bad in [
+        dir.to_string_lossy().as_ref(),
+        real.to_string_lossy().as_ref(),
+        "Files/",
+        "~/",
+        "file:",
+    ] {
+        assert!(!text.contains(bad), "{bad:?} in {text}");
+    }
+}
+
+#[test]
+fn mcp_reads_a_text_attachment() {
+    let d = Dir::new("attachment");
+    let content = "Quarterly budget figures\r\nsecond line\n";
+    let guid = [0x91; 16];
+    std::fs::write(
+        d.path("HxStore.hxd"),
+        attachment_store(&[(
+            guid,
+            "notes[1].txt",
+            "Budget notes",
+            "text/plain",
+            content.len(),
+        )]),
+    )
+    .unwrap();
+    std::fs::create_dir_all(d.path(ATT_DIR)).unwrap();
+    std::fs::write(d.path(ATT_DIR).join("notes[1].txt"), content).unwrap();
+
+    let mut input = request(
+        1,
+        "initialize",
+        json!({"protocolVersion": "2025-06-18", "capabilities": {},
+               "clientInfo": {"name": "test", "version": "0"}}),
+    );
+    input += "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n";
+    input += &request(
+        2,
+        "tools/call",
+        json!({"name": "list_attachments", "arguments": {"message_guid": hex(&ATT_MESSAGE)}}),
+    );
+    input += &request(
+        3,
+        "tools/call",
+        json!({"name": "get_attachment", "arguments": {"guid": hex(&guid)}}),
+    );
+    let store = d.path("HxStore.hxd");
+    let cache = d.path("cache");
+    let (status, out, err) = mcp(
+        &[
+            Path::new("--store"),
+            &store,
+            Path::new("--cache-dir"),
+            &cache,
+        ],
+        &[("HOME", &d.0)],
+        input.as_bytes(),
+    );
+    assert_eq!(status.code(), Some(0), "stderr: {err}");
+    let lines = responses(&out);
+    assert_eq!(lines.len(), 3, "{out}");
+
+    let list = tool_result(&lines[1]);
+    assert_eq!(list["total"], 1, "{list}");
+    assert_eq!(list["items"][0]["guid"], hex(&guid));
+    assert_eq!(list["items"][0]["filename"], "notes[1].txt");
+
+    let content_items = lines[2]["result"]["content"].as_array().unwrap();
+    assert_eq!(content_items.len(), 1, "{}", lines[2]);
+    assert_eq!(content_items[0]["type"], "text");
+    let v = tool_result(&lines[2]);
+    assert_eq!(v["kind"], "text");
+    assert_eq!(v["text"], content.replace('\r', ""));
+    assert_eq!(v["filename"], "notes[1].txt");
+    assert_eq!(v["file_size"], content.len());
+
+    assert_no_path(&out, &d.0);
+    let err = err.to_lowercase();
+    for word in ["notes[1]", "quarterly", "budget", "figures", "second line"] {
+        assert!(!err.contains(word), "{word:?} in stderr: {err}");
+    }
+}
