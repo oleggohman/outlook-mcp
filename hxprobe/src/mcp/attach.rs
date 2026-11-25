@@ -12,6 +12,20 @@ use std::io::{ErrorKind, Read, Seek, SeekFrom};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
+/// Largest file the server reads at all, in bytes.
+pub const MAX_SOURCE_BYTES: u64 = 30_000_000;
+/// Default of `max_bytes`, the largest file sent as bytes (provisional; the
+/// hand check of the clients decides).
+pub const DEFAULT_SEND_BYTES: i64 = 250_000;
+/// Largest value of `max_bytes`.
+pub const MAX_SEND_BYTES: i64 = 10_000_000;
+/// Largest image sent, whatever `max_bytes` says.
+pub const MAX_IMAGE_BYTES: i64 = 3_750_000;
+/// Largest `offset` into the text of a file, in characters.
+pub const MAX_TEXT_OFFSET: i64 = 30_000_000;
+/// Bytes from the start of a file that decide its kind.
+pub const HEAD_BYTES: usize = 8_192;
+
 /// The cause given to `Cache::denied_here` when the attachment folder, a
 /// file in it, or the store's directory cannot be read.
 pub const ATTACHMENTS_DENIED: &str =
@@ -135,6 +149,218 @@ pub fn read_head(file: &mut File, max: usize) -> std::io::Result<Vec<u8>> {
 /// The part of a stored file name after the last `/`.
 pub fn own_name(filename: &str) -> &str {
     filename.rsplit('/').next().unwrap_or(filename)
+}
+
+/// What a file is, as far as what is sent depends on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    Text,
+    Html,
+    /// An image both clients show, with its media type.
+    Image(&'static str),
+    Pdf,
+    /// A ZIP archive; it may be a Word, Excel or PowerPoint file.
+    Zip,
+    File,
+}
+
+/// The kind of a file from its first bytes (`head`, at most
+/// [`HEAD_BYTES`] are looked at), the extension of the stored name and the
+/// stored content type. A signature always wins; the extension and the
+/// content type only select text, and only when no NUL byte is in the head.
+pub fn classify(head: &[u8], extension: Option<&str>, content_type: Option<&str>) -> Kind {
+    if let Some(mime) = image_type(head) {
+        return Kind::Image(mime);
+    }
+    if head.starts_with(b"%PDF-") {
+        return Kind::Pdf;
+    }
+    if head.starts_with(b"PK\x03\x04") {
+        return Kind::Zip;
+    }
+    if head[..head.len().min(HEAD_BYTES)].contains(&0) {
+        return Kind::File;
+    }
+    let ext = extension.map(str::to_ascii_lowercase);
+    let ext = ext.as_deref();
+    // The media type without its parameters.
+    let ct = content_type.map(|c| {
+        c.split(';')
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+    });
+    let ct = ct.as_deref();
+    if matches!(ext, Some("html" | "htm")) || ct == Some("text/html") {
+        return Kind::Html;
+    }
+    let text_ext = matches!(
+        ext,
+        Some(
+            "txt"
+                | "csv"
+                | "tsv"
+                | "log"
+                | "md"
+                | "json"
+                | "xml"
+                | "ics"
+                | "vcf"
+                | "eml"
+                | "yaml"
+                | "yml"
+        )
+    );
+    let text_ct = ct.is_some_and(|c| {
+        c.starts_with("text/")
+            || matches!(c, "application/json" | "application/xml" | "message/rfc822")
+    });
+    if text_ext || text_ct {
+        Kind::Text
+    } else {
+        Kind::File
+    }
+}
+
+/// The media type of an image both clients show, from its first bytes.
+fn image_type(head: &[u8]) -> Option<&'static str> {
+    if head.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if head.starts_with(b"\xff\xd8\xff") {
+        Some("image/jpeg")
+    } else if head.starts_with(b"GIF87a") || head.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if head.len() >= 12 && head.starts_with(b"RIFF") && &head[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else {
+        None
+    }
+}
+
+/// Media type of a file without a signature, by extension.
+pub fn media_type(extension: Option<&str>) -> &'static str {
+    let ext = extension.map(str::to_ascii_lowercase);
+    match ext.as_deref() {
+        Some("doc") => "application/msword",
+        Some("xls") => "application/vnd.ms-excel",
+        Some("ppt") => "application/vnd.ms-powerpoint",
+        Some("rtf") => "application/rtf",
+        Some("msg") => "application/vnd.ms-outlook",
+        Some("zip") => "application/zip",
+        Some("7z") => "application/x-7z-compressed",
+        Some("gz") => "application/gzip",
+        Some("tif" | "tiff") => "image/tiff",
+        Some("bmp") => "image/bmp",
+        Some("heic") => "image/heic",
+        Some("svg") => "image/svg+xml",
+        Some("mp3") => "audio/mpeg",
+        Some("wav") => "audio/wav",
+        Some("mp4") => "video/mp4",
+        Some("mov") => "video/quicktime",
+        _ => "application/octet-stream",
+    }
+}
+
+/// Text of a text file: by byte order mark (UTF-8, UTF-16LE, UTF-16BE),
+/// else UTF-8; invalid bytes are replaced. The flag says whether any were.
+pub fn decode_text(bytes: &[u8]) -> (String, bool) {
+    if let Some(rest) = bytes.strip_prefix(b"\xef\xbb\xbf") {
+        return utf8(rest);
+    }
+    if let Some(rest) = bytes.strip_prefix(b"\xff\xfe") {
+        return utf16(rest, u16::from_le_bytes);
+    }
+    if let Some(rest) = bytes.strip_prefix(b"\xfe\xff") {
+        return utf16(rest, u16::from_be_bytes);
+    }
+    utf8(bytes)
+}
+
+/// `bytes` as UTF-8, invalid bytes replaced; whether any were.
+fn utf8(bytes: &[u8]) -> (String, bool) {
+    match std::str::from_utf8(bytes) {
+        Ok(s) => (s.to_string(), false),
+        Err(_) => (String::from_utf8_lossy(bytes).into_owned(), true),
+    }
+}
+
+/// `bytes` as UTF-16 units made by `unit`; a lone surrogate and an odd last
+/// byte are replaced. Whether anything was.
+fn utf16(bytes: &[u8], unit: fn([u8; 2]) -> u16) -> (String, bool) {
+    let units = bytes.as_chunks::<2>().0.iter().map(|c| unit(*c));
+    let mut replaced = false;
+    let mut out: String = char::decode_utf16(units)
+        .map(|r| {
+            r.unwrap_or_else(|_| {
+                replaced = true;
+                char::REPLACEMENT_CHARACTER
+            })
+        })
+        .collect();
+    if bytes.len() % 2 == 1 {
+        out.push(char::REPLACEMENT_CHARACTER);
+        replaced = true;
+    }
+    (out, replaced)
+}
+
+/// `text` without control characters other than `\n` and `\t` (so `\r\n`
+/// becomes `\n`), as [`crate::mcp::text::cap`] drops them.
+pub fn clean(text: &str) -> String {
+    text.chars()
+        .filter(|&c| !c.is_control() || c == '\n' || c == '\t')
+        .collect()
+}
+
+/// One page of the cleaned text of a file. All counts are in characters of
+/// the cleaned text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Page {
+    pub text: String,
+    pub total_chars: usize,
+    /// Whether characters after this page exist.
+    pub truncated: bool,
+    /// Where the next page starts, when there is one.
+    pub next_offset: Option<usize>,
+}
+
+/// `max_chars` characters of the cleaned `text` after `offset`; counting,
+/// skipping and cutting all on `clean(text)`.
+pub fn page(text: &str, offset: usize, max_chars: usize) -> Page {
+    let cleaned = clean(text);
+    let total_chars = cleaned.chars().count();
+    let text: String = cleaned.chars().skip(offset).take(max_chars).collect();
+    let end = offset.saturating_add(text.chars().count());
+    let truncated = end < total_chars;
+    Page {
+        text,
+        total_chars,
+        truncated,
+        next_offset: truncated.then_some(end),
+    }
+}
+
+/// Standard base64 (RFC 4648) with padding.
+pub fn base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b = [
+            chunk[0],
+            chunk.get(1).copied().unwrap_or(0),
+            chunk.get(2).copied().unwrap_or(0),
+        ];
+        let n = u32::from(b[0]) << 16 | u32::from(b[1]) << 8 | u32::from(b[2]);
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(char::from(ALPHABET[(n >> (18 - 6 * i) & 63) as usize]));
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -484,5 +710,320 @@ mod tests {
         assert_eq!(own_name("a/b"), "b");
         assert_eq!(own_name("~/Files/S0/"), "");
         assert_eq!(own_name(""), "");
+    }
+
+    // --- kinds ---
+
+    #[test]
+    fn signatures_decide_the_kind() {
+        let images: [(&[u8], &str); 5] = [
+            (b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR", "image/png"),
+            (b"\xff\xd8\xff\xe0\0\x10JFIF", "image/jpeg"),
+            (b"GIF87a\x01\0\x01\0", "image/gif"),
+            (b"GIF89a\x01\0\x01\0", "image/gif"),
+            (b"RIFF\x24\0\0\0WEBPVP8 ", "image/webp"),
+        ];
+        for (head, mime) in images {
+            for (ext, ct) in [
+                (Some("txt"), Some("text/plain")),
+                (Some("pdf"), Some("application/pdf")),
+                (None, None),
+            ] {
+                assert_eq!(classify(head, ext, ct), Kind::Image(mime), "{mime} {ext:?}");
+            }
+        }
+        assert_eq!(
+            classify(b"%PDF-1.7\n", Some("txt"), Some("text/plain")),
+            Kind::Pdf
+        );
+        assert_eq!(classify(b"%PDF-", None, None), Kind::Pdf);
+        assert_eq!(
+            classify(b"PK\x03\x04\x14\0", Some("txt"), Some("text/plain")),
+            Kind::Zip
+        );
+        // Not quite a signature.
+        assert_eq!(
+            classify(b"RIFF\x24\0\0\0WAVEfmt ", Some("wav"), None),
+            Kind::File
+        );
+        assert_eq!(classify(b"%PDF", Some("bin"), None), Kind::File);
+    }
+
+    #[test]
+    fn text_kinds_come_from_the_extension_or_the_content_type() {
+        for ext in [
+            "txt", "csv", "tsv", "log", "md", "json", "xml", "ics", "vcf", "eml", "yaml", "yml",
+            "TXT", "Csv",
+        ] {
+            assert_eq!(
+                classify(b"a,b\n1,2\n", Some(ext), None),
+                Kind::Text,
+                "{ext}"
+            );
+        }
+        for ct in [
+            "text/plain",
+            "text/csv; charset=utf-8",
+            "Text/Calendar",
+            "application/json",
+            "application/xml;charset=UTF-8",
+            "message/rfc822",
+            " APPLICATION/JSON ",
+        ] {
+            assert_eq!(classify(b"hello", None, Some(ct)), Kind::Text, "{ct}");
+        }
+        for (ext, ct) in [
+            (Some("html"), None),
+            (Some("HTM"), None),
+            (None, Some("text/html; charset=utf-8")),
+            (Some("txt"), Some("TEXT/HTML")),
+            (Some("html"), Some("text/plain")),
+        ] {
+            assert_eq!(classify(b"<p>x</p>", ext, ct), Kind::Html, "{ext:?} {ct:?}");
+        }
+        // An empty file with a text extension.
+        assert_eq!(classify(b"", Some("txt"), None), Kind::Text);
+        // Text bytes under an image name are no image.
+        assert_eq!(
+            classify(b"just text", Some("png"), Some("image/png")),
+            Kind::File
+        );
+        assert_eq!(
+            classify(b"just text", Some("bin"), Some("application/octet-stream")),
+            Kind::File
+        );
+        assert_eq!(classify(b"just text", None, None), Kind::File);
+    }
+
+    #[test]
+    fn a_nul_byte_in_the_head_makes_a_file() {
+        let mut head = vec![b'a'; HEAD_BYTES];
+        head[HEAD_BYTES - 1] = 0;
+        assert_eq!(classify(&head, Some("txt"), Some("text/plain")), Kind::File);
+        assert_eq!(classify(b"<p>\0</p>", Some("html"), None), Kind::File);
+        assert_eq!(classify(b"\0", None, Some("text/plain")), Kind::File);
+        // A NUL after the head is not looked at.
+        let mut long = vec![b'a'; HEAD_BYTES + 1];
+        long[HEAD_BYTES] = 0;
+        assert_eq!(classify(&long, Some("txt"), None), Kind::Text);
+    }
+
+    #[test]
+    fn media_types_by_extension() {
+        let table = [
+            ("doc", "application/msword"),
+            ("xls", "application/vnd.ms-excel"),
+            ("ppt", "application/vnd.ms-powerpoint"),
+            ("rtf", "application/rtf"),
+            ("msg", "application/vnd.ms-outlook"),
+            ("zip", "application/zip"),
+            ("7z", "application/x-7z-compressed"),
+            ("gz", "application/gzip"),
+            ("tif", "image/tiff"),
+            ("tiff", "image/tiff"),
+            ("bmp", "image/bmp"),
+            ("heic", "image/heic"),
+            ("svg", "image/svg+xml"),
+            ("mp3", "audio/mpeg"),
+            ("wav", "audio/wav"),
+            ("mp4", "video/mp4"),
+            ("mov", "video/quicktime"),
+        ];
+        for (ext, mime) in table {
+            assert_eq!(media_type(Some(ext)), mime, "{ext}");
+            assert_eq!(media_type(Some(&ext.to_uppercase())), mime, "{ext}");
+        }
+        assert_eq!(media_type(Some("exe")), "application/octet-stream");
+        assert_eq!(media_type(Some("")), "application/octet-stream");
+        assert_eq!(media_type(None), "application/octet-stream");
+    }
+
+    // --- text ---
+
+    fn utf16le(s: &str) -> Vec<u8> {
+        s.encode_utf16().flat_map(u16::to_le_bytes).collect()
+    }
+
+    fn utf16be(s: &str) -> Vec<u8> {
+        s.encode_utf16().flat_map(u16::to_be_bytes).collect()
+    }
+
+    #[test]
+    fn text_is_decoded_by_its_byte_order_mark() {
+        let s = "Hello, שלום עולם 😀";
+        assert_eq!(decode_text(s.as_bytes()), (s.to_string(), false));
+        let mut b = b"\xef\xbb\xbf".to_vec();
+        b.extend_from_slice(s.as_bytes());
+        assert_eq!(decode_text(&b), (s.to_string(), false));
+
+        let mut le = b"\xff\xfe".to_vec();
+        le.extend(utf16le(s));
+        assert_eq!(decode_text(&le), (s.to_string(), false));
+        let mut be = b"\xfe\xff".to_vec();
+        be.extend(utf16be(s));
+        assert_eq!(decode_text(&be), (s.to_string(), false));
+
+        // An odd last byte is replaced.
+        le.push(b'x');
+        assert_eq!(decode_text(&le), (format!("{s}\u{fffd}"), true));
+        be.push(b'x');
+        assert_eq!(decode_text(&be), (format!("{s}\u{fffd}"), true));
+        // A lone surrogate is replaced.
+        let mut lone = b"\xff\xfe".to_vec();
+        lone.extend_from_slice(&[0x00, 0xd8, b'a', 0]);
+        assert_eq!(decode_text(&lone), ("\u{fffd}a".to_string(), true));
+
+        assert_eq!(decode_text(b""), (String::new(), false));
+        assert_eq!(decode_text(b"\xef\xbb\xbf"), (String::new(), false));
+        assert_eq!(decode_text(b"\xff\xfe"), (String::new(), false));
+    }
+
+    #[test]
+    fn invalid_utf8_is_replaced_and_flagged() {
+        assert_eq!(
+            decode_text(b"caf\xe9 ok"),
+            ("caf\u{fffd} ok".to_string(), true)
+        );
+        assert_eq!(
+            decode_text(b"\xef\xbb\xbfa\xffb"),
+            ("a\u{fffd}b".to_string(), true)
+        );
+    }
+
+    #[test]
+    fn clean_drops_control_characters_but_lines_and_tabs() {
+        assert_eq!(clean("a\r\nb"), "a\nb");
+        assert_eq!(clean("a\tb\nc"), "a\tb\nc");
+        assert_eq!(
+            clean("a\u{0}b\u{7}c\u{1b}[0md\u{7f}e\u{85}f\rg"),
+            "abc[0mdefg"
+        );
+        assert_eq!(clean("שלום\r\n"), "שלום\n");
+        assert_eq!(clean(""), "");
+    }
+
+    #[test]
+    fn pages_of_a_text() {
+        let text = "abcdefghij";
+        let p = page(text, 0, 4);
+        assert_eq!(
+            p,
+            Page {
+                text: "abcd".into(),
+                total_chars: 10,
+                truncated: true,
+                next_offset: Some(4)
+            }
+        );
+        let p = page(text, 4, 4);
+        assert_eq!(
+            (p.text.as_str(), p.truncated, p.next_offset),
+            ("efgh", true, Some(8))
+        );
+        let p = page(text, 8, 4);
+        assert_eq!(
+            (p.text.as_str(), p.truncated, p.next_offset),
+            ("ij", false, None)
+        );
+        // Exactly to the end.
+        let p = page(text, 6, 4);
+        assert_eq!(
+            (p.text.as_str(), p.truncated, p.next_offset),
+            ("ghij", false, None)
+        );
+        for offset in [10, 11, usize::MAX] {
+            let p = page(text, offset, 4);
+            assert_eq!(
+                p,
+                Page {
+                    text: String::new(),
+                    total_chars: 10,
+                    truncated: false,
+                    next_offset: None
+                }
+            );
+        }
+        // Characters, not bytes; counted on the cleaned text.
+        let p = page("שלום\r\nעולם", 0, 5);
+        assert_eq!(p.total_chars, 9);
+        assert_eq!(p.text, "שלום\n");
+        assert_eq!(p.next_offset, Some(5));
+        assert_eq!(page("שלום\r\nעולם", 5, 100).text, "עולם");
+        assert_eq!(page("", 0, 5).total_chars, 0);
+    }
+
+    /// The pages of `text` read one after the other with `max_chars`.
+    fn read_all(text: &str, max_chars: usize) -> (String, usize, usize) {
+        let mut out = String::new();
+        let mut offset = 0;
+        let mut pages = 0;
+        loop {
+            let p = page(text, offset, max_chars);
+            assert!(p.text.chars().count() <= max_chars);
+            out.push_str(&p.text);
+            pages += 1;
+            match p.next_offset {
+                Some(n) => {
+                    assert!(p.truncated);
+                    assert_eq!(n, offset + p.text.chars().count());
+                    offset = n;
+                }
+                None => {
+                    assert!(!p.truncated);
+                    return (out, p.total_chars, pages);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn reading_page_by_page_gives_the_whole_cleaned_text() {
+        let plain: String = (0..50).map(|i| format!("line {i} שלום\n")).collect();
+        let (all, total, pages) = read_all(&plain, 7);
+        assert_eq!(all, plain);
+        assert_eq!(total, plain.chars().count());
+        assert_eq!(pages, total.div_ceil(7));
+
+        let crlf: String = (0..50).map(|i| format!("row {i}\r\n")).collect();
+        let want = crlf.replace("\r\n", "\n");
+        let (all, total, _) = read_all(&crlf, 7);
+        assert_eq!(all, want);
+        assert_eq!(total, want.chars().count());
+        // Every page text is what cap leaves unchanged.
+        let mut offset = 0;
+        while let Some(n) = page(&crlf, offset, 7).next_offset {
+            let p = page(&crlf, offset, 7);
+            assert_eq!(crate::mcp::text::cap(&p.text, 7).0, p.text);
+            offset = n;
+        }
+    }
+
+    // --- base64 ---
+
+    #[test]
+    fn base64_of_rfc_4648_vectors() {
+        for (input, want) in [
+            ("", ""),
+            ("f", "Zg=="),
+            ("fo", "Zm8="),
+            ("foo", "Zm9v"),
+            ("foob", "Zm9vYg=="),
+            ("fooba", "Zm9vYmE="),
+            ("foobar", "Zm9vYmFy"),
+        ] {
+            assert_eq!(base64(input.as_bytes()), want, "{input}");
+        }
+    }
+
+    #[test]
+    fn base64_of_every_byte_value() {
+        let all: Vec<u8> = (0..=255u8).collect();
+        let want = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4\
+                    OTo7PD0+P0BBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5fYGFiY2RlZmdoaWprbG1ub3Bx\
+                    cnN0dXZ3eHl6e3x9fn+AgYKDhIWGh4iJiouMjY6PkJGSk5SVlpeYmZqbnJ2en6ChoqOkpaanqKmq\
+                    q6ytrq+wsbKztLW2t7i5uru8vb6/wMHCw8TFxsfIycrLzM3Oz9DR0tPU1dbX2Nna29zd3t/g4eLj\
+                    5OXm5+jp6uvs7e7v8PHy8/T19vf4+fr7/P3+/w==";
+        assert_eq!(base64(&all), want);
+        assert_eq!(base64(&all).len(), 344);
     }
 }
