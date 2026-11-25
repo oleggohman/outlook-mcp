@@ -15,6 +15,7 @@ use serde_json::{json, Map, Value};
 
 use crate::mcp::attach;
 use crate::mcp::cache::Cache;
+use crate::mcp::office;
 use crate::mcp::text::{cap, html_to_text, integer, iso, lossy, parse_time};
 
 /// The sentence every description ends with.
@@ -1067,7 +1068,7 @@ fn kind_name(kind: attach::Kind) -> &'static str {
         attach::Kind::Html => "html",
         attach::Kind::Image(_) => "image",
         attach::Kind::Pdf => "pdf",
-        // Until the Office readers exist, an archive is a file.
+        // An archive that is not a Word, Excel or PowerPoint file.
         attach::Kind::Zip | attach::Kind::File => "file",
     }
 }
@@ -1140,6 +1141,46 @@ fn over_limit(att: &str, len: u64, max_bytes: i64, largest: i64) -> Option<Strin
     })
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only: a smaller text limit for the Office readers.
+    static OFFICE_TEST_LIMIT: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+    /// Test-only: make the Office reader panic.
+    static OFFICE_TEST_PANIC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The text limit of the Office readers ([`office::OFFICE_MAX_TEXT`]; tests
+/// may set a smaller one).
+fn office_limit() -> usize {
+    #[cfg(test)]
+    if let Some(n) = OFFICE_TEST_LIMIT.with(|l| l.get()) {
+        return n;
+    }
+    office::OFFICE_MAX_TEXT
+}
+
+/// The text of the Office archive `data` of kind `k`; `None` when it cannot
+/// be read. A panic of a reader is caught here, so the server answers the
+/// next call; an abort cannot be caught, which is why every reader bounds
+/// what it allocates.
+fn office_text(k: office::OfficeKind, data: &[u8]) -> Option<office::Cut> {
+    let limit = office_limit();
+    std::panic::catch_unwind(|| {
+        #[cfg(test)]
+        if OFFICE_TEST_PANIC.with(|p| p.get()) {
+            panic!("test-only panic in an Office reader");
+        }
+        match k {
+            office::OfficeKind::Docx => office::docx_text_limited(data, limit),
+            office::OfficeKind::Xlsx => office::xlsx_text_limited(data, limit),
+            office::OfficeKind::Pptx => office::pptx_text_limited(data, limit),
+        }
+    })
+    .ok()?
+    .ok()
+}
+
 /// `get_attachment`: the content of one attachment file, read at call time
 /// from the attachment folder of the profile.
 fn get_attachment(cache: &mut Cache, now: i64, args: &Args) -> Result<Output, ToolError> {
@@ -1189,6 +1230,8 @@ fn get_attachment(cache: &mut Cache, now: i64, args: &Args) -> Result<Output, To
     }
 
     let full = usize::try_from(len).unwrap_or(usize::MAX);
+    // The kind in the result; an archive is refined below.
+    let mut label = kind_name(kind);
     let no_text = || {
         failed(format!(
             "no text can be made from {att} ({}); call without format and offset to get its bytes",
@@ -1259,22 +1302,62 @@ fn get_attachment(cache: &mut Cache, now: i64, args: &Args) -> Result<Output, To
             }
             (text, bytes)
         }
-        // Until the Office readers exist, an archive is a file.
+        // An archive is read whole (its directory is at its end) to see
+        // whether it is a Word, Excel or PowerPoint file; those are sent as
+        // text only, never as bytes, so no byte limit applies to them.
         attach::Kind::Zip | attach::Kind::File => {
-            if a.format == Format::Text || a.offset > 0 {
-                return Err(no_text());
-            }
-            if let Some(e) = over_limit(&att, len, a.max_bytes, attach::MAX_SEND_BYTES) {
-                return Err(failed(e));
-            }
-            let data = attach::read_head(&mut file, full).map_err(read_failed)?;
-            let bytes = Bytes {
-                item: BytesItem::Resource,
-                mime: attach::media_type(extension),
-                uri: format!("hxprobe://attachment/{}", rec.guid),
-                data: Arc::new(data),
+            let archive = match kind {
+                attach::Kind::Zip => Some(attach::read_head(&mut file, full).map_err(read_failed)?),
+                _ => None,
             };
-            (None, Some(bytes))
+            let office_kind = archive.as_deref().and_then(office::kind_of);
+            match (office_kind, archive) {
+                (Some(k), Some(archive)) => {
+                    label = match k {
+                        office::OfficeKind::Docx => "docx",
+                        office::OfficeKind::Xlsx => "xlsx",
+                        office::OfficeKind::Pptx => "pptx",
+                    };
+                    let text = office_text(k, &archive);
+                    match &text {
+                        None => notes.push("no text could be extracted from this file".into()),
+                        Some(c) => {
+                            if c.cut {
+                                notes.push(format!(
+                                    "the extracted text stops at {} bytes; the rest of the file \
+                                     was not read",
+                                    office::OFFICE_MAX_TEXT
+                                ));
+                            }
+                            if c.text.trim().is_empty() {
+                                notes.push(
+                                    "the file has no text (a scanned document has none)".into(),
+                                );
+                            }
+                        }
+                    }
+                    (text.map(|c| c.text), None)
+                }
+                (_, archive) => {
+                    if a.format == Format::Text || a.offset > 0 {
+                        return Err(no_text());
+                    }
+                    if let Some(e) = over_limit(&att, len, a.max_bytes, attach::MAX_SEND_BYTES) {
+                        return Err(failed(e));
+                    }
+                    let data = match archive {
+                        Some(d) => d,
+                        None => attach::read_head(&mut file, full).map_err(read_failed)?,
+                    };
+                    let bytes = Bytes {
+                        item: BytesItem::Resource,
+                        mime: attach::media_type(extension),
+                        uri: format!("hxprobe://attachment/{}", rec.guid),
+                        data: Arc::new(data),
+                    };
+                    (None, Some(bytes))
+                }
+            }
         }
     };
     let page = text.map(|t| attach::page(&t, a.offset, a.max_chars));
@@ -1296,7 +1379,7 @@ fn get_attachment(cache: &mut Cache, now: i64, args: &Args) -> Result<Output, To
         "size": rec.size,
         "file_size": len,
         "download_status": rec.download_status,
-        "kind": kind_name(kind),
+        "kind": label,
         "text": page.as_ref().map(|p| p.text.as_str()),
         "offset": a.offset,
         "total_chars": page.as_ref().map(|p| p.total_chars),
@@ -1309,7 +1392,7 @@ fn get_attachment(cache: &mut Cache, now: i64, args: &Args) -> Result<Output, To
     // Counts and the kind only: no name, no path, no content.
     crate::mcp::log(&format!(
         "get_attachment {} {len} bytes {} chars in {} ms",
-        kind_name(kind),
+        label,
         page.as_ref().map_or(0, |p| p.total_chars),
         started.elapsed().as_millis()
     ));
@@ -2984,6 +3067,283 @@ mod tests {
             "{notes:?}"
         );
         assert!(notes.contains(&json!(NO_TEXT)), "{notes:?}");
+    }
+
+    // --- Office files ---
+
+    use crate::mcp::office::testzip::{zip, zip_raw, Raw};
+
+    /// A `.docx` archive whose body is `body`.
+    fn docx(body: &str) -> Vec<u8> {
+        let doc = format!("<w:document><w:body>{body}</w:body></w:document>");
+        zip(&[
+            ("[Content_Types].xml", b"<Types/>", true),
+            ("word/document.xml", doc.as_bytes(), true),
+        ])
+    }
+
+    /// A `.docx` archive with one paragraph per entry of `paras`.
+    fn docx_of(paras: &[&str]) -> Vec<u8> {
+        let body: String = paras
+            .iter()
+            .map(|p| format!("<w:p><w:r><w:t>{p}</w:t></w:r></w:p>"))
+            .collect();
+        docx(&body)
+    }
+
+    fn xlsx() -> Vec<u8> {
+        zip(&[
+            (
+                "xl/workbook.xml",
+                b"<workbook><sheets><sheet name=\"Plan\" r:id=\"rId1\"/></sheets></workbook>",
+                true,
+            ),
+            (
+                "xl/_rels/workbook.xml.rels",
+                b"<Relationships><Relationship Id=\"rId1\" Target=\"worksheets/sheet1.xml\"/>\
+                  </Relationships>",
+                true,
+            ),
+            (
+                "xl/sharedStrings.xml",
+                b"<sst><si><t>Item</t></si><si><t>Cost</t></si></sst>",
+                true,
+            ),
+            (
+                "xl/worksheets/sheet1.xml",
+                b"<worksheet><sheetData><row r=\"1\"><c r=\"A1\" t=\"s\"><v>0</v></c>\
+                  <c r=\"B1\" t=\"s\"><v>1</v></c></row><row r=\"2\"><c r=\"A2\" t=\"inlineStr\">\
+                  <is><t>Rent</t></is></c><c r=\"B2\"><v>1200</v></c></row></sheetData></worksheet>",
+                true,
+            ),
+        ])
+    }
+
+    fn pptx() -> Vec<u8> {
+        let slide = |t: &str| {
+            format!("<p:sld><p:txBody><a:p><a:r><a:t>{t}</a:t></a:r></a:p></p:txBody></p:sld>")
+        };
+        let (one, two) = (slide("Welcome"), slide("Agenda"));
+        zip(&[
+            ("ppt/presentation.xml", b"<p:presentation/>", true),
+            ("ppt/slides/slide2.xml", two.as_bytes(), true),
+            ("ppt/slides/slide1.xml", one.as_bytes(), true),
+        ])
+    }
+
+    #[test]
+    fn get_attachment_sends_office_files_as_text_only() {
+        let (d, x, p) = (docx_of(&["Dear team,", "the plan."]), xlsx(), pptx());
+        let other = zip(&[("notes.txt", b"inside", true)]);
+        let cases: [(&str, &str, &[u8], &str, &str); 4] = [
+            (
+                "letter[1].docx",
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                &d,
+                "docx",
+                "Dear team,\nthe plan.\n",
+            ),
+            // The record's type is not taken.
+            (
+                "budget[2].xlsx",
+                "application/pdf",
+                &x,
+                "xlsx",
+                "# Plan\nItem\tCost\nRent\t1200\n",
+            ),
+            (
+                "deck[3].pptx",
+                "text/plain",
+                &p,
+                "pptx",
+                "# Slide 1\nWelcome\n# Slide 2\nAgenda\n",
+            ),
+            (
+                "letter[4].docx",
+                "application/pdf",
+                &d,
+                "docx",
+                "Dear team,\nthe plan.\n",
+            ),
+        ];
+        let names: Vec<String> = cases.iter().map(|c| stored(c.0)).collect();
+        let mut atts: Vec<TestAttachment> = cases
+            .iter()
+            .zip(&names)
+            .enumerate()
+            .map(|(i, (c, n))| att(0xc0 + i as u8, n, c.1, c.2.len()))
+            .collect();
+        let zip_name = stored("pack[5].zip");
+        atts.push(att(0xc4, &zip_name, "application/zip", other.len()));
+        let mut files: Vec<(&str, &[u8])> = cases.iter().map(|c| (c.0, c.2)).collect();
+        files.push(("pack[5].zip", &other));
+        let mut f = attachment_fixture(&atts, &files);
+        for (i, (name, ct, data, kind, text)) in cases.iter().enumerate() {
+            let g = att_guid(0xc0 + i as u8);
+            for args in [json!({"guid": g}), json!({"guid": g, "format": "text"})] {
+                let out = f.attachment(args);
+                assert!(out.bytes.is_none(), "{name}");
+                assert_eq!(
+                    out.json,
+                    json!({
+                        "guid": g, "message_guid": msg(1),
+                        "display_name": "Shared notes", "filename": name,
+                        "content_type": ct, "inline": 0,
+                        "size": data.len(), "file_size": data.len(), "download_status": 2,
+                        "kind": kind,
+                        "text": text, "offset": 0, "total_chars": text.chars().count(),
+                        "truncated": false, "next_offset": null,
+                        "sent": null, "notes": [], "untrusted": UNTRUSTED
+                    }),
+                    "{name}"
+                );
+            }
+        }
+        // An archive that is none of the three is a file, with its bytes.
+        let out = f.attachment(json!({"guid": att_guid(0xc4)}));
+        assert_eq!(out.json["kind"], "file");
+        assert_eq!(
+            out.json["sent"],
+            json!({"type": "resource", "mime_type": "application/zip", "bytes": other.len()})
+        );
+        assert_eq!(*out.bytes.expect("bytes").data, other);
+        let e = f.attachment_err(json!({"guid": att_guid(0xc4), "format": "text"}));
+        assert!(e.starts_with("no text can be made from "), "{e}");
+        assert!(e.contains("(file)"), "{e}");
+    }
+
+    #[test]
+    fn get_attachment_of_a_damaged_or_empty_office_file() {
+        // The marker entry is there, but it does not inflate.
+        let damaged = zip_raw(&[Raw {
+            name: "word/document.xml",
+            data: vec![0xff; 64],
+            method: 8,
+            flags: 0,
+            size: 1_000,
+        }]);
+        let empty = docx("<w:p/><w:p></w:p>");
+        let (a, b) = (stored("broken[1].docx"), stored("blank[2].docx"));
+        let mut f = attachment_fixture(
+            &[
+                att(0xc5, &a, "application/msword", damaged.len()),
+                att(0xc6, &b, "application/msword", empty.len()),
+            ],
+            &[("broken[1].docx", &damaged), ("blank[2].docx", &empty)],
+        );
+        let out = f.attachment(json!({"guid": att_guid(0xc5)}));
+        assert!(out.bytes.is_none());
+        assert_eq!(out.json["kind"], "docx");
+        for k in ["text", "total_chars", "truncated", "next_offset", "sent"] {
+            assert_eq!(out.json[k], Value::Null, "{k}");
+        }
+        assert_eq!(out.json["notes"], json!([NO_TEXT]));
+
+        let out = f.attachment(json!({"guid": att_guid(0xc6)}));
+        assert!(out.bytes.is_none());
+        assert_eq!(out.json["kind"], "docx");
+        assert_eq!(out.json["sent"], Value::Null);
+        assert_eq!(
+            out.json["notes"],
+            json!(["the file has no text (a scanned document has none)"])
+        );
+    }
+
+    #[test]
+    fn get_attachment_notes_an_office_text_cut_at_the_limit() {
+        let data = docx_of(&["first paragraph", "second paragraph", "third paragraph"]);
+        let name = stored("long[1].docx");
+        let mut f = attachment_fixture(
+            &[att(0xc7, &name, "application/msword", data.len())],
+            &[("long[1].docx", &data)],
+        );
+        OFFICE_TEST_LIMIT.with(|l| l.set(Some(20)));
+        let out = f.attachment(json!({"guid": att_guid(0xc7)}));
+        OFFICE_TEST_LIMIT.with(|l| l.set(None));
+        assert_eq!(out.json["text"], "first paragraph\n");
+        assert_eq!(
+            out.json["notes"],
+            json!([format!(
+                "the extracted text stops at {} bytes; the rest of the file was not read",
+                office::OFFICE_MAX_TEXT
+            )])
+        );
+        assert!(out.json["notes"][0]
+            .as_str()
+            .unwrap()
+            .starts_with("the extracted text stops at 16000000 bytes; "));
+        let out = f.attachment(json!({"guid": att_guid(0xc7)}));
+        assert_eq!(out.json["notes"], json!([]));
+    }
+
+    #[test]
+    fn get_attachment_survives_a_panic_in_an_office_reader() {
+        let data = docx_of(&["fine"]);
+        let name = stored("trap[1].docx");
+        let mut f = attachment_fixture(
+            &[att(0xc8, &name, "application/msword", data.len())],
+            &[("trap[1].docx", &data)],
+        );
+        OFFICE_TEST_PANIC.with(|p| p.set(true));
+        let out = f.attachment(json!({"guid": att_guid(0xc8)}));
+        OFFICE_TEST_PANIC.with(|p| p.set(false));
+        assert_eq!(out.json["text"], Value::Null);
+        assert_eq!(out.json["notes"], json!([NO_TEXT]));
+        assert!(out.bytes.is_none());
+        // The next call is answered.
+        let out = f.attachment(json!({"guid": att_guid(0xc8)}));
+        assert_eq!(out.json["text"], "fine\n");
+    }
+
+    #[test]
+    fn get_attachment_reads_a_large_office_file_and_pages_its_text() {
+        let paras: Vec<String> = (0..40).map(|i| format!("line {i}")).collect();
+        let refs: Vec<&str> = paras.iter().map(String::as_str).collect();
+        // A stored filler entry makes the file exactly one byte above the
+        // default byte limit.
+        let target = attach::DEFAULT_SEND_BYTES as usize + 1;
+        let with_filler = |n: usize| {
+            let body: String = refs
+                .iter()
+                .map(|p| format!("<w:p><w:r><w:t>{p}</w:t></w:r></w:p>"))
+                .collect();
+            let doc = format!("<w:document><w:body>{body}</w:body></w:document>");
+            zip(&[
+                ("word/document.xml", doc.as_bytes(), true),
+                ("word/media/filler.bin", &vec![7u8; n], false),
+            ])
+        };
+        let data = with_filler(target - with_filler(0).len());
+        assert_eq!(data.len(), target);
+        let text: String = paras.iter().map(|p| format!("{p}\n")).collect();
+        let name = stored("big[1].docx");
+        let mut f = attachment_fixture(
+            &[att(0xc9, &name, "application/msword", data.len())],
+            &[("big[1].docx", &data)],
+        );
+        let g = att_guid(0xc9);
+        let out = f.attachment(json!({"guid": g}));
+        assert!(out.bytes.is_none());
+        assert_eq!(out.json["text"], text);
+        assert_eq!(out.json["notes"], json!([]));
+        assert_eq!(out.json["file_size"], target);
+
+        // From an offset: the text from there, no note about bytes.
+        let out = f.attachment(json!({"guid": g, "offset": 5}));
+        assert_eq!(out.json["text"], &text[5..]);
+        assert_eq!(out.json["notes"], json!([]));
+        assert_eq!(out.json["sent"], Value::Null);
+
+        // Page by page, the whole text.
+        let mut read = String::new();
+        let mut offset = Some(0u64);
+        while let Some(o) = offset {
+            let out = f.attachment(json!({"guid": g, "offset": o, "max_chars": 17}));
+            read.push_str(out.json["text"].as_str().unwrap());
+            assert_eq!(out.json["notes"], json!([]));
+            offset = out.json["next_offset"].as_u64();
+        }
+        assert_eq!(read, text);
     }
 
     // --- arguments ---

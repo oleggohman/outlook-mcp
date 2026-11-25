@@ -574,7 +574,7 @@ enum Pending {
 /// `w:p` a line break. In a table, cells of a row are separated by tabs and
 /// a row ends with a line break; paragraphs inside one cell are separated
 /// by line breaks. Headers, footers, notes and comments are not read.
-fn docx_text_limited(archive: &[u8], limit: usize) -> Result<Cut, ()> {
+pub(crate) fn docx_text_limited(archive: &[u8], limit: usize) -> Result<Cut, ()> {
     let mut budget = MAX_INFLATED;
     let doc = entry(archive, "word/document.xml", &mut budget)?.ok_or(())?;
     let mut out = TextOut::new(limit);
@@ -659,7 +659,7 @@ fn numbered(name: &[u8], prefix: &str) -> Option<u32> {
 /// in number order, each with a line `# Slide <N>`, then the text of `a:t`,
 /// a line break at the end of `a:p` and for `a:br`. Notes pages and the
 /// slide order of the presentation part are not read.
-fn pptx_text_limited(archive: &[u8], limit: usize) -> Result<Cut, ()> {
+pub(crate) fn pptx_text_limited(archive: &[u8], limit: usize) -> Result<Cut, ()> {
     let records = directory(archive)?;
     let mut slides: Vec<(u32, &Record)> = records
         .iter()
@@ -928,7 +928,7 @@ pub fn xlsx_text(archive: &[u8]) -> Result<Cut, ()> {
 /// `xl/workbook.xml` and its relations; without a usable relation the
 /// entries `xl/worksheets/sheet<N>.xml` in number order, named `Sheet <N>`.
 /// Per sheet a line `# <name>`, then its rows (see [`sheet_rows`]).
-fn xlsx_text_limited(archive: &[u8], limit: usize) -> Result<Cut, ()> {
+pub(crate) fn xlsx_text_limited(archive: &[u8], limit: usize) -> Result<Cut, ()> {
     use std::collections::HashMap;
     let records = directory(archive)?;
     let by_name: HashMap<&[u8], &Record> = records.iter().map(|r| (r.name, r)).collect();
