@@ -196,8 +196,6 @@ pub fn kind_of(archive: &[u8]) -> Option<OfficeKind> {
 
 /// The bytes of the entry `name` of `archive`, inflated; `None` when there is
 /// no such entry. What it inflates to is taken from `budget`.
-// Used by the readers of the next steps; until then by the tests only.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn entry(archive: &[u8], name: &str, budget: &mut usize) -> Result<Option<Vec<u8>>, ()> {
     entry_with(archive, name, budget, MAX_ENTRY_BYTES)
 }
@@ -213,9 +211,15 @@ fn entry_with(
     let Some(r) = records.iter().find(|r| r.name == name.as_bytes()) else {
         return Ok(None);
     };
+    take(archive, r, budget, max_entry).map(Some)
+}
+
+/// The bytes of `r`, inflated, under `max_entry` and what is left of
+/// `budget`, which loses what they take.
+fn take(archive: &[u8], r: &Record, budget: &mut usize, max_entry: usize) -> Result<Vec<u8>, ()> {
     let out = read(archive, r, max_entry.min(*budget))?;
     *budget -= out.len();
-    Ok(Some(out))
+    Ok(out)
 }
 
 /// One event of the XML scanner.
@@ -240,7 +244,7 @@ pub(crate) struct Tag<'a> {
 impl<'a> Tag<'a> {
     /// The decoded value of the attribute `name`, if the tag has it; `None`
     /// also once the attributes stop being well formed.
-    // Used by the readers of the next steps; until then by the tests only.
+    // Used by the workbook reader of the next step.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn attr(&self, name: &str) -> Option<Cow<'a, str>> {
         let b = self.attrs;
@@ -356,8 +360,6 @@ pub(crate) struct Xml<'a> {
 }
 
 impl<'a> Xml<'a> {
-    // Used by the readers of the next steps; until then by the tests only.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn new(b: &'a [u8]) -> Xml<'a> {
         Xml {
             b,
@@ -465,6 +467,232 @@ impl<'a> Iterator for Xml<'a> {
             return Some(Ok(Event::Start(Tag { name, attrs })));
         }
     }
+}
+
+/// Most bytes of text an Office reader produces (the same number as the
+/// limit on the text of the PDF child).
+pub const OFFICE_MAX_TEXT: usize = 16_000_000;
+
+/// The text a reader made, and whether it stopped at its limit.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Cut {
+    pub text: String,
+    pub cut: bool,
+}
+
+/// The one way a reader adds text: every push, padding included, is checked
+/// against the limit before anything is appended, so neither the text nor
+/// its buffer can grow past it (the buffer at most doubles the limit).
+struct TextOut {
+    s: String,
+    limit: usize,
+    full: bool,
+}
+
+impl TextOut {
+    fn new(limit: usize) -> TextOut {
+        TextOut {
+            s: String::new(),
+            limit,
+            full: false,
+        }
+    }
+
+    /// Whether `added` more bytes fit; when they do not, the text is full
+    /// from now on.
+    fn fits(&mut self, added: Option<usize>) -> bool {
+        if !self.full && added.is_some_and(|n| n <= self.limit - self.s.len()) {
+            return true;
+        }
+        self.full = true;
+        false
+    }
+
+    fn push(&mut self, c: char) {
+        if self.fits(Some(c.len_utf8())) {
+            self.s.push(c);
+        }
+    }
+
+    fn push_str(&mut self, t: &str) {
+        if self.fits(Some(t.len())) {
+            self.s.push_str(t);
+        }
+    }
+
+    /// `n` times `c` (padding), checked as a whole first; never builds a
+    /// string of `n` characters.
+    // Used by the workbook reader of the next step.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn push_n(&mut self, c: char, n: usize) {
+        if self.fits(c.len_utf8().checked_mul(n)) {
+            for _ in 0..n {
+                self.s.push(c);
+            }
+        }
+    }
+
+    fn finish(self) -> Cut {
+        Cut {
+            text: self.s,
+            cut: self.full,
+        }
+    }
+}
+
+/// The text of a `.docx` archive, at most [`OFFICE_MAX_TEXT`] bytes.
+// The error carries nothing on purpose: no detail of a file from mail
+// reaches a result.
+#[allow(clippy::result_unit_err)]
+pub fn docx_text(archive: &[u8]) -> Result<Cut, ()> {
+    docx_text_limited(archive, OFFICE_MAX_TEXT)
+}
+
+/// Feeds the events of `xml` to `f` until `out` is full; a scanner error is
+/// an error of the reader.
+fn scan<'a>(
+    xml: &'a [u8],
+    out: &mut TextOut,
+    mut f: impl FnMut(Event<'a>, &mut TextOut),
+) -> Result<(), ()> {
+    for e in Xml::new(xml) {
+        f(e?, out);
+        if out.full {
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// What the end of a paragraph or a cell of a Word table has left to write
+/// before the next text of the same row.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Pending {
+    Nothing,
+    Break,
+    Tab,
+}
+
+/// [`docx_text`] with a given limit. Text of `w:t`; `w:tab` a tab (not the
+/// tab stops of `w:tabs`); `w:br` and `w:cr` a line break; the end of a
+/// `w:p` a line break. In a table, cells of a row are separated by tabs and
+/// a row ends with a line break; paragraphs inside one cell are separated
+/// by line breaks. Headers, footers, notes and comments are not read.
+fn docx_text_limited(archive: &[u8], limit: usize) -> Result<Cut, ()> {
+    let mut budget = MAX_INFLATED;
+    let doc = entry(archive, "word/document.xml", &mut budget)?.ok_or(())?;
+    let mut out = TextOut::new(limit);
+    let (mut in_t, mut tab_stops, mut cells) = (false, 0usize, 0usize);
+    let mut pending = Pending::Nothing;
+    // Writes what a cell left pending, before new text.
+    let flush = |out: &mut TextOut, pending: &mut Pending| {
+        match *pending {
+            Pending::Nothing => {}
+            Pending::Break => out.push('\n'),
+            Pending::Tab => out.push('\t'),
+        }
+        *pending = Pending::Nothing;
+    };
+    scan(&doc, &mut out, |e, out| match e {
+        Event::Start(t) => match t.name {
+            b"w:t" => in_t = true,
+            b"w:tabs" => tab_stops += 1,
+            b"w:tab" if tab_stops == 0 => {
+                flush(out, &mut pending);
+                out.push('\t');
+            }
+            b"w:br" | b"w:cr" => {
+                flush(out, &mut pending);
+                out.push('\n');
+            }
+            b"w:tc" => cells += 1,
+            _ => {}
+        },
+        Event::End(name) => match name {
+            b"w:t" => in_t = false,
+            b"w:tabs" => tab_stops = tab_stops.saturating_sub(1),
+            b"w:p" if cells > 0 => {
+                if pending == Pending::Nothing {
+                    pending = Pending::Break;
+                }
+            }
+            b"w:p" => out.push('\n'),
+            b"w:tc" => {
+                cells = cells.saturating_sub(1);
+                // The tab of an empty cell before this one.
+                if pending == Pending::Tab {
+                    out.push('\t');
+                }
+                pending = Pending::Tab;
+            }
+            b"w:tr" => {
+                pending = Pending::Nothing;
+                out.push('\n');
+            }
+            _ => {}
+        },
+        Event::Text(t) if in_t => {
+            flush(out, &mut pending);
+            out.push_str(&t);
+        }
+        Event::Text(_) => {}
+    })?;
+    Ok(out.finish())
+}
+
+/// The text of a `.pptx` archive, at most [`OFFICE_MAX_TEXT`] bytes.
+// The error carries nothing on purpose: no detail of a file from mail
+// reaches a result.
+#[allow(clippy::result_unit_err)]
+pub fn pptx_text(archive: &[u8]) -> Result<Cut, ()> {
+    pptx_text_limited(archive, OFFICE_MAX_TEXT)
+}
+
+/// The number `N` of an entry named `<prefix><N>.xml`.
+fn numbered(name: &[u8], prefix: &str) -> Option<u32> {
+    let digits = name
+        .strip_prefix(prefix.as_bytes())?
+        .strip_suffix(b".xml")?;
+    if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    std::str::from_utf8(digits).ok()?.parse().ok()
+}
+
+/// [`pptx_text`] with a given limit. The entries `ppt/slides/slide<N>.xml`
+/// in number order, each with a line `# Slide <N>`, then the text of `a:t`,
+/// a line break at the end of `a:p` and for `a:br`. Notes pages and the
+/// slide order of the presentation part are not read.
+fn pptx_text_limited(archive: &[u8], limit: usize) -> Result<Cut, ()> {
+    let records = directory(archive)?;
+    let mut slides: Vec<(u32, &Record)> = records
+        .iter()
+        .filter_map(|r| Some((numbered(r.name, "ppt/slides/slide")?, r)))
+        .collect();
+    slides.sort_by_key(|(n, _)| *n);
+    slides.dedup_by_key(|(n, _)| *n);
+    let mut budget = MAX_INFLATED;
+    let mut out = TextOut::new(limit);
+    for (n, r) in slides {
+        out.push_str(&format!("# Slide {n}\n"));
+        if out.full {
+            break;
+        }
+        let xml = take(archive, r, &mut budget, MAX_ENTRY_BYTES)?;
+        let mut in_t = false;
+        scan(&xml, &mut out, |e, out| match e {
+            Event::Start(t) if t.name == b"a:t" => in_t = true,
+            Event::Start(t) if t.name == b"a:br" => out.push('\n'),
+            Event::End(b"a:t") => in_t = false,
+            Event::End(b"a:p") => out.push('\n'),
+            Event::Text(t) if in_t => out.push_str(&t),
+            _ => {}
+        })?;
+        if out.full {
+            break;
+        }
+    }
+    Ok(out.finish())
 }
 
 #[cfg(test)]
@@ -1094,5 +1322,269 @@ mod xml_tests {
             );
         }
         assert!(started.elapsed() < Duration::from_secs(30));
+    }
+}
+
+#[cfg(test)]
+mod reader_tests {
+    use super::testzip::zip;
+    use super::*;
+
+    #[test]
+    fn text_out_stops_at_its_limit() {
+        let mut t = TextOut::new(10);
+        t.push_str("abc");
+        t.push('d');
+        t.push_n('-', 3);
+        t.push_str("");
+        assert!(!t.full);
+        // Would pass the limit: nothing of it is appended.
+        t.push_str("wxyz");
+        assert!(t.full);
+        // Every later push is a no-op, even one that would fit.
+        t.push('a');
+        t.push_str("b");
+        t.push_n('c', 1);
+        assert_eq!(
+            t.finish(),
+            Cut {
+                text: "abcd---".into(),
+                cut: true
+            }
+        );
+        // Up to the limit exactly is not full; a character is whole or not
+        // at all.
+        let mut t = TextOut::new(4);
+        t.push_str("אב");
+        assert!(!t.full);
+        t.push('ג');
+        assert!(t.full);
+        assert_eq!(t.finish().text, "אב");
+        let mut t = TextOut::new(5);
+        t.push_n('א', 2);
+        t.push_n('א', 1);
+        assert_eq!(
+            t.finish(),
+            Cut {
+                text: "אא".into(),
+                cut: true
+            }
+        );
+    }
+
+    #[test]
+    fn text_out_padding_never_builds_its_string() {
+        let started = std::time::Instant::now();
+        let mut t = TextOut::new(1_000);
+        t.push_str(&"x".repeat(500));
+        t.push_n(' ', usize::MAX / 2);
+        assert!(t.full);
+        t.push_n('\t', usize::MAX);
+        assert!(t.s.len() <= 1_000);
+        assert!(t.s.capacity() <= 2_000, "capacity {}", t.s.capacity());
+        let mut t = TextOut::new(1_000);
+        t.push_n('\u{10FFFF}', usize::MAX / 2);
+        assert!(t.full);
+        assert!(t.s.capacity() <= 2_000);
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        // Filling up to the limit keeps the capacity within twice of it.
+        let mut t = TextOut::new(1_000);
+        for _ in 0..2_000 {
+            t.push('y');
+        }
+        assert_eq!(t.s.len(), 1_000);
+        assert!(t.s.capacity() <= 2_000);
+    }
+
+    /// A `.docx` archive whose body is `body`.
+    fn docx(body: &str) -> Vec<u8> {
+        let doc = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
+             <w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">\
+             <w:body>{body}</w:body></w:document>"
+        );
+        zip(&[
+            ("[Content_Types].xml", b"<Types/>", true),
+            ("word/document.xml", doc.as_bytes(), true),
+        ])
+    }
+
+    #[test]
+    fn docx_paragraphs_runs_tabs_and_breaks() {
+        let a = docx(
+            "<w:p><w:pPr><w:tabs><w:tab w:val=\"left\" w:pos=\"720\"/></w:tabs></w:pPr>\n\
+             <w:r><w:t>Hello</w:t></w:r><w:r><w:t xml:space=\"preserve\"> wor</w:t></w:r>\
+             <w:r><w:rPr><w:b/></w:rPr><w:t>ld</w:t></w:r></w:p>\n\
+             <w:p><w:r><w:t>a</w:t><w:tab/><w:t>b</w:t><w:br/><w:t>c</w:t><w:cr/>\
+             <w:t>d &amp; e</w:t></w:r></w:p>\n\
+             <w:p/><w:p><w:r><w:instrText>PAGE</w:instrText><w:t>שלום</w:t></w:r></w:p>",
+        );
+        assert_eq!(
+            docx_text(&a),
+            Ok(Cut {
+                text: "Hello world\na\tb\nc\nd & e\n\nשלום\n".into(),
+                cut: false
+            })
+        );
+    }
+
+    #[test]
+    fn docx_tables_give_tabs_between_cells_and_a_line_per_row() {
+        let cell = |t: &str| format!("<w:tc><w:p><w:r><w:t>{t}</w:t></w:r></w:p></w:tc>");
+        let a = docx(&format!(
+            "<w:p><w:r><w:t>before</w:t></w:r></w:p>\
+             <w:tbl><w:tr>{}{}</w:tr><w:tr>{}{}</w:tr></w:tbl>\
+             <w:p><w:r><w:t>after</w:t></w:r></w:p>",
+            cell("A1"),
+            cell("B1"),
+            cell("A2"),
+            cell("B2")
+        ));
+        assert_eq!(
+            docx_text(&a).unwrap().text,
+            "before\nA1\tB1\nA2\tB2\nafter\n"
+        );
+        // An empty cell keeps its place; two paragraphs in a cell are two
+        // lines of it.
+        let a = docx(
+            "<w:tbl><w:tr><w:tc><w:p/></w:tc>\
+             <w:tc><w:p><w:r><w:t>x</w:t></w:r></w:p><w:p><w:r><w:t>y</w:t></w:r></w:p></w:tc>\
+             </w:tr></w:tbl>",
+        );
+        assert_eq!(docx_text(&a).unwrap().text, "\tx\ny\n");
+    }
+
+    #[test]
+    fn docx_failures() {
+        // No `word/document.xml`.
+        let a = zip(&[("xl/workbook.xml", b"<workbook/>", true)]);
+        assert_eq!(docx_text(&a), Err(()));
+        assert_eq!(docx_text(b"not an archive"), Err(()));
+        // A document type declaration.
+        let a = zip(&[(
+            "word/document.xml",
+            b"<!DOCTYPE d [<!ENTITY e \"x\">]><w:document/>",
+            true,
+        )]);
+        assert_eq!(docx_text(&a), Err(()));
+        // No text at all is not a failure.
+        assert_eq!(
+            docx_text(&docx("<w:p/>")),
+            Ok(Cut {
+                text: "\n".into(),
+                cut: false
+            })
+        );
+    }
+
+    #[test]
+    fn docx_text_stops_at_its_limit() {
+        let body: String = (0..1_000)
+            .map(|i| format!("<w:p><w:r><w:t>paragraph {i}</w:t></w:r></w:p>"))
+            .collect();
+        let a = docx(&body);
+        let c = docx_text_limited(&a, 100).unwrap();
+        assert!(c.cut);
+        assert!(c.text.len() <= 100);
+        assert!(c.text.starts_with("paragraph 0\nparagraph 1\n"));
+        let all = docx_text(&a).unwrap();
+        assert!(!all.cut);
+        assert!(all.text.ends_with("paragraph 999\n"));
+    }
+
+    /// A `.pptx` archive with the given slides `(number, paragraphs)`, in
+    /// the order given.
+    fn pptx(slides: &[(u32, &[&str])]) -> Vec<u8> {
+        let xml: Vec<(String, String)> = slides
+            .iter()
+            .map(|(n, paras)| {
+                let ps: String = paras
+                    .iter()
+                    .map(|p| format!("<a:p><a:r><a:t>{p}</a:t></a:r></a:p>"))
+                    .collect();
+                (
+                    format!("ppt/slides/slide{n}.xml"),
+                    format!(
+                        "<p:sld><p:cSld><p:spTree><p:sp><p:txBody>{ps}</p:txBody></p:sp>\
+                         </p:spTree></p:cSld></p:sld>"
+                    ),
+                )
+            })
+            .collect();
+        let mut entries: Vec<(&str, &[u8], bool)> = vec![
+            ("ppt/presentation.xml", b"<p:presentation/>", true),
+            (
+                "ppt/slides/_rels/slide1.xml.rels",
+                b"<Relationships/>",
+                true,
+            ),
+            (
+                "ppt/slideLayouts/slideLayout1.xml",
+                b"<a:t>layout</a:t>",
+                true,
+            ),
+            ("ppt/notesSlides/notesSlide1.xml", b"<a:t>notes</a:t>", true),
+        ];
+        entries.extend(xml.iter().map(|(n, x)| (n.as_str(), x.as_bytes(), true)));
+        zip(&entries)
+    }
+
+    #[test]
+    fn pptx_slides_come_in_number_order() {
+        let a = pptx(&[
+            (3, &["Three"]),
+            (1, &["Title one", "Body & more"]),
+            (2, &[]),
+        ]);
+        assert_eq!(
+            pptx_text(&a),
+            Ok(Cut {
+                text: "# Slide 1\nTitle one\nBody & more\n# Slide 2\n# Slide 3\nThree\n".into(),
+                cut: false
+            })
+        );
+        let a = pptx(&[(10, &["ten"]), (9, &["nine"]), (1, &["one"])]);
+        assert_eq!(
+            pptx_text(&a).unwrap().text,
+            "# Slide 1\none\n# Slide 9\nnine\n# Slide 10\nten\n"
+        );
+    }
+
+    #[test]
+    fn pptx_line_breaks_and_failures() {
+        let a = zip(&[
+            ("ppt/presentation.xml", b"<p:presentation/>", true),
+            (
+                "ppt/slides/slide1.xml",
+                b"<p:sld><a:p><a:r><a:t>a</a:t></a:r><a:br/><a:r><a:t>b</a:t></a:r></a:p></p:sld>",
+                false,
+            ),
+        ]);
+        assert_eq!(pptx_text(&a).unwrap().text, "# Slide 1\na\nb\n");
+        assert_eq!(pptx_text(b"not an archive"), Err(()));
+        let a = zip(&[("ppt/slides/slide1.xml", b"<!DOCTYPE x><p:sld/>", true)]);
+        assert_eq!(pptx_text(&a), Err(()));
+        // A presentation without slides has no text.
+        let a = zip(&[("ppt/presentation.xml", b"<p:presentation/>", true)]);
+        assert_eq!(
+            pptx_text(&a),
+            Ok(Cut {
+                text: String::new(),
+                cut: false
+            })
+        );
+    }
+
+    #[test]
+    fn pptx_text_stops_at_its_limit() {
+        let paras: Vec<String> = (0..100).map(|i| format!("line {i}")).collect();
+        let refs: Vec<&str> = paras.iter().map(String::as_str).collect();
+        let slides: Vec<(u32, &[&str])> = (1..=50).map(|n| (n, &refs[..])).collect();
+        let a = pptx(&slides);
+        let c = pptx_text_limited(&a, 1_000).unwrap();
+        assert!(c.cut);
+        assert!(c.text.len() <= 1_000);
+        assert!(c.text.starts_with("# Slide 1\nline 0\n"));
+        assert!(!pptx_text(&a).unwrap().cut);
     }
 }
