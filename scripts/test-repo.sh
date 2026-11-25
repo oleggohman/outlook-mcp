@@ -221,8 +221,12 @@ check_phrases() {
     done
 }
 
+# Longest description of the skill, in characters (without its quotes).
+max_description=360
+
 # The description in the front matter of skill $1 is a "Use when ..."
-# trigger list that names a warning in a result.
+# trigger list of at most $max_description characters that names a warning
+# in a result and attachments.
 check_skill_description() {
     local d
     d=$(awk 'NR == 1 && $0 != "---" { exit } NR > 1 && $0 == "---" { exit }
@@ -241,6 +245,33 @@ check_skill_description() {
         *warning* ) ;;
         * ) why='the description does not name a warning in a result'; return 1 ;;
     esac
+    case "$d" in
+        *attachment* ) ;;
+        * ) why='the description does not name attachments'; return 1 ;;
+    esac
+    [ "${#d}" -le "$max_description" ] \
+        || { why="the description has ${#d} characters, more than $max_description"; return 1; }
+}
+
+# File $1 contains none of the fixed strings $2...
+check_absent() {
+    local f=$1 p
+    shift
+    for p in "$@"; do
+        ! grep -qF -e "$p" "$f" || { why="$(basename "$f") contains '$p'"; return 1; }
+    done
+}
+
+# No line of the files $1... holds a local path, a file address, the
+# attachment folder of the profile or the server's own address scheme.
+skill_path_patterns=('/Users/' '~/' 'file://' 'Library/' 'Files/S0' 'hxprobe://')
+check_skill_paths() {
+    local f p
+    for f in "$@"; do
+        for p in "${skill_path_patterns[@]}"; do
+            ! grep -qF -e "$p" "$f" || { why="$(basename "$f") contains '$p'"; return 1; }
+        done
+    done
 }
 
 # Every line of Markdown file $1 that contains the fixed string $2 lies
@@ -508,6 +539,76 @@ printf '# Top\n\n## %s\n\n### Sub\n\n```sh\n# comment\nApplication Support/hxpro
     "$skill_fallback" > "$tmp/nested.md"
 expect_pass 'self-test: a subheading and a code comment keep the heading' \
     check_lines_under "$tmp/nested.md" 'Application Support/hxprobe' "$skill_fallback"
+
+# The description names attachments and stays short.
+sed '/^description:/s/attachment/file/g' "$skill" > "$tmp/skill-no-attachment.md"
+expect_fail 'self-test: skill description without attachments' \
+    check_skill_description "$tmp/skill-no-attachment.md"
+# A description of exactly $1 characters that passes every other rule.
+description_of() {
+    local base='Use when a tool returns a warning or the user asks about an attachment' pad
+    pad=$(printf '%*s' $(($1 - ${#base})) '' | tr ' ' x)
+    printf '%s%s' "$base" "$pad"
+}
+for n in "$max_description" $((max_description + 1)); do
+    HXPROBE_D="$(description_of "$n")" awk '/^description:/ { print "description: \"" ENVIRON["HXPROBE_D"] "\""; next } { print }' \
+        "$skill" > "$tmp/skill-length-$n.md"
+done
+expect_pass "self-test: skill description of $max_description characters" \
+    check_skill_description "$tmp/skill-length-$max_description.md"
+expect_fail "self-test: skill description of $((max_description + 1)) characters" \
+    check_skill_description "$tmp/skill-length-$((max_description + 1)).md"
+
+# The skill covers the content of attachments: the tool, paging, the byte
+# limit and its errors; and no longer says only metadata can be had.
+skill_attachment_phrases=(get_attachment next_offset max_bytes 'is not on this Mac' \
+    'above the limit of' 'outside the attachment folder')
+skill_attachment_gone=('gives name, type and size only')
+expect_pass 'skill: attachment phrases' check_phrases "$skill" "${skill_attachment_phrases[@]}"
+expect_pass 'skill: no metadata-only attachment row' check_absent "$skill" "${skill_attachment_gone[@]}"
+i=0
+for p in "${skill_attachment_phrases[@]}"; do
+    i=$((i + 1))
+    grep -vF -e "$p" "$skill" > "$tmp/skill-without-$i.md" || true
+    expect_fail "self-test: skill without '$p'" \
+        check_phrases "$tmp/skill-without-$i.md" "${skill_attachment_phrases[@]}"
+done
+{ cat "$skill"; printf '\n`list_attachments` gives name, type and size only.\n'; } > "$tmp/skill-metadata-only.md"
+expect_fail 'self-test: skill with the metadata-only attachment row' \
+    check_absent "$tmp/skill-metadata-only.md" "${skill_attachment_gone[@]}"
+
+# The reference file sends content questions to get_attachment.
+reference="$repo/skills/outlook-local-mail/references/triage-and-threads.md"
+reference_gone=('cannot be read through this server' 'ask the user to attach it')
+expect_pass 'reference: names get_attachment' check_phrases "$reference" get_attachment
+expect_pass 'reference: does not say attachments cannot be read' \
+    check_absent "$reference" "${reference_gone[@]}"
+grep -vF -e get_attachment "$reference" > "$tmp/reference-no-tool.md" || true
+expect_fail 'self-test: reference file without get_attachment' \
+    check_phrases "$tmp/reference-no-tool.md" get_attachment
+i=0
+for p in "${reference_gone[@]}"; do
+    i=$((i + 1))
+    { cat "$reference"; printf '\nThe content %s.\n' "$p"; } > "$tmp/reference-gone-$i.md"
+    expect_fail "self-test: reference file with '$p'" \
+        check_absent "$tmp/reference-gone-$i.md" "${reference_gone[@]}"
+done
+
+# No tracked file under skills/ holds a local path or a file address.
+skill_files=()
+while IFS= read -r -d '' f; do
+    [ -f "$repo/$f" ] && skill_files+=("$repo/$f")
+done < <(git -C "$repo" ls-files -z -- skills)
+t='skill files: tracked files found'
+if [ "${#skill_files[@]}" -ge 2 ]; then pass "$t"; else fail "$t" "found ${#skill_files[@]}"; fi
+expect_pass 'skill files: no local path or file address' check_skill_paths "${skill_files[@]}"
+i=0
+for p in "${skill_path_patterns[@]}"; do
+    i=$((i + 1))
+    { cat "$skill"; printf '\nOpen %s/example.pdf.\n' "$p"; } > "$tmp/skill-path-$i.md"
+    expect_fail "self-test: skill file with '$p'" \
+        check_skill_paths "$reference" "$tmp/skill-path-$i.md"
+done
 
 # The changelog has a section for the version of hxprobe/Cargo.toml on top.
 changelog="$repo/CHANGELOG.md"
