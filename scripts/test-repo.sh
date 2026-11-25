@@ -20,9 +20,15 @@
 # name the warning, the shared program path, the denial and the clients,
 # and name the per-user program path only under the headings that explain
 # it; both quote the stop command of the denial text with its paths in
-# single quotes, the shape that the server's own test expects. Every check
-# is a function that takes the file to check; each one also runs on a changed
-# copy in a temp directory, where it must fail. The release gate stays out
+# single quotes, the shape that the server's own test expects. The skill's
+# description is a "Use when" trigger list of at most 360 characters that
+# names a warning and attachments; the skill names get_attachment, its
+# paging, its byte limit and its errors; the reference file sends questions
+# about a file's content to get_attachment and does not say attachments
+# cannot be read; no tracked file under skills/ holds a local path, a file
+# address, the attachment folder or the server's own address scheme. Every
+# check is a function that takes the file to check; each one also runs on a
+# changed copy in a temp directory, where it must fail. The release gate stays out
 # of the plain run, so the tree is green before the program is signed.
 #
 # Reads tracked files only and writes nothing outside its temp directory.
