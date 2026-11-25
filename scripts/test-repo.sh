@@ -641,6 +641,31 @@ expect_fail 'self-test: README without Claude Code' \
 expect_fail 'self-test: README per-user program under another heading' \
     check_lines_under "$tmp/readme-path.md" 'Application Support/hxprobe/bin/hxprobe' "${readme_headings[@]}"
 
+# The README documents the content of attachments: the tool, the folder,
+# the resource address, the PDF child, the errors, the dependencies, the
+# size annotation and the one-request-at-a-time limit; and no longer says
+# that only metadata can be had.
+readme_attachment_phrases=(get_attachment 'Files/S0/3/Attachments/0' 'hxprobe://attachment/' \
+    pdf-text 'is not on this Mac' 'above the limit of' miniz_oxide pdf-extract \
+    'eight mail tools' maxResultSizeChars 'one request at a time')
+readme_attachment_gone=('metadata only, no content' 'seven mail tools')
+expect_pass 'readme: attachment phrases' check_phrases "$readme" "${readme_attachment_phrases[@]}"
+expect_pass 'readme: no metadata-only attachments' check_absent "$readme" "${readme_attachment_gone[@]}"
+i=0
+for p in "${readme_attachment_phrases[@]}"; do
+    i=$((i + 1))
+    grep -vF -e "$p" "$readme" > "$tmp/readme-without-$i.md" || true
+    expect_fail "self-test: README without '$p'" \
+        check_phrases "$tmp/readme-without-$i.md" "${readme_attachment_phrases[@]}"
+done
+i=0
+for p in "${readme_attachment_gone[@]}"; do
+    i=$((i + 1))
+    { cat "$readme"; printf '\nAttachments: %s.\n' "$p"; } > "$tmp/readme-gone-$i.md"
+    expect_fail "self-test: README with '$p'" \
+        check_absent "$tmp/readme-gone-$i.md" "${readme_attachment_gone[@]}"
+done
+
 # The stop command: single quotes in the server's source, and the same
 # shape where the skill and the README quote the denial text.
 proto="$repo/hxprobe/src/mcp/proto.rs"
