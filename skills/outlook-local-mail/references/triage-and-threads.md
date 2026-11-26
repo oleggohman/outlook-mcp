@@ -1,4 +1,9 @@
-# Triage and threads
+# Triage and threads (local backend)
+
+This file is the **local-only** version. In hybrid mode use
+`references/hybrid.md`; in M365-only mode use the triage and thread
+sections of `references/m365.md`. The principles are the same in all
+three; the calls differ.
 
 Workflows for "what's important", "what's urgent", "what needs me",
 "analyze this thread" and "did I answer X". The server has no thread id, no

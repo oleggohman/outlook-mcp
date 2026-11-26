@@ -21,7 +21,7 @@
 # and name the per-user program path only under the headings that explain
 # it; both quote the stop command of the denial text with its paths in
 # single quotes, the shape that the server's own test expects. The skill's
-# description is a "Use when" trigger list of at most 360 characters that
+# description is a "Use when" trigger list of at most 1,024 characters (the limit of the skill format) that
 # names a warning and attachments; the skill names get_attachment, its
 # paging, its byte limit and its errors; the reference file sends questions
 # about a file's content to get_attachment and does not say attachments
@@ -228,7 +228,7 @@ check_phrases() {
 }
 
 # Longest description of the skill, in characters (without its quotes).
-max_description=360
+max_description=1024
 
 # The description in the front matter of skill $1 is a "Use when ..."
 # trigger list of at most $max_description characters that names a warning

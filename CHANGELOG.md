@@ -4,6 +4,30 @@ All notable changes to this project are listed here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.2] - 2026-11-26
+
+The hxprobe program has no functional change; its version follows the skill.
+
+### Added
+
+- The skill works with the Microsoft 365 connector as well as the local
+  Outlook MCP. With both available it runs in hybrid mode: bulk listing,
+  folder work, keyword scans and attachment text on the local snapshot;
+  mail newer than the snapshot, recipients, thread ids, reply checks,
+  calendar and people on Microsoft 365. With only one available it uses
+  that one alone, and it switches when a source fails mid-task.
+- New reference files: `skills/outlook-local-mail/references/hybrid.md`
+  (window split, merging and dedupe, triage, folder work, threads,
+  attachments and completeness checks in hybrid mode) and
+  `skills/outlook-local-mail/references/m365.md` (Microsoft 365 calls,
+  argument rules and the Microsoft-365-only workflows).
+
+### Changed
+
+- The skill's description names both sources; `scripts/test-repo.sh` now
+  allows a description up to the skill format's limit of 1,024 characters.
+- `references/triage-and-threads.md` is marked as the local-only workflow.
+
 ## [0.3.0] - 2026-11-25
 
 ### Added
@@ -297,6 +321,7 @@ Plugin release; the hxprobe program stays at 0.2.0.
 - Prebuilt program for Apple Silicon Macs, verified by the launcher against
   `release/SHA256SUMS`.
 
+[0.3.2]: https://github.com/oleggohman/outlook-mcp/compare/v0.3.0...v0.3.2
 [0.3.0]: https://github.com/oleggohman/outlook-mcp/compare/v0.2.4...v0.3.0
 [0.2.4]: https://github.com/oleggohman/outlook-mcp/compare/v0.2.3...v0.2.4
 [0.2.3]: https://github.com/oleggohman/outlook-mcp/compare/v0.2.2...v0.2.3

@@ -1155,7 +1155,7 @@ service.
 mode):
 
 ```json
-"service": {"running": true, "building": false, "version": "0.3.0", "pid": 4242, "last_error": null}
+"service": {"running": true, "building": false, "version": "0.3.2", "pid": 4242, "last_error": null}
 ```
 
 `running` tells whether the service answered the last request and `building`
